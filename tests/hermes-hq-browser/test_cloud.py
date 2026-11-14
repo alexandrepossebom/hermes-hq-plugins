@@ -111,7 +111,7 @@ class CloudBrowserTests(Base):
 
 
 class CloudForAllTests(Base):
-    """Settings › Browser Use Cloud › Use for All Bots (owner 2026-11-14: "Add the settings switch for all bots")."""
+    """Settings › Browser Use Cloud › Use for All Bots (the owner asked for one switch, not a choice per bot)."""
 
     def setUp(self):
         super().setUp()
