@@ -256,6 +256,17 @@ made, its history) and what its bot writes with `tasks_update(page={summary, nex
 next, and parts such as options compared in a table, the numbers that matter, or what it found. The bot writes words,
 never HTML. The `task-page` skill (hermes-hq-push:task-page) tells bots what goes on it.
 
+Version 0.9.55 gives Tasks lists a keeper. A list (`GET`/`PUT /tasks/sections`) now also carries `color`, `icon`, `bot`
+(the bot that keeps it), `adds` (`ask`: that bot offers new tasks first) and `today` (`false`: left out of Today);
+a field an older app leaves out is kept. Bots get `tasks_offer`: a list to make, a batch of tasks for a list, or
+tasks to move into one, shown in the app as one card. Nothing changes until you tap (`POST /tasks/offers/{id}` with
+`accept`, `decline`, `move`, `leave` or `undo`); a list you declined isn't offered again, and the bot whose list you
+accept becomes its keeper. `tasks_add` and `tasks_update` take `source` (`app`, `who`, `at`, `ref`, `link`): the
+same `ref` never becomes a second task. A finished task refuses anything more from a bot. The bot that added a task
+for you may fill it in until you change it; on your own task a bot can file, tag, note, or offer to close it
+(`offer_done`, answered in the app with Mark Done or Keep Open), and is told so once instead of refused each time.
+`GET /tasks` gains `lists: true` and `offers`.
+
 Version 0.9.50 remakes how Dashboard tiles are made. A bot no longer writes a tile's HTML and CSS: it gives the
 tile's data as a small JSON spec (a headline, then blocks: a chart, status boxes, rows, meters, stats) and
 `make_tile.py` draws it with a designed kit, in one of four looks (`app`, the person's own theme; `midnight`;

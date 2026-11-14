@@ -544,6 +544,7 @@ class TaskPatchIn(BaseModel):
     tags: list[str] | None = Field(default=None, max_length=10)
     alert: int | None = Field(default=None, ge=0, le=10080)
     starts: str | None = Field(default=None, max_length=40)
+    keep_open: bool | None = None   # 0.9.55: "Keep Open" on a bot's offer to close it
 
 
 class SettingsIn(BaseModel):
@@ -566,8 +567,19 @@ class IdeaAddIn(BaseModel):
 
 
 class SectionIn(BaseModel):
+    """0.9.55: a list's look, who keeps it and its rules. A field left out keeps what was saved; sent empty clears it."""
     id: str = Field(default="", max_length=64)
     name: str = Field(max_length=60)
+    color: str | None = Field(default=None, max_length=20)
+    icon: str | None = Field(default=None, max_length=40)
+    bot: str | None = Field(default=None, max_length=64)
+    adds: str | None = Field(default=None, pattern="^(auto|ask)$")
+    today: bool | None = None
+
+
+class OfferAnswerIn(BaseModel):
+    action: str = Field(pattern="^(accept|decline|move|leave|undo)$")
+    list: bool = True   # accept only: false is "Add, No List"
 
 
 class SectionsIn(BaseModel):
@@ -737,7 +749,16 @@ def tasks_sections_get():
 @router.put("/tasks/sections")
 def tasks_sections_put(body: SectionsIn):
     """The user's own sections, the whole list in order (0.9.36); one left out is deleted, its tasks kept."""
-    return _tasks_store().put_sections([s.model_dump() for s in body.sections])
+    return _tasks_store().put_sections([s.model_dump(exclude_unset=True) for s in body.sections])
+
+
+@router.post("/tasks/offers/{offer_id}")
+def tasks_offer_answer(offer_id: str, body: OfferAnswerIn):
+    """0.9.55: the person's tap on a bot's offer of a list or a batch of tasks: ``{rev, offer, sections}``."""
+    try:
+        return _tasks_store().answer_offer(offer_id, body.action, make_list=body.list)
+    except tasks.TaskError as error:
+        raise HTTPException(error.status_code, error.detail) from None
 
 
 @router.post("/tasks/prep-job/{profile}")

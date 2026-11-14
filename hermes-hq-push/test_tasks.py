@@ -303,7 +303,7 @@ def test_tasks_off_drops_the_note_the_tools_and_the_prep_job(tmp_path, monkeypat
     assert s.enabled() and tasks.context_for(store=s, profile="otto", platform="desktop", user_message="hi")
     ctx = FakeCtx()
     tasks.register_tools(ctx, lambda: s, lambda: "otto", lambda task, prof: None)
-    assert set(ctx.checks) == {"tasks_list", "tasks_add", "tasks_update", "tasks_next_prep"}
+    assert set(ctx.checks) == {"tasks_list", "tasks_add", "tasks_update", "tasks_offer", "tasks_next_prep"}
     assert all(check() for check in ctx.checks.values())
 
     saved = s.put_settings({"enabled": False})
@@ -1517,3 +1517,220 @@ def test_the_runner_job_prompt_still_opens_the_way_the_app_knows(tmp_path):
     assert tasks.PREP_JOB_PROMPT.startswith("Work through Tasks prep.")
     assert "If the task has how, follow that." in tasks.PREP_JOB_PROMPT
     assert "scheduled job" in tasks.ADD_SCHEMA["description"]
+
+
+# ---------------------------------------------------------------------------
+# 0.9.55: lists with a look and a keeper, offers, sources, the finished-task guard
+# ---------------------------------------------------------------------------
+
+def call(ctx, tool, args, session_id="sess1"):
+    return json.loads(ctx.tools[tool](args, session_id=session_id))
+
+
+def test_a_list_keeps_its_look_when_an_older_app_sends_only_names(tmp_path):
+    s = store(tmp_path)
+    saved = s.put_sections([{"name": "Work", "color": "blue", "icon": "briefcase", "bot": "otto", "adds": "ask",
+                             "today": False}, {"name": "Home", "color": "plaid", "icon": "Not A Symbol!"}])
+    work, home = saved["sections"]
+    assert work == {"id": work["id"], "name": "Work", "color": "blue", "icon": "briefcase", "bot": "otto",
+                    "adds": "ask", "today": False}
+    assert home == {"id": home["id"], "name": "Home"}   # a colour or icon it doesn't know is dropped
+    again = s.put_sections([{"id": work["id"], "name": "Work stuff"}, {"id": home["id"], "name": "Home"}])
+    assert again["sections"][0] == dict(work, name="Work stuff")   # an older app renamed it: the rest stays
+    cleared = s.put_sections([{"id": work["id"], "name": "Work", "bot": "", "adds": "auto", "today": True,
+                               "color": None}])
+    assert cleared["sections"] == [{"id": work["id"], "name": "Work", "icon": "briefcase"}]
+
+
+def test_the_list_answer_says_it_has_lists_and_offers(tmp_path):
+    s = store(tmp_path)
+    answer = s.list_response(None)
+    assert answer["lists"] is True and answer["offers"] == []
+
+
+def test_offering_a_new_list_changes_nothing_until_the_tap(tmp_path):
+    s, ctx, _ = wired(tmp_path)
+    out = call(ctx, "tasks_offer", {"list": "Work", "why": "From this week's email", "tasks": [
+        {"title": "Send the Q4 deck", "due": "2026-11-20", "source": {"app": "Email", "who": "Sam", "ref": "m-1"}},
+        {"title": "Reply about the offsite"}, {"title": "send Q4 deck"}]})
+    offer = out["offer"]
+    assert offer["new"] is True and offer["state"] == "new" and offer["bot"] == "otto" and offer["list"] == "Work"
+    assert [t["title"] for t in offer["tasks"]] == ["Send the Q4 deck", "Reply about the offsite"]   # the twin is dropped
+    assert s.list_all() == [] and s.get_sections() == []
+    assert s.list_response(None)["offers"][0]["id"] == offer["id"]
+    done = s.answer_offer(offer["id"], "accept")
+    work = done["sections"][0]
+    assert work["name"] == "Work" and work["bot"] == "otto" and work["color"] in tasks.LIST_COLORS
+    made = s.list_all()
+    assert [t["title"] for t in made] == ["Send the Q4 deck", "Reply about the offsite"]
+    assert all(t["section"] == work["id"] and t["who"] == "me" and t["created_by"] == "otto" for t in made)
+    assert made[0]["source"]["from"] == {"app": "Email", "who": "Sam", "ref": "m-1"} and made[0]["due"] == "2026-11-20"
+    assert done["offer"]["state"] == "accepted" and done["offer"]["added"] == [t["id"] for t in made]
+    with pytest.raises(tasks.TaskError) as exc:
+        s.answer_offer(offer["id"], "accept")
+    assert exc.value.status_code == 409
+
+
+def test_undo_takes_back_the_tasks_and_the_list(tmp_path):
+    s, ctx, _ = wired(tmp_path)
+    mine = s.create(me(), created_by="you", source={"kind": "app"})
+    offer = call(ctx, "tasks_offer", {"list": "Work", "tasks": [{"title": "Send the Q4 deck"}],
+                                      "move": [mine["id"], "nope"]})["offer"]
+    assert offer["move"] == [{"id": mine["id"], "title": "Call the vet"}] and offer["move_state"] == "new"
+    s.answer_offer(offer["id"], "accept")
+    assert s.get(mine["id"])["section"] is None          # moving is asked on its own
+    moved = s.answer_offer(offer["id"], "move")
+    work = moved["sections"][0]["id"]
+    assert s.get(mine["id"])["section"] == work and moved["offer"]["move_state"] == "moved"
+    undone = s.answer_offer(offer["id"], "undo")
+    assert undone["sections"] == [] and undone["offer"]["state"] == "undone"
+    assert [t["id"] for t in s.list_all()] == [mine["id"]] and s.get(mine["id"])["section"] is None
+
+
+def test_add_no_list_adds_to_the_inbox_and_leave_keeps_tasks_where_they_are(tmp_path):
+    s, ctx, _ = wired(tmp_path)
+    offer = call(ctx, "tasks_offer", {"list": "Work", "tasks": [{"title": "Send the Q4 deck"}]})["offer"]
+    out = s.answer_offer(offer["id"], "accept", make_list=False)
+    assert out["sections"] == [] and s.list_all()[0]["section"] is None and out["offer"]["listed"] is False
+    mine = s.create(me(), created_by="you", source={"kind": "app"})
+    second = call(ctx, "tasks_offer", {"list": "Home", "tasks": [{"title": "Fix the gate"}], "move": [mine["id"]]})["offer"]
+    s.answer_offer(second["id"], "accept")
+    left = s.answer_offer(second["id"], "leave")
+    assert left["offer"]["move_state"] == "left" and s.get(mine["id"])["section"] is None
+
+
+def test_a_declined_list_is_not_offered_again(tmp_path):
+    s, ctx, _ = wired(tmp_path)
+    offer = call(ctx, "tasks_offer", {"list": "Home", "tasks": [{"title": "Fix the gate"}]})["offer"]
+    assert s.answer_offer(offer["id"], "decline")["offer"]["state"] == "declined"
+    again = call(ctx, "tasks_offer", {"list": "home", "tasks": [{"title": "Fix the gate"}]})
+    assert "not now" in again["error"] and s.get_sections() == [] and s.list_all() == []
+
+
+def test_a_second_offer_of_the_same_list_replaces_the_first(tmp_path):
+    s, ctx, _ = wired(tmp_path)
+    call(ctx, "tasks_offer", {"list": "Work", "tasks": [{"title": "Send the Q4 deck"}]})
+    call(ctx, "tasks_offer", {"list": "Work", "tasks": [{"title": "Send the Q4 deck"}, {"title": "Book the room"}]})
+    waiting = s.list_response(None)["offers"]
+    assert len(waiting) == 1 and len(waiting[0]["tasks"]) == 2
+
+
+def test_a_keeper_adds_to_its_list_without_asking_and_the_list_says_when_it_looked(tmp_path):
+    s, ctx, _ = wired(tmp_path)
+    work = s.put_sections([{"name": "Work", "bot": "otto"}, {"name": "Home"}])["sections"][0]
+    added = call(ctx, "tasks_add", {"title": "Send the Q4 deck", "who": "me"})
+    assert added["section"] == work["id"] and added["filed"] == "Work"   # its own list, though it named none
+    assert s.get_sections()[0]["checked_at"]
+    own = call(ctx, "tasks_add", {"title": "Draft the email", "who": "bot"})
+    assert own["section"] is None                                        # its own work stays under Bots
+    refused = call(ctx, "tasks_offer", {"list": "Work", "tasks": [{"title": "Book the room"}]})
+    assert "tasks_add" in refused["error"]
+    listed = call(ctx, "tasks_list", {})
+    assert listed["you_keep"] == ["Work"] and "ask_first" not in listed
+
+
+def test_a_list_that_asks_first_takes_an_offer_not_an_add(tmp_path):
+    s, ctx, _ = wired(tmp_path)
+    work = s.put_sections([{"name": "Work", "bot": "otto", "adds": "ask"}])["sections"][0]
+    refused = call(ctx, "tasks_add", {"title": "Send the Q4 deck", "who": "me"})
+    assert "tasks_offer" in refused["error"] and s.list_all() == []
+    asked = call(ctx, "tasks_add", {"title": "Send the Q4 deck", "who": "me", "asked": True})
+    assert asked["section"] == work["id"]
+    offer = call(ctx, "tasks_offer", {"list": "Work", "tasks": [{"title": "Book the room"}]})["offer"]
+    assert offer["new"] is False and offer["section"] == work["id"]
+    s.answer_offer(offer["id"], "accept")
+    assert {t["title"]: t["section"] for t in s.list_all()}["Book the room"] == work["id"]
+    assert call(ctx, "tasks_list", {})["ask_first"] == ["Work"]
+
+
+def test_a_list_that_is_not_there_sends_the_task_to_the_inbox_and_says_so(tmp_path):
+    s, ctx, _ = wired(tmp_path)
+    out = call(ctx, "tasks_add", {"title": "Send the Q4 deck", "who": "me", "section": "Work"})
+    assert out["section"] is None and "tasks_offer" in out["note"]
+
+
+def test_the_same_source_never_makes_two_tasks(tmp_path):
+    s, ctx, _ = wired(tmp_path)
+    first = call(ctx, "tasks_add", {"title": "RSVP to the offsite", "who": "me",
+                                    "source": {"app": "Email", "who": "Sam", "at": "2026-11-13", "ref": "m-1"}})
+    assert first["source"]["from"]["ref"] == "m-1"
+    same = call(ctx, "tasks_add", {"title": "Answer Sam about the trip", "who": "me", "source": {"ref": "m-1"}})
+    assert same["already"]["id"] == first["id"] and same["already"]["source"]["ref"] == "m-1"
+    other = call(ctx, "tasks_add", {"title": "RSVP to the offsite", "who": "me", "source": {"ref": "m-2"}})
+    assert other["id"] != first["id"]            # alike in name, but its own message: its own task
+    s.update_route(first["id"], s.get(first["id"])["rev"], {"status": "done"})
+    late = call(ctx, "tasks_add", {"title": "RSVP again", "who": "me", "source": {"ref": "m-1"}})
+    assert late["already_done"]["id"] == first["id"] and len(s.list_all()) == 2
+
+
+def test_a_finished_task_takes_nothing_more_from_a_bot(tmp_path):
+    s, ctx, _ = wired(tmp_path)
+    task = s.create(me(), created_by="you", source={"kind": "app"})
+    s.update_route(task["id"], task["rev"], {"status": "done"})
+    for change in ({"note": "Two more RSVPs came in"}, {"section": "Work"}, {"tags": ["x"]},
+                   {"made": [{"title": "List", "kind": "note", "ref": "a"}]}):
+        out = call(ctx, "tasks_update", {"id": task["id"], **change})
+        assert "finished" in out["error"] and "tasks_add" in out["error"]
+    assert s.get(task["id"])["log"][-1]["text"] != "Two more RSVPs came in"
+
+
+def test_the_bot_that_added_a_task_fills_it_in_until_the_person_changes_it(tmp_path):
+    s, ctx, _ = wired(tmp_path)
+    task = call(ctx, "tasks_add", {"title": "Send the Q4 deck", "who": "me"})
+    out = call(ctx, "tasks_update", {"id": task["id"], "notes": "Sam needs it by Friday.",
+                                     "source": {"app": "Email", "who": "Sam", "ref": "m-9"},
+                                     "made": [{"title": "Thread", "kind": "link", "ref": "https://example.com/t"}],
+                                     "page": {"summary": "Deck is drafted."}})
+    assert out["notes"] == "Sam needs it by Friday." and out["source"]["from"]["ref"] == "m-9"
+    assert out["source"]["session_id"] == "sess1" and len(out["made"]) == 1
+    assert "error" in call(ctx, "tasks_update", {"id": task["id"], "status": "ready"})   # still theirs to move
+    moved = s.update_route(task["id"], s.get(task["id"])["rev"], {"section": None, "position": 3.0})
+    assert moved["edited"] is False                      # dragging or filing it isn't changing it
+    edited = s.update_route(task["id"], moved["rev"], {"title": "Send the Q4 deck to Sam"})
+    assert edited["edited"] is True
+    late = call(ctx, "tasks_update", {"id": task["id"], "notes": "Rewritten"})
+    assert "every task with who 'me'" in late["error"] and s.get(task["id"])["notes"] == "Sam needs it by Friday."
+    theirs = s.create(me(title="Book flights"), created_by="you", source={"kind": "app"})
+    assert "error" in call(ctx, "tasks_update", {"id": theirs["id"], "page": {"summary": "x"}})
+    assert "error" not in call(ctx, "tasks_update", {"id": theirs["id"], "note": "Fares drop on Tuesday"})
+
+
+def test_a_bot_offers_to_close_a_task_and_keep_open_is_remembered(tmp_path):
+    s, ctx, _ = wired(tmp_path)
+    task = s.create(me(), created_by="you", source={"kind": "app"})
+    out = call(ctx, "tasks_update", {"id": task["id"], "offer_done": "The vet confirmed by email"})
+    assert out["offer"] == {"kind": "done", "by": "otto", "text": "The vet confirmed by email", "at": out["offer"]["at"]}
+    assert out["status"] == "open" and "Mark Done" in out["offered"]
+    assert call(ctx, "tasks_list", {"scope": "all"})["tasks"][0]["offer_done"] == "The vet confirmed by email"
+    kept = s.update_route(task["id"], out["rev"], {"keep_open": True})
+    assert kept["offer"]["kept"] is True and kept["log"][-1]["text"] == "kept it open" and kept["edited"] is False
+    again = call(ctx, "tasks_update", {"id": task["id"], "offer_done": "Really, it's settled"})
+    assert "keep this one open" in again["error"]
+    done = s.update_route(task["id"], kept["rev"], {"status": "done"})
+    assert done["offer"] is None
+    own = s.create(bot_task(), created_by="otto", source={"kind": "chat", "profile": "otto"})
+    assert "yours alone" in call(ctx, "tasks_update", {"id": own["id"], "offer_done": "x"})["error"]
+
+
+def test_the_keeper_hears_it_keeps_the_list_in_the_note(tmp_path):
+    s = store(tmp_path)
+    s.put_settings({"capture": "off"})
+    assert tasks.context_for(store=s, profile="otto", platform="desktop", user_message="hi") is None
+    s.put_sections([{"name": "Work", "bot": "otto"}])
+    note = tasks.context_for(store=s, profile="otto", platform="desktop", user_message="hi")
+    assert "You keep their Tasks list “Work”" in note and "offer_done" in note
+    assert tasks.context_for(store=s, profile="ivy", platform="desktop", user_message="hi") is None
+
+
+def test_an_older_database_gains_the_new_columns(tmp_path):
+    import sqlite3
+    s = store(tmp_path)
+    task = s.create(me(), created_by="you", source={"kind": "app"})
+    with sqlite3.connect(tmp_path / "tasks.db") as db:
+        db.execute("alter table tasks drop column edited")
+        db.execute("alter table tasks drop column offer")
+        db.execute("update meta set value='5' where key='shape'")
+    before = s.rev()
+    again = store(tmp_path)
+    assert again.get(task["id"])["edited"] is False and again.get(task["id"])["offer"] is None
+    assert again.rev() == before + 1     # a new shape: every app reads the whole list again

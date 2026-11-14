@@ -71,8 +71,8 @@ _UNSET = object()  # tasks_update left `due` out (None clears it)
 # The list answer's shape: raise it when the answer gains a field. An app polling `?since=<rev>` hears "unchanged" until
 # the rev moves, so it would keep an answer from before the field (0.9.40: after an update to 0.9.39 the app never saw
 # `ideas` and kept asking for the update). A new shape moves the rev once, and every app reads the whole list again.
-LIST_SHAPE = "5"   # 2: `ideas` (0.9.39). 3: each task's `page` (0.9.43). 4: `next_check`, `choices` (0.9.47).
-                   # 5: `priority`, `tags`, `alert`, `starts` (0.9.53)
+LIST_SHAPE = "6"   # 2: `ideas` (0.9.39). 3: each task's `page` (0.9.43). 4: `next_check`, `choices` (0.9.47).
+                   # 5: `priority`, `tags`, `alert`, `starts` (0.9.53). 6: `lists`, `offers`, a task's `offer` (0.9.55)
 # 0.9.47, owner 2026-11-09 ("no friction, it just works"): the bot's own next look at a task (a real run, not a
 # promise in a sentence), and up to 3 one-tap answers when it asks the person something.
 CHOICES_CAP = 3
@@ -110,10 +110,24 @@ GROUPS = ("smart", "sections")
 SORTS = ("smart", "due", "added", "priority")   # "priority": 0.9.53
 SECTIONS_CAP = 50
 SECTION_NAME_MAX = 60
+# 0.9.55, owner 2026-11-14 (a bot asked to "keep my work tasks up to date" took 11 minutes and three messages to get
+# a list, was refused eight times on the person's own tasks, and noted new work on a task that was then finished):
+# a list has a look (colour, icon), a bot that keeps it, and its own rule for what that bot adds; a bot offers a list
+# or a batch of tasks as one card (``offers``); a task says where it came from (``source.from``); a finished task
+# takes nothing more; a bot offers to close a task instead of closing it (``offer``).
+LIST_COLORS = ("blue", "green", "orange", "red", "purple", "pink", "teal", "yellow", "gray")
+LIST_ADDS = ("auto", "ask")   # what the list's bot does with a new task for it: add it, or offer it first
+_ICON_NAME = re.compile(r"^[a-z0-9.]{1,40}$")   # an SF Symbol's name
+OFFERS_CAP = 40          # kept offers, newest last (answered ones stay so the same list isn't offered twice)
+OFFER_TASKS_CAP = 20
+OFFER_WHY_MAX = 160
+FROM_MAX = {"app": 40, "who": 80, "at": 40, "ref": 300, "link": 2000}
+CHECKED_EVERY = 60       # a keeper's "checked" time moves at most once a minute
+EDIT_KEYS = ("title", "notes", "due", "repeat", "steps", "who", "bot", "priority", "tags", "alert", "starts")
 
 COLUMNS = ("id", "rev", "title", "notes", "who", "bot", "status", "status_note", "due", "repeat", "prep",
            "steps", "made", "source", "created_at", "updated_at", "done_at", "created_by", "log", "section", "position",
-           "watch", "chat", "page_at", "next_check", "choices", "priority", "tags", "alert", "starts")
+           "watch", "chat", "page_at", "next_check", "choices", "priority", "tags", "alert", "starts", "edited", "offer")
 
 
 class TaskError(ValueError):
@@ -534,6 +548,11 @@ def compact(task: dict, sections: dict | None = None, page: dict | None = None) 
         out["tags"] = task["tags"]
     if task.get("starts"):
         out["starts"] = task["starts"]
+    found = (task.get("source") or {}).get("from") if isinstance(task.get("source"), dict) else None
+    if found:
+        out["source"] = {k: found[k] for k in ("app", "who", "at", "ref") if found.get(k)}
+    if task.get("offer"):
+        out["offer_done"] = "kept open by them" if task["offer"].get("kept") else task["offer"].get("text", "")
     if page and (page.get("summary") or page.get("blocks")):
         out["page"] = {"summary": _clip(page.get("summary") or "", 160), "parts": [b["title"] for b in page.get("blocks") or []]}
     return out
@@ -563,9 +582,70 @@ def _row_to_task(row) -> dict:
     task["priority"] = _clean_priority(task.get("priority"))
     task["alert"] = _clean_alert(task.get("alert"))
     task["starts"] = task.get("starts") or None
+    task["edited"] = bool(task.get("edited"))
     for key in ("steps", "made", "source", "log", "chat", "choices", "tags"):
         task[key] = json.loads(task[key] or ("{}" if key in ("source", "chat") else "[]"))
+    try:
+        offer = json.loads(task.get("offer") or "null")
+    except ValueError:
+        offer = None
+    task["offer"] = offer if isinstance(offer, dict) and offer else None
     return task
+
+
+def clean_from(value) -> dict:
+    """Where a bot found a task (0.9.55): ``{app, who, at, ref, link}``, each optional. ``ref`` is the one thing
+    that names that message, email or ticket and nothing else, so the same one never becomes two tasks."""
+    if not isinstance(value, dict):
+        return {}
+    out = {}
+    for key, size in FROM_MAX.items():
+        text = _text(value.get(key), size)
+        if text and (key != "link" or text.startswith(("https://", "http://"))):
+            out[key] = text
+    return out
+
+
+def _ref(task: dict) -> str:
+    source = task.get("source")
+    found = source.get("from") if isinstance(source, dict) else None
+    return found.get("ref", "") if isinstance(found, dict) else ""
+
+
+# What a bot is told when it tries to change the person's own task (0.9.55: a bot got the old line eight times in a
+# row, once per task, and never learned what it could do instead).
+MINE_RULE = ("This is the user's own task, and that holds for every task with who 'me': don't try the same on the "
+             "others. What you can do on it: add a short note (note), file it in one of their lists (section), tag "
+             "it (tags), offer to close it when it looks settled (offer_done, with why: they tap Mark Done or Keep "
+             "Open), or take a part of it when they ask for help (who='together' with your steps in add_steps).")
+DONE_RULE = ("That task is finished, so nothing more goes on it. If there is new work, add it as a new task with "
+             "tasks_add (and its own source), and tell the user.")
+
+
+def _clean_section(given: dict, old: dict | None = None) -> dict | None:
+    """One list as it is saved: ``id`` and ``name``, and only when set ``color``, ``icon``, ``bot`` (who keeps it),
+    ``adds: "ask"`` and ``today: false``. A key the caller left out keeps what was saved (an older app sends only
+    id and name, and must not wipe the rest)."""
+    name = _text(given.get("name"), SECTION_NAME_MAX)
+    sid = _text(given.get("id"), 64) or new_id()
+    if not name:
+        return None
+    out = {"id": sid, "name": name}
+    old = old or {}
+
+    def pick(key, ok):
+        value = given[key] if key in given else old.get(key)   # sent empty (or as the default) clears it
+        if ok(value):
+            out[key] = value
+
+    pick("color", lambda v: v in LIST_COLORS)
+    pick("icon", lambda v: isinstance(v, str) and bool(_ICON_NAME.match(v)))
+    pick("bot", lambda v: isinstance(v, str) and bool(_PROFILE_NAME.match(v)))
+    pick("adds", lambda v: v == "ask")
+    pick("today", lambda v: v is False)
+    if old.get("checked_at") and out.get("bot") == old.get("bot"):
+        out["checked_at"] = old["checked_at"]
+    return out
 
 
 def _clean_choices(value) -> list[str]:
@@ -685,6 +765,10 @@ class Store:
                 db.execute("alter table tasks add column alert integer")
             if "starts" not in have:   # ("start" is the tools' word for "your part is under way")
                 db.execute("alter table tasks add column starts text")
+            if "edited" not in have:   # 0.9.55: the person changed it themselves; and a bot's offer to close it
+                db.execute("alter table tasks add column edited integer not null default 0")
+            if "offer" not in have:
+                db.execute("alter table tasks add column offer text not null default ''")
             if "position" not in have:
                 db.execute("alter table tasks add column position real")
                 for task_id, made in db.execute("select id, created_at from tasks").fetchall():
@@ -801,9 +885,11 @@ class Store:
         # ideas (0.9.39): how many new ideas the Ideas page has, for the count on its tab.
         # fields, files (0.9.53): this add-on keeps a task's priority, tags, alert and start day, and the person's own
         # files and links (POST /tasks/{id}/attach): the app shows those rows only then.
+        # lists, offers (0.9.55): a list carries its colour, icon, bot and rules, and a bot's offers of a list or a
+        # batch of tasks wait here for the person's tap (POST /tasks/offers/{id}).
         return {"rev": current, "tasks": listed, "settings": self.get_settings(),
                 "sections": self.get_sections(), "pages": True, "ideas": self.new_ideas_count(),
-                "fields": True, "files": True}
+                "fields": True, "files": True, "lists": True, "offers": self.shown_offers()}
 
     def new_ideas_count(self) -> int:
         """New ideas still fresh (ideas.py: one nobody acts on fades after FRESH_DAYS); 0 while Ideas is off."""
@@ -813,7 +899,7 @@ class Store:
         with closing(self._db()) as db:
             return db.execute("select count(*) from task_ideas where state='new' and created_at>=?", (since,)).fetchone()[0]
 
-    def find_open_twin(self, title: str) -> dict | None:
+    def find_open_twin(self, title: str, ref: str = "") -> dict | None:
         """An open task that is ``title`` in other words ("Call the dentist" / "call dentist"), so a bot's
         ``tasks_add`` doesn't put the same thing on the list twice (0.9.34: "cautious of too many things making it
         on the task list")."""
@@ -821,8 +907,19 @@ class Store:
             return None
         for task in self.list_all():
             if task["status"] != "done" and same_task(task["title"], title):
+                if ref and _ref(task) and _ref(task) != ref:
+                    continue   # two things with their own sources are two tasks, however alike their names
                 return task
         return None
+
+    def find_by_ref(self, ref: str) -> dict | None:
+        """The task a bot already made from this source (0.9.55), open or finished: the same message, email or
+        ticket never becomes a second task. An open one wins over a finished one."""
+        if not ref:
+            return None
+        found = [t for t in self.list_all() if _ref(t) == ref]
+        found.sort(key=lambda t: t["status"] == "done")
+        return found[0] if found else None
 
     def enabled(self) -> bool:
         """Tasks is on (Settings › Tasks in the app); off hides the tools, the note and the prep jobs."""
@@ -889,7 +986,7 @@ class Store:
 
     # -- writing -----------------------------------------------------------------------------------------------
 
-    def create(self, fields: dict, created_by: str, source: dict) -> dict:
+    def create(self, fields: dict, created_by: str, source: dict, db=None) -> dict:
         title = _text(fields.get("title"), TITLE_MAX)
         if not title:
             raise TaskError(400, "A task needs a title.")
@@ -915,15 +1012,31 @@ class Store:
             "next_check": "", "choices": "[]",
             "priority": _clean_priority(fields.get("priority")), "tags": json.dumps(_clean_tags(fields.get("tags"))),
             "alert": _clean_alert(fields.get("alert")), "starts": _clean_start(fields.get("starts")),
+            "edited": 0, "offer": "",
         }
-        with closing(self._write_db()) as db, db:
-            row["section"] = self._section_id(db, fields.get("section"))
+        section_by_id = bool(fields.get("_section_by_id"))
+
+        def insert(db):
+            row["section"] = self._section_id(db, fields.get("section"), by_id=section_by_id)
+            if row["section"] is None and created_by != "you" and who != "bot" and "section" not in fields:
+                row["section"] = self._kept_list(db, created_by)   # a list's bot files its tasks there
             if isinstance(fields.get("position"), (int, float)) and not isinstance(fields.get("position"), bool):
                 row["position"] = float(fields["position"])
             db.execute(f"insert into tasks ({','.join(row)}) values ({','.join('?' * len(row))})",
                       list(row.values()))
-            self._bump_rev(db)
+
+        if db is not None:
+            insert(db)
+            return row
+        with closing(self._write_db()) as fresh, fresh:
+            insert(fresh)
+            self._bump_rev(fresh)
         return self.get(row["id"])
+
+    def _kept_list(self, db, bot: str) -> str | None:
+        """The one list ``bot`` keeps (0.9.55), or ``None`` when it keeps none or several."""
+        kept = [s["id"] for s in self._read_sections(db) if s.get("bot") == bot]
+        return kept[0] if len(kept) == 1 else None
 
     def delete(self, task_id: str) -> dict:
         with closing(self._write_db()) as db, db:
@@ -1053,6 +1166,14 @@ class Store:
             updated["alert"] = _clean_alert(patch["alert"])
         if "starts" in patch:
             updated["starts"] = _clean_start(patch["starts"])
+        if patch.get("_edited"):
+            updated["edited"] = True
+        if "source" in patch and isinstance(patch["source"], dict):
+            updated["source"] = patch["source"]
+        if "offer" in patch:   # a bot's offer to close it (0.9.55); None takes it off
+            updated["offer"] = patch["offer"] or None
+        if patch.get("keep_open") and updated.get("offer"):
+            updated["offer"] = dict(updated["offer"], kept=True)
         if updated.get("who") == "bot":
             updated["repeat"] = None   # bot work that repeats stays a Job
         log_entries = list(updated.get("log") or [])
@@ -1067,10 +1188,13 @@ class Store:
                 updated["choices"] = []
             if status == "done":
                 updated["next_check"] = ""
+                updated["offer"] = None
         for line in patch.get("_changes") or ():
             log_entries.append({"at": now, "by": by, "text": _text(line, NOTE_MAX), "kind": "change"})
         if note:
             log_entries.append({"at": now, "by": by, "text": _text(note, NOTE_MAX)})
+        if patch.get("keep_open") and task.get("offer") and not task["offer"].get("kept"):
+            log_entries.append({"at": now, "by": by, "text": "kept it open", "kind": "change"})
         if updated["status"] == "done" and updated["who"] in ("me", "together") and updated.get("repeat"):
             # 0.9.53: a task they share with a bot repeats too. It opens again with every step unticked (the bot's
             # as well: its part is to do again), its status line cleared, and a start day moved on with its date.
@@ -1094,14 +1218,17 @@ class Store:
     def _write(self, db, task: dict) -> None:
         db.execute("""update tasks set rev=?, title=?, notes=?, who=?, bot=?, status=?, status_note=?, due=?,
             repeat=?, prep=?, steps=?, made=?, updated_at=?, done_at=?, log=?, section=?, position=?, watch=?,
-            chat=?, page_at=?, next_check=?, choices=?, priority=?, tags=?, alert=?, starts=? where id=?""",
+            chat=?, page_at=?, next_check=?, choices=?, priority=?, tags=?, alert=?, starts=?, edited=?, offer=?,
+            source=? where id=?""",
             (task["rev"], task["title"], task["notes"], task["who"], task["bot"], task["status"],
              task["status_note"], task["due"], task["repeat"], int(task["prep"]), json.dumps(task["steps"]),
              json.dumps(task["made"]), task["updated_at"], task["done_at"], json.dumps(task["log"]),
              task.get("section"), float(task.get("position") or 0), task.get("watch") or "",
              json.dumps(task.get("chat") or {}), task.get("page_at") or "", task.get("next_check") or "",
              json.dumps(task.get("choices") or []), _clean_priority(task.get("priority")),
-             json.dumps(task.get("tags") or []), task.get("alert"), task.get("starts"), task["id"]))
+             json.dumps(task.get("tags") or []), task.get("alert"), task.get("starts"),
+             int(bool(task.get("edited"))), json.dumps(task["offer"], ensure_ascii=False) if task.get("offer") else "",
+             json.dumps(task.get("source") or {}, ensure_ascii=False), task["id"]))
 
     def update_route(self, task_id: str, rev: int, patch: dict, by: str = "you") -> dict:
         """``PATCH /tasks/{id}``: a stale ``rev`` raises ``TaskError(409, {"task": current})``. Both carry the task's
@@ -1115,6 +1242,8 @@ class Store:
                 raise TaskError(409, {"task": self._shown(db, task)})
             if "section" in patch:
                 patch["section"] = self._section_id(db, patch["section"], by_id=True)
+            if by == "you" and any(key in patch for key in EDIT_KEYS):
+                patch["_edited"] = True   # 0.9.55: from here the bot that added it no longer fills it in
             updated = self._merge(task, patch, by)
             self._write(db, updated)
             self._bump_rev(db)
@@ -1124,7 +1253,8 @@ class Store:
     def update_bot(self, task_id: str, profile: str, *, status=None, status_note=None, done_steps=None,
                   add_steps=None, made=None, note=None, who=None, prep=None, due=_UNSET,
                   section=_UNSET, watch=None, page=None, title=None, undone_steps=None, next_check=_UNSET,
-                  choices=None, owner_said=False, priority=None, tags=None) -> dict:
+                  choices=None, owner_said=False, priority=None, tags=None, notes=None, source=None,
+                  offer_done=None) -> dict:
         """``tasks_update``: no ``rev`` (the tool contract has none — the bot always applies to the current
         task). Enforces docs/tasks.md's rules in code: a bot may only mark ``done`` a task it owns alone
         (``who == "bot"``), and may not change a ``who == "me"`` task except to add ``note`` — or to take a part
@@ -1138,15 +1268,23 @@ class Store:
         change the task"): the call came from this task's own chat, where the person is talking to the bot about
         it, so what they said is their decision. Then the bot may also tick or untick their steps, rename it, move
         its date and mark it done, on any kind of task. Background runs keep the rules above."""
-        changing = (status is not None or status_note is not None or done_steps or add_steps or made
-                    or prep is not None or watch is not None or page is not None or title is not None
-                    or undone_steps or next_check is not _UNSET or choices is not None or priority is not None)
+        # 0.9.55: ``filling`` (below): the bot that added a task for the person may still fill it in (what it made, its
+        # Task Page, notes, where it came from, priority) until the person changes the task themselves.
+        fill = bool(made) or page is not None or priority is not None or notes is not None or source is not None
+        changing = (status is not None or status_note is not None or done_steps or add_steps
+                    or prep is not None or watch is not None or title is not None
+                    or undone_steps or next_check is not _UNSET or choices is not None)
         with closing(self._write_db()) as db, db:
             row = db.execute(f"select {','.join(COLUMNS)} from tasks where id=?", (task_id,)).fetchone()
             if row is None:
                 raise TaskError(404, "No such task.")
             task = _row_to_task(row)
             taking_part = task["who"] == "me" and who == "together"
+            filling = task["created_by"] == profile and not task.get("edited")
+            mine = task["who"] in ("bot", "together") and task["bot"] == profile
+            reopening = task["who"] == "bot" and task["bot"] == profile and status not in (None, "done")
+            if task["status"] == "done" and not owner_said and not taking_part and not reopening:
+                raise TaskError(403, DONE_RULE)
             if taking_part:
                 if task["status"] == "done":
                     raise TaskError(403, "That task is already done.")
@@ -1162,9 +1300,14 @@ class Store:
                 if due is not _UNSET and task["created_by"] != profile and not taking_part and not (
                         task["who"] in ("bot", "together") and task["bot"] == profile):
                     raise TaskError(403, "Only the user can change the date of a task they added.")
-                if task["who"] == "me" and changing and not taking_part:
-                    raise TaskError(403, "This is the user's own task; a bot may only add a note to it, or take a "
-                                         "part of it (who='together' with your steps in add_steps).")
+                if task["who"] == "me" and not taking_part and (changing or (fill and not filling)):
+                    raise TaskError(403, MINE_RULE)
+                if (notes is not None or source is not None) and not (filling or mine):
+                    raise TaskError(403, "Only the bot that added a task, before the user changes it, or the bot "
+                                         "it belongs to, sets its notes or source. Add a note instead.")
+                if offer_done is not None and (task.get("offer") or {}).get("kept"):
+                    raise TaskError(403, "They chose to keep this one open. Don't offer to close it again; say "
+                                         "it in the chat if something new happened.")
                 if status == "done" and task["who"] != "bot":
                     raise TaskError(403, "Only a task that is yours alone (who: bot) can be marked done; a "
                                          "together task needs the user to finish it.")
@@ -1216,6 +1359,17 @@ class Store:
                 patch["section"] = self._section_id(db, section)
             if tags is not None:        # nor is tagging it (0.9.53)
                 patch["tags"] = _clean_tags(tags)
+            if notes is not None:
+                patch["notes"] = _lines(notes, NOTES_MAX)
+            if source is not None and clean_from(source):
+                patch["source"] = {**(task.get("source") or {}),
+                                   "from": {**((task.get("source") or {}).get("from") or {}), **clean_from(source)}}
+            if offer_done is not None and task["status"] != "done":
+                why = _text(offer_done, OFFER_WHY_MAX)
+                if task["who"] == "bot":
+                    raise TaskError(400, "This task is yours alone: mark it done yourself.")
+                if why:
+                    patch["offer"] = {"kind": "done", "by": profile, "text": why, "at": _iso(self.clock)}
             if priority is not None:
                 patch["priority"] = _clean_priority(priority)
             page_notes: list[str] = []
@@ -1317,16 +1471,16 @@ class Store:
         """``PUT /tasks/sections``: the whole list, in order (new ones without an id get one). A section left out
         is deleted, and its tasks go back to no section; they're never deleted with it."""
         clean, seen = [], set()
-        for s in sections[:SECTIONS_CAP]:
-            if not isinstance(s, dict):
-                continue
-            name = _text(s.get("name"), SECTION_NAME_MAX)
-            sid = _text(s.get("id"), 64) or new_id()
-            if not name or sid in seen:
-                continue
-            seen.add(sid)
-            clean.append({"id": sid, "name": name})
         with closing(self._write_db()) as db, db:
+            saved = {s["id"]: s for s in self._read_sections(db)}
+            for s in sections[:SECTIONS_CAP]:
+                if not isinstance(s, dict):
+                    continue
+                one = _clean_section(s, saved.get(_text(s.get("id"), 64)))
+                if one is None or one["id"] in seen:
+                    continue
+                seen.add(one["id"])
+                clean.append(one)
             db.execute("insert into meta (key, value) values ('sections', ?) on conflict(key) do update"
                        " set value=excluded.value", (json.dumps(clean, ensure_ascii=False),))
             gone = [row[0] for row in db.execute("select distinct section from tasks where section is not null")
@@ -1338,6 +1492,211 @@ class Store:
 
     def section_names(self) -> dict:
         return {s["id"]: s["name"] for s in self.get_sections()}
+
+    def _save_sections(self, db, sections: list[dict]) -> None:
+        db.execute("insert into meta (key, value) values ('sections', ?) on conflict(key) do update"
+                   " set value=excluded.value", (json.dumps(sections, ensure_ascii=False),))
+
+    def mark_checked(self, bot: str) -> None:
+        """``bot`` just looked at the list (any of its Tasks tools): the lists it keeps say "checked 8:02 AM"."""
+        now = self.clock()
+        with closing(self._write_db()) as db, db:
+            sections, moved = self._read_sections(db), False
+            for s in sections:
+                if s.get("bot") == bot and now - _seconds(s.get("checked_at") or "") >= CHECKED_EVERY:
+                    s["checked_at"], moved = _iso(self.clock), True
+            if moved:
+                self._save_sections(db, sections)
+                self._bump_rev(db)
+
+    # -- offers (0.9.55): a bot never makes a list, and on an Ask First list never adds, by itself. It offers, the
+    # app shows one card, and the person's tap does it here in one go (and can be undone in one go).
+
+    @staticmethod
+    def _read_offers(db) -> list[dict]:
+        row = db.execute("select value from meta where key='offers'").fetchone()
+        try:
+            saved = json.loads(row[0]) if row else []
+        except ValueError:
+            return []
+        return [o for o in saved if isinstance(o, dict) and o.get("id")]
+
+    def _save_offers(self, db, offers: list[dict]) -> None:
+        db.execute("insert into meta (key, value) values ('offers', ?) on conflict(key) do update"
+                   " set value=excluded.value", (json.dumps(offers[-OFFERS_CAP:], ensure_ascii=False),))
+
+    def _show_offer(self, db, offer: dict) -> dict:
+        """An offer as the app and the bot see it: the tasks to move carry their titles, ``made`` stays inside."""
+        out = {k: v for k, v in offer.items() if k not in ("made", "move")}
+        titles = {}
+        if offer.get("move"):
+            marks = ",".join("?" * len(offer["move"]))
+            titles = dict(db.execute(f"select id, title from tasks where id in ({marks})", offer["move"]).fetchall())
+        out["move"] = [{"id": i, "title": titles[i]} for i in offer.get("move") or [] if i in titles]
+        out["added"] = list((offer.get("made") or {}).get("added") or [])
+        return out
+
+    def shown_offers(self) -> list[dict]:
+        """Offers still waiting, and answered ones from the last day (their card says what happened, with Undo)."""
+        since = _iso(lambda: self.clock() - 86400)
+        with closing(self._db()) as db:
+            return [self._show_offer(db, o) for o in self._read_offers(db)
+                    if o.get("state") == "new" or (o.get("answered_at") or "") >= since]
+
+    def offer(self, bot: str, session_id: str, list_name, tasks_in, move, why="") -> dict:
+        """``tasks_offer``: a list to make (with the tasks that would go in it), tasks for a list that asks first,
+        or tasks already on the page to move into a list. Nothing changes until the person taps."""
+        name = _text(list_name, SECTION_NAME_MAX)
+        if not name:
+            raise TaskError(400, "Say which list: its name.")
+        with closing(self._write_db()) as db, db:
+            sections = self._read_sections(db)
+            section = next((s for s in sections if s["name"].casefold() == name.casefold()), None)
+            offers = self._read_offers(db)
+            if section is None and any(o.get("state") == "declined" and o.get("new")
+                                       and o["list"].casefold() == name.casefold() for o in offers):
+                raise TaskError(403, f"They said not now to a \u201c{name}\u201d list. Don't offer it again unless "
+                                     "they ask for it; add the tasks without a list.")
+            rows = [_row_to_task(r) for r in db.execute(f"select {','.join(COLUMNS)} from tasks").fetchall()]
+            by_id = {t["id"]: t for t in rows}
+            fresh, already = [], []
+            for item in (tasks_in if isinstance(tasks_in, list) else [])[:OFFER_TASKS_CAP]:
+                if not isinstance(item, dict) or not _text(item.get("title"), TITLE_MAX):
+                    continue
+                title, found = _text(item.get("title"), TITLE_MAX), clean_from(item.get("source"))
+                ref = found.get("ref", "")
+                twin = next((t for t in rows if ref and _ref(t) == ref), None) or next(
+                    (t for t in rows if t["status"] != "done" and same_task(t["title"], title)
+                     and not (ref and _ref(t) and _ref(t) != ref)), None)
+                if twin or any(same_task(f["title"], title) for f in fresh):
+                    if twin:
+                        already.append({"id": twin["id"], "title": twin["title"], "status": twin["status"]})
+                    continue
+                one = {"title": title}
+                if _text(item.get("due"), DUE_MAX):
+                    one["due"] = _text(item.get("due"), DUE_MAX)
+                if _lines(item.get("notes"), NOTES_MAX):
+                    one["notes"] = _lines(item.get("notes"), NOTES_MAX)
+                if found:
+                    one["source"] = found
+                fresh.append(one)
+            moving = []
+            for task_id in (move if isinstance(move, list) else [])[:OFFER_TASKS_CAP]:
+                task = by_id.get(str(task_id))
+                if task and task["status"] != "done" and task["id"] not in moving and (
+                        section is None or task.get("section") != section["id"]):
+                    moving.append(task["id"])
+            if not fresh and not moving and (section is not None or not already):
+                raise TaskError(400, "Nothing to offer: every task is on their list already, or none was given."
+                                + (f" Already there: {json.dumps(already, ensure_ascii=False)}" if already else ""))
+            if section is not None and not moving and section.get("bot") == bot and section.get("adds") != "ask":
+                raise TaskError(400, f"You keep \u201c{section['name']}\u201d and it takes your tasks without "
+                                     "asking: add them with tasks_add (section) and say what you added.")
+            offers = [o for o in offers if not (o.get("state") == "new" and o.get("bot") == bot
+                                                and o["list"].casefold() == name.casefold())]
+            made = {"id": new_id(), "bot": bot, "session_id": str(session_id or ""), "at": _iso(self.clock),
+                    "list": section["name"] if section else name, "section": section["id"] if section else None,
+                    "new": section is None, "why": _text(why, OFFER_WHY_MAX), "tasks": fresh, "move": moving,
+                    "state": "new"}
+            if moving:
+                made["move_state"] = "new"
+            offers.append(made)
+            self._save_offers(db, offers)
+            self._bump_rev(db)
+            shown = self._show_offer(db, made)
+        if already:
+            shown["already"] = already
+        return shown
+
+    def answer_offer(self, offer_id: str, action: str, make_list: bool = True) -> dict:
+        """``POST /tasks/offers/{id}``. ``accept``: the list is made (kept by the bot that offered it; not when
+        ``make_list`` is false: "Add, No List") and the tasks go on, in one go. ``move`` / ``leave``: the tasks
+        already on the page go into the list, or stay. ``decline``: nothing, and the same list isn't offered again.
+        ``undo``: what accepting made is taken back (the tasks, the moves, and the list if it made it)."""
+        if action not in ("accept", "decline", "move", "leave", "undo"):
+            raise TaskError(400, "action must be accept, decline, move, leave or undo.")
+        with closing(self._write_db()) as db, db:
+            offers = self._read_offers(db)
+            offer = next((o for o in offers if o["id"] == offer_id), None)
+            if offer is None:
+                raise TaskError(404, "No such offer.")
+            now, state = _iso(self.clock), offer.get("state")
+            done = offer.setdefault("made", {})
+            sections = self._read_sections(db)
+
+            def home() -> str | None:
+                """The list's id: the one there, the one this offer made, or one made now."""
+                wanted = offer.get("section") or done.get("section")
+                if wanted and any(s["id"] == wanted for s in sections):
+                    return wanted
+                named = next((s for s in sections if s["name"].casefold() == offer["list"].casefold()), None)
+                if named:
+                    return named["id"]
+                used = {s.get("color") for s in sections}
+                color = next((c for c in LIST_COLORS if c not in used), LIST_COLORS[0])
+                fresh = {"id": new_id(), "name": offer["list"], "color": color, "bot": offer["bot"]}
+                sections.append(fresh)
+                self._save_sections(db, sections)
+                done["section"] = fresh["id"]
+                return fresh["id"]
+
+            def move_in() -> None:
+                target, moved = home(), done.setdefault("moved", {})
+                for task_id in offer.get("move") or []:
+                    row = db.execute("select section from tasks where id=? and status != 'done'", (task_id,)).fetchone()
+                    if row is not None and row[0] != target:
+                        moved[task_id] = row[0]
+                        db.execute("update tasks set section=?, rev=rev+1 where id=?", (target, task_id))
+                offer["move_state"] = "moved"
+
+            if action == "decline":
+                if state != "new":
+                    raise TaskError(409, "That offer was already answered.")
+                offer["state"], offer["answered_at"] = "declined", now
+            elif action == "accept":
+                if state != "new":
+                    raise TaskError(409, "That offer was already answered.")
+                target = home() if (make_list or not offer.get("new")) else None
+                source = {"kind": "chat", "profile": offer["bot"], "session_id": offer.get("session_id") or ""}
+                added, at = [], self.clock()
+                for index, item in enumerate(offer.get("tasks") or []):
+                    fields = {"title": item["title"], "due": item.get("due"), "notes": item.get("notes"),
+                              "section": target, "_section_by_id": True, "position": at + index / 1000}
+                    origin = dict(source, **({"from": item["source"]} if item.get("source") else {}))
+                    added.append(self.create(fields, created_by=offer["bot"], source=origin, db=db)["id"])
+                done["added"] = added
+                offer["state"], offer["answered_at"], offer["listed"] = "accepted", now, target is not None
+                if target is None and offer.get("move"):
+                    offer["move_state"] = "left"
+            elif action in ("move", "leave"):
+                if state != "accepted" or offer.get("move_state") != "new":
+                    raise TaskError(409, "Nothing is waiting to be moved.")
+                if action == "move":
+                    move_in()
+                else:
+                    offer["move_state"] = "left"
+                offer["answered_at"] = now
+            else:   # undo
+                if state != "accepted":
+                    raise TaskError(409, "There is nothing to undo.")
+                for task_id in done.get("added") or []:
+                    db.execute("delete from tasks where id=?", (task_id,))
+                    db.execute("delete from task_pages where id=?", (task_id,))
+                for task_id, old in (done.get("moved") or {}).items():
+                    back = old if old and any(s["id"] == old for s in sections) else None
+                    db.execute("update tasks set section=?, rev=rev+1 where id=?", (back, task_id))
+                made_list = done.get("section")
+                if made_list and db.execute("select 1 from tasks where section=?", (made_list,)).fetchone() is None:
+                    sections = [s for s in sections if s["id"] != made_list]
+                    self._save_sections(db, sections)
+                offer["state"], offer["answered_at"], offer["made"] = "undone", now, {}
+                if offer.get("move"):
+                    offer["move_state"] = "new"
+            self._save_offers(db, offers)
+            rev = self._bump_rev(db)
+            shown = self._show_offer(db, offer)
+            sections = self._read_sections(db)
+        return {"rev": rev, "offer": shown, "sections": sections}
 
     # -- prep (docs/tasks.md #3): quiet hours, the daily cap, handing out the next task -----------------------
 
@@ -1664,6 +2023,18 @@ def _capture_line(capture: str) -> str:
     return ""
 
 
+KEEPER_RULE = ("Keeping a list means: when something for it turns up in what you can see, put it there (tasks_add "
+               "with section and source; on a list that asks first, offer it with tasks_offer); when one of its "
+               "tasks looks settled, offer to close it (tasks_update offer_done) and never mark their task done or "
+               "reword it; tell them the top few, not the whole list.")
+
+
+def keeper_line(names: list[str]) -> str:
+    """0.9.55: the bot that keeps a list hears so from the list itself, not from a rule it wrote in its own notes."""
+    said = ", ".join(f"\u201c{n[:40]}\u201d" for n in names[:MAX_LISTED])
+    return f"You keep their Tasks list{'s' if len(names) > 1 else ''} {said}. {KEEPER_RULE}"
+
+
 def today_line(now: float) -> str:
     """The gateway's own date and time, so "today" and "tomorrow" mean the user's (build 755: "today" was saved as
     the next day — nothing told the bot the date)."""
@@ -1757,6 +2128,9 @@ def context_for(*, store: Store, profile: str, platform: str = "", parent_sessio
         shown = ", ".join(f"{t['title'][:40]} ({t['status']})" for t in mine[:MAX_LISTED])
         more = f", +{len(mine) - MAX_LISTED} more" if len(mine) > MAX_LISTED else ""
         lines.append(f"Open Tasks you share with them: {shown}{more}.")
+    kept = [s["name"] for s in store.get_sections() if s.get("bot") == profile]
+    if kept:
+        lines.append(keeper_line(kept))
     capture = _capture_line(settings.get("capture", "auto"))
     if capture:
         lines.append(capture)
@@ -1847,9 +2221,23 @@ MADE_ITEMS = {"type": "object", "properties": {
     "ref": {"type": "string", "description": "file: its full path. link: the URL. note: the text, in Markdown, one "
             "line per item (\"- **Elm & Oak**: 5 min, $25, book online\"); a long table goes in a file instead."}},
     "required": ["title"]}
-SECTION = {"type": "string", "description": "One of the user's own sections on the Tasks page, by name (tasks_list "
-           "lists them), when they ask for it to go there; empty takes it out of its section. Sections are theirs: "
-           "you can't make new ones."}
+SECTION = {"type": "string", "description": "One of the user's lists on the Tasks page, by name (tasks_list names "
+           "them), when it belongs there or they ask; empty takes it out of its list. You can't make a list "
+           "yourself: when one is missing, offer it with tasks_offer."}
+SOURCE = {"type": "object", "description": "Where you found this, when it came from somewhere you read (a message, "
+          "an email, a ticket, a calendar): the task shows it as a line (\"Chat app \u00b7 Sam \u00b7 Nov 13\"), and the "
+          "same ref never becomes a second task.", "properties": {
+    "app": {"type": "string", "description": "The app or place, a word or two: \"Email\", \"Calendar\"."},
+    "who": {"type": "string", "description": "Who it came from, as they'd say it: \"Sam\"."},
+    "at": {"type": "string", "description": "When, YYYY-MM-DD."},
+    "ref": {"type": "string", "description": "What names that one message, email or ticket and nothing else (its "
+            "id or permalink). A new ask in the same thread gets its own ref."},
+    "link": {"type": "string", "description": "A link that opens it, if there is one."}}}
+OFFER_TASK = {"type": "object", "properties": {
+    "title": {"type": "string"},
+    "due": {"type": "string", "description": "Only if it has a date: " + DUE_HELP},
+    "notes": {"type": "string", "description": "A sentence the user can read at a glance."},
+    "source": SOURCE}, "required": ["title"]}
 WATCH = {"type": "string", "description": "What you'll look out for that would answer or finish this, and where you'd "
          "see it, only if you can check it yourself, starting lowercase: \"a reply from Sam with the signed "
          "contract, by email\". Needs who 'bot' or 'together' with prep=true: your prep run comes an hour before it's due, checks this first, then gets "
@@ -1895,7 +2283,8 @@ ADD_SCHEMA = _schema(
     "theirs (who 'me'), and start yours: do it in this reply if it's quick, or set prep=true and start_now=true "
     "if it's long. who: 'me' (their own to-do; you don't touch it except to add a note, or to take a part of it "
     "with tasks_update), 'bot' (you'll do all of it), 'together' (steps split between you). If it's already on "
-    "the list you get that task back as 'already' and nothing is added: update it instead. " + WORKSPACE_RULE + " "
+    "the list you get that task back as 'already' and nothing is added: update it instead. Several tasks at once "
+    "for one list, or a list that isn't there yet: tasks_offer, not many tasks_add calls. " + WORKSPACE_RULE + " "
     + PREP_RULE + " In a scheduled job nobody reads your reply as it runs: when the job needs the user to decide, "
     "approve or do something, add it here without asking first (who 'me', or 'together' with your part done), the "
     "question in notes, instead of only writing it in the job's report. "
@@ -1918,6 +2307,9 @@ ADD_SCHEMA = _schema(
      "start_now": START_NOW,
      "bot": {"type": "string", "description": "Which bot (profile) it's for; default: you."},
      "section": SECTION,
+     "source": SOURCE,
+     "asked": {"type": "boolean", "description": "True only when the user just asked you, in this chat, to add "
+               "exactly this: then it goes on a list that asks first without an offer."},
      "priority": PRIORITY,
      "tags": TAGS,
      "starts": {"type": "string", "description": "Only if they said when it can start: the day (YYYY-MM-DD) it joins "
@@ -1928,7 +2320,9 @@ UPDATE_SCHEMA = _schema(
     "tasks_update",
     "Move a shared task along: note what you made, tick off your own steps, or ask for the user. You can only "
     "set status 'done' on a task that's yours alone (who='bot'); a 'together' task needs the user to finish it "
-    "— set it 'ready' instead. A 'me' task is the user's: add a short note, or — when they ask you to help with it "
+    "— set it 'ready' instead. A finished task takes nothing more: new work is a new task. A 'me' task is the "
+    "user's: you may file it (section), tag it, add a short note, or offer to close it (offer_done); one you added "
+    "yourself you may also fill in (notes, source, made, page) until they change it; or — when they ask you to help with it "
     "(first ask which parts with one clarify card: multi_select, up to 3 things you could do, best first, unless "
     "they already said), or you just added it in this chat — take a part of it: who='together' with add_steps "
     "(yours who 'bot', then "
@@ -1968,8 +2362,33 @@ UPDATE_SCHEMA = _schema(
      "watch": WATCH,
      "start_now": START_NOW,
      "section": SECTION,
+     "notes": {"type": "string", "description": "Only on a task you added (until the user changes it) or one that "
+               "is yours: its notes, rewritten. Otherwise use note."},
+     "source": SOURCE,
+     "offer_done": {"type": "string", "description": "On a task that isn't yours alone and looks settled: why, in "
+                    "a few words (\"Sam confirmed by email Tuesday\"). The user sees it on the task with Mark Done "
+                    "and Keep Open; you never mark their task done yourself."},
      "page": PAGE},
     ("id",))
+
+OFFER_SCHEMA = _schema(
+    "tasks_offer",
+    "Offer the user a list on their Tasks page, or a batch of tasks for a list, as ONE card they answer with a tap "
+    "(the card shows the tasks; nothing changes until they tap, and one Undo takes it all back). Use it when: they "
+    "ask you to keep or organise a kind of task and there is no list for it (list: the new list's name, tasks: "
+    "what would go in it; if they say yes you become that list's keeper); several new tasks belong to a list that "
+    "asks first; or tasks already on their page belong in a list (move: their ids; never move one without this). "
+    "After calling it, say one short line and stop: don't repeat the tasks in text, and don't ask again in words. "
+    "If they said not now to a list before, you get an error: don't offer it again.",
+    {"list": {"type": "string", "description": "The list's name: one of theirs (tasks_list names them), or a new "
+              "one, a word or two (\"Work\", \"Home\")."},
+     "tasks": {"type": "array", "description": "New tasks for it, up to 20; ones already on their list are left "
+               "out and come back as 'already'.", "items": OFFER_TASK},
+     "move": {"type": "array", "items": {"type": "string"}, "description": "ids of tasks already on their page "
+              "that belong in this list. Asked on the same card, separately."},
+     "why": {"type": "string", "description": "One short line the card shows under its title: \"From your email "
+             "and calendar this week\"."}},
+    ("list",))
 
 NEXT_PREP_SCHEMA = _schema(
     "tasks_next_prep",
@@ -1998,32 +2417,68 @@ def register_tools(ctx, store_for: Callable[[], Store], profile: Callable[[], st
             tasks = [t for t in tasks if t["bot"] == bot]
         if not include_done:
             tasks = [t for t in tasks if t["status"] != "done"]
-        names = store.section_names()
+        store.mark_checked(bot)
+        sections = store.get_sections()
+        names = {s["id"]: s["name"] for s in sections}
         pages = store.pages_for(t["id"] for t in tasks if t.get("page_at"))
         out = {"tasks": [compact(t, names, pages.get(t["id"])) for t in tasks]}
         if names:
             out["sections"] = list(names.values())
+        kept = [s["name"] for s in sections if s.get("bot") == bot]
+        if kept:   # 0.9.55
+            out["you_keep"] = kept
+        asking = [s["name"] for s in sections if s.get("adds") == "ask"]
+        if asking:
+            out["ask_first"] = asking
         return json.dumps(out, ensure_ascii=False)
 
     def handle_add(args, session_id="", **kwargs):
         store, bot = store_for(), profile()
         args = _as_dict(args)
         source = {"kind": "chat", "profile": bot, "session_id": str(session_id or "")}
-        twin = store.find_open_twin(_text(args.get("title"), TITLE_MAX))
+        found = clean_from(args.get("source"))   # 0.9.55: where it came from
+        if found:
+            source["from"] = found
+        same = store.find_by_ref(found.get("ref", ""))
+        if same and same["status"] == "done":
+            return json.dumps({"already_done": compact(same), "note": "A task from this same source is on their "
+                               "list and finished, so nothing was added. If this is new work, it has its own "
+                               "message or item: add it with that one's ref."}, ensure_ascii=False)
+        twin = same or store.find_open_twin(_text(args.get("title"), TITLE_MAX), found.get("ref", ""))
         if twin:
             return json.dumps({"already": compact(twin), "note": "This is already on their list, so nothing was "
                                "added. Update it with tasks_update if something changed."}, ensure_ascii=False)
+        sections = store.get_sections()
+        wanted = _text(args.get("section"), SECTION_NAME_MAX)
+        section = next((s for s in sections if wanted and wanted.casefold() in (s["name"].casefold(), s["id"])), None)
+        theirs = args.get("who") not in ("bot",)
+        if section is None and not wanted and theirs:
+            kept = [s for s in sections if s.get("bot") == bot]
+            section = kept[0] if len(kept) == 1 else None
+        if section is not None and section.get("adds") == "ask" and theirs and not args.get("asked"):
+            return json.dumps({"error": f"\u201c{section['name']}\u201d asks first: offer this with tasks_offer "
+                               f"(list \u201c{section['name']}\u201d, tasks) so they can tap yes. Only if they just "
+                               "asked you for exactly this task, call tasks_add again with asked=true."},
+                              ensure_ascii=False)
         try:
             fields = {**args, "due": resolve_due(args.get("due"), store.clock())}
+            for key in ("source", "asked"):
+                fields.pop(key, None)
             if fields.get("priority") == "none":
                 fields["priority"] = 0
             task = store.create(fields, created_by=bot, source=source)
         except TaskError as error:
             return json.dumps({"error": str(error.detail)}, ensure_ascii=False)
+        store.mark_checked(bot)
         home = bot_home(task["bot"]) if task["bot"] else None
         if task["prep"]:
             reconcile_prep_job(store, task["bot"], home)
         out = {**task, "undo": "Say 'undo' and I'll remove it, or tap Undo in the app"}
+        if wanted and section is None:
+            out["note"] = (f"They have no \u201c{wanted}\u201d list, so this went to their Inbox. To suggest that "
+                           "list, use tasks_offer; don't add more tasks for it until they answer.")
+        elif task.get("section"):
+            out["filed"] = next((s["name"] for s in sections if s["id"] == task["section"]), "")
         said = due_said(task["due"], store.clock())
         if said:
             out["due_said"] = said
@@ -2057,10 +2512,15 @@ def register_tools(ctx, store_for: Callable[[], Store], profile: Callable[[], st
                                     undone_steps=args.get("undone_steps"), next_check=next_check,
                                     choices=args.get("choices"), owner_said=owner_said,
                                     priority=(0 if args.get("priority") == "none" else args.get("priority")) if "priority" in args else None,
-                                    tags=args.get("tags") if "tags" in args else None)
+                                    tags=args.get("tags") if "tags" in args else None,
+                                    notes=args.get("notes"), source=args.get("source"),
+                                    offer_done=args.get("offer_done"))
         except TaskError as error:
             return json.dumps({"error": str(error.detail)}, ensure_ascii=False)
+        store.mark_checked(bot)
         out = dict(task)
+        if args.get("offer_done") and task.get("offer"):
+            out["offered"] = "They see Mark Done and Keep Open on the task. Say so in a few words; don't ask again."
         if before.get("who") == "me" and task["who"] == "together":
             # The app's "Hermes Is Helping" card keys on this: the log's last line is the bot's own note when it
             # gave one (2026-11-04 live test: "Hermes taking the shortlist; …", so the card never showed).
@@ -2086,6 +2546,24 @@ def register_tools(ctx, store_for: Callable[[], Store], profile: Callable[[], st
                             "it's done (or when the bot you asked answers).")
         return json.dumps(out, ensure_ascii=False)
 
+    def handle_offer(args, session_id="", **kwargs):
+        store, bot = store_for(), profile()
+        args = _as_dict(args)
+        items = []
+        for item in args.get("tasks") if isinstance(args.get("tasks"), list) else []:
+            if isinstance(item, dict):
+                try:
+                    items.append({**item, "due": resolve_due(item.get("due"), store.clock())})
+                except TaskError as error:
+                    return json.dumps({"error": str(error.detail)}, ensure_ascii=False)
+        try:
+            offer = store.offer(bot, str(session_id or ""), args.get("list"), items, args.get("move"), args.get("why"))
+        except TaskError as error:
+            return json.dumps({"error": str(error.detail)}, ensure_ascii=False)
+        store.mark_checked(bot)
+        return json.dumps({"offer": offer, "say": "The card is on their screen with these tasks. One short line, "
+                           "then stop: don't list the tasks again and don't ask in words."}, ensure_ascii=False)
+
     def handle_next_prep(args, **kwargs):
         store = store_for()
         if not store.enabled():
@@ -2105,5 +2583,7 @@ def register_tools(ctx, store_for: Callable[[], Store], profile: Callable[[], st
                       description=ADD_SCHEMA["description"], emoji="➕")
     ctx.register_tool(name="tasks_update", toolset="hq_tasks", check_fn=on, schema=UPDATE_SCHEMA, handler=handle_update,
                       description=UPDATE_SCHEMA["description"], emoji="✅")
+    ctx.register_tool(name="tasks_offer", toolset="hq_tasks", check_fn=on, schema=OFFER_SCHEMA, handler=handle_offer,
+                      description=OFFER_SCHEMA["description"], emoji="🗂️")
     ctx.register_tool(name="tasks_next_prep", toolset="hq_tasks", check_fn=on, schema=NEXT_PREP_SCHEMA,
                       handler=handle_next_prep, description=NEXT_PREP_SCHEMA["description"], emoji="🧪")
