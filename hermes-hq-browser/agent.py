@@ -183,9 +183,13 @@ def _tmpdir() -> str:
 
 def browser_of(info: dict | None) -> tuple[str, str] | None:
     """``("daemon", session name)`` for a Hermes-managed Chromium, ``("cdp", ws url)`` for a local browser
-    Hermes attaches to (the real-profile Chrome, a local override), or None (cloud, Lightpanda, remote)."""
-    if not info or info.get("bb_session_id"):
+    Hermes attaches to (the real-profile Chrome, a local override), ``("cloud", wss url)`` for a Browser Use cloud
+    browser, or None (another cloud, Lightpanda, remote)."""
+    if not info:
         return None
+    if info.get("bb_session_id"):
+        url = str(info.get("cdp_url") or "")
+        return ("cloud", url) if CLOUD.match(url) else None
     name = info.get("session_name")
     if not isinstance(name, str) or not name or name.startswith("lp"):
         return None
@@ -198,6 +202,9 @@ def browser_of(info: dict | None) -> tuple[str, str] | None:
 
 
 LOCAL_CDP = ("ws://127.0.0.1:", "ws://localhost:", "ws://[::1]:", "http://127.0.0.1:", "http://localhost:")
+# cdp.py's CLOUD (the dashboard side checks it again before it connects): a Browser Use cloud browser's socket.
+CLOUD = re.compile(r"^wss://[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.cdp\.browser-use\.com"
+                   r"/devtools/browser/[A-Za-z0-9-]{1,128}$")
 
 
 def exec_source() -> tuple[str, str] | None:
@@ -222,7 +229,10 @@ def exec_source() -> tuple[str, str] | None:
 
 
 def _reachable(url: str) -> bool:
-    """A loopback debugging port still accepts connections (cheap; no CDP)."""
+    """A loopback debugging port still accepts connections (cheap; no CDP). A cloud browser is not asked: it is open
+    for as long as Hermes keeps its session (``_open_keys``)."""
+    if CLOUD.match(url or ""):
+        return True
     import socket
     from urllib.parse import urlsplit
     try:
@@ -240,6 +250,8 @@ def _ident(profile: str, kind: str, value: str) -> str:
 def endpoint(source: tuple[str, str], tmpdir: str | None = None) -> str | None:
     """``ws://127.0.0.1:<port>/devtools/browser/<id>`` of the browser, or None."""
     kind, value = source
+    if kind == "cloud":
+        return value if CLOUD.match(value) else None
     if kind == "cdp":
         if "/devtools/browser/" in value:
             return value
@@ -299,7 +311,7 @@ def _track(key: str, session_id: str, task_id: str, tool_name: str, url=None) ->
                 schema=_spool.SCHEMA, id=ident, generation=GENERATION, pid=os.getpid(), profile=profile,
                 source=list(source), keys=[], session_ids=[], session_id=session_id or task_id, endpoint=None,
                 opened_at=now, status="live", url=None, busy=0, paused=None, dirty=True,
-                shared=source[0] == "cdp", fallback=fallback)
+                shared=source[0] == "cdp", fallback=fallback, cloud=source[0] == "cloud")
         if key not in record["keys"]:
             record["keys"].append(key)
         sid = session_id or task_id
@@ -616,11 +628,15 @@ def page_url(endpoint_url: str) -> str | None:
     from urllib.parse import urlsplit
     try:
         parts = urlsplit(endpoint_url)
-        if parts.hostname not in ("127.0.0.1", "localhost", "::1") or not parts.port:
+        if CLOUD.match(endpoint_url or ""):
+            listing = f"https://{parts.hostname}/json/list"
+        elif parts.hostname not in ("127.0.0.1", "localhost", "::1") or not parts.port:
             return None
-        scheme = "https" if parts.scheme in ("wss", "https") else "http"
-        host = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
-        with urllib.request.urlopen(f"{scheme}://{host}:{parts.port}/json/list", timeout=2) as response:  # noqa: S310 - loopback only
+        else:
+            scheme = "https" if parts.scheme in ("wss", "https") else "http"
+            host = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
+            listing = f"{scheme}://{host}:{parts.port}/json/list"
+        with urllib.request.urlopen(listing, timeout=4) as response:  # noqa: S310 - loopback, or the bot's cloud browser
             targets = json.loads(response.read(1 << 20))
     except Exception:  # noqa: BLE001
         return None

@@ -61,5 +61,11 @@ def register(ctx):
         if callable(getattr(ctx, "register_system_prompt_section", None)):
             ctx.register_system_prompt_section("hermes-hq-browser.web", agent.system_section, max_chars=1200)
         ctx.register_hook("pre_llm_call", agent.before_llm)
+        # Browser Use Cloud for a bot (cloud.py). Optional: an older Hermes without browser providers gets the rest.
+        if callable(getattr(ctx, "register_browser_provider", None)):
+            try:
+                ctx.register_browser_provider(load("cloud").provider())
+            except Exception:  # noqa: BLE001
+                log.info("hermes-hq-browser: Browser Use Cloud isn't available in this Hermes", exc_info=True)
     except Exception:  # noqa: BLE001 - a broken plugin must never break the agent
         log.warning("hermes-hq-browser: could not start", exc_info=True)

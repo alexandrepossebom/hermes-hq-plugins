@@ -64,6 +64,7 @@ REFRESH_IDLE = 1200.0
 REFRESH_UNUSED = 4 * 3600.0
 REFRESH_SPACING = 180.0
 WINDOW = "1280,800"
+CLOUD_PROVIDER = "hq-browser-use"  # cloud.PROVIDER
 LOCAL = re.compile(r"^(?:http|ws)://(?:127\.0\.0\.1|localhost|\[::1\]):(\d{2,5})/?$")
 LOOPBACK_FIXED = re.compile(r"^ws://(?:127\.0\.0\.1|localhost|\[::1\]):\d+/devtools/browser/")  # one browser, by id
 SAFE_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
@@ -363,8 +364,8 @@ def skip_reason(config: dict, state: dict) -> str | None:
     """Why this plugin leaves a bot's browser alone, from its config and state file (``plan``'s checks, in its order;
     choice.py reads the same): ``off`` (the plugin is disabled in that profile), ``real_profile`` (Hermes' own
     ``browser.use_real_profile``), ``fixed`` / ``remote`` (a ``cdp_url`` naming one browser by id, or another
-    computer's), ``released`` (the plugin set ``cdp_url`` and the person removed it), ``camofox``. None: the plugin
-    runs it."""
+    computer's), ``released`` (the plugin set ``cdp_url`` and the person removed it), ``cloud`` (Browser Use Cloud, chosen
+    in Hermes HQ), ``camofox``. None: the plugin runs it."""
     settings = browser_settings(config)
     enabled, disabled = plugin_lists(config)
     url = str(settings.get("cdp_url") or "").strip()
@@ -374,6 +375,8 @@ def skip_reason(config: dict, state: dict) -> str | None:
         return "real_profile"
     if url and port_of(url) is None:
         return "fixed" if LOOPBACK_FIXED.match(url) else "remote"
+    if not url and str(settings.get("cloud_provider") or "").lower() == CLOUD_PROVIDER:
+        return "cloud"  # Browser Use Cloud, chosen in Hermes HQ (cloud.py)
     if not url and state.get("url"):
         return "released"  # the plugin set cdp_url and the person removed it
     if not url and str(settings.get("cloud_provider") or "").lower() == "camofox":
@@ -774,11 +777,12 @@ class Supervisor:
     def keep(self, profile: str, home: Path, decision: dict, state: dict, processes, now: float) -> dict:
         if "skip" in decision:
             reason = decision["skip"]
-            if reason == "released" and state.get("status") != "released":
+            if reason in ("released", "cloud") and state.get("status") != reason:
                 if state.get("pid") and state.get("folder"):
                     end(int(state["pid"]), state["folder"])
-                state = update_state(self.root, profile, {"status": "released", "pid": None})
-                log.info("hermes-hq-browser: %s's cdp_url was removed; its own Chrome is off", profile)
+                state = update_state(self.root, profile, {"status": reason, "pid": None})
+                log.info("hermes-hq-browser: %s's own Chrome is off (%s)", profile,
+                         "it browses in Browser Use Cloud" if reason == "cloud" else "its cdp_url was removed")
             return {"profile": profile, "status": reason}
         port, url = decision["manage"], decision["url"]
         folder = str(home / "chrome-debug")

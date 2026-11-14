@@ -7,7 +7,21 @@ import json
 import re
 
 LOOPBACK = re.compile(r"^ws://(?:127\.0\.0\.1|localhost|\[::1\]):(\d{1,5})/devtools/browser/[A-Za-z0-9-]{1,128}$")
+# A Browser Use cloud browser (the bot's ``browser.cloud_provider``): Chrome's own DevTools socket behind a host
+# named after the session, which is the secret. Nothing else off this machine is ever connected to.
+CLOUD = re.compile(r"^wss://[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.cdp\.browser-use\.com"
+                   r"/devtools/browser/[A-Za-z0-9-]{1,128}$")
 MAX_MESSAGE = 32 * 1024 * 1024
+
+
+def usable(endpoint) -> bool:
+    """An endpoint this plugin may connect to: a browser on this machine, or a Browser Use cloud browser."""
+    endpoint = endpoint or ""
+    return bool(LOOPBACK.match(endpoint) or CLOUD.match(endpoint))
+
+
+def cloud(endpoint) -> bool:
+    return bool(CLOUD.match(endpoint or ""))
 
 
 class CdpError(Exception):
@@ -24,11 +38,12 @@ class Cdp:
         self.closed = asyncio.Event()
 
     async def connect(self, endpoint: str, timeout: float = 5.0):
-        if not LOOPBACK.match(endpoint or ""):
+        if not usable(endpoint):
             raise CdpError("not a local browser")
         import websockets
         self.socket = await asyncio.wait_for(
-            websockets.connect(endpoint, max_size=MAX_MESSAGE, ping_interval=None, open_timeout=timeout), timeout)
+            websockets.connect(endpoint, max_size=MAX_MESSAGE, ping_interval=None,
+                               open_timeout=timeout + (5.0 if cloud(endpoint) else 0.0)), timeout + (5.0 if cloud(endpoint) else 0.0))
         self.reader = asyncio.create_task(self._read())
         return self
 

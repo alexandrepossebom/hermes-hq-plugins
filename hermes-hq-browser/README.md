@@ -60,6 +60,26 @@ Install the plugin once, for the main profile. The dashboard (`fleet.py`, one su
 `GET /bots` reports each bot's Chrome (`ready`, `starting`, `not_responding`, or why it has none) and Hermes HQ
 says so when there is no page to show. State lives in `<hermes root>/hermes-hq-browser/chromes/<profile>.json`.
 
+## Browser Use Cloud (3.9)
+
+A bot can browse in a cloud browser on the person's own [Browser Use](https://browser-use.com) account instead of a
+Chrome on this machine: **Bot Info › Browser › Browser Use Cloud** in Hermes HQ, after pasting an API key once.
+
+- **The key** is checked with Browser Use, then saved in `<hermes root>/hermes-hq-browser/cloud.json` (owner-only).
+  `GET /cloud` says whether one is saved and its last four characters, never the key. `POST /cloud {"key": ""}`
+  forgets it. Without a saved key, Hermes' own `BROWSER_USE_API_KEY` is used when it is set.
+- **The choice** (`POST /choice {"mode": "cloud"}`) changes only that bot's `config.yaml`, backed up first:
+  `browser.cloud_provider: hq-browser-use`, `browser.cdp_url` emptied. Its own Chrome is stopped and its folder, with
+  the sign-ins it had, stays. `{"mode": "own"}` brings it back.
+- **The provider** (`cloud.py`, registered as `hq-browser-use`) starts the browser when the bot first browses and
+  stops it when Hermes closes the session. Each bot has a Browser Use profile of its own, made the first time, so its
+  sign-ins stay between browsers (Hermes' built-in `browser-use` provider starts every browser signed out). No proxy
+  is used. A browser Hermes forgot to close stops by itself after two hours.
+- **Watch and Take Control** work as for a bot's own Chrome: the cloud browser is listed, streamed and held through
+  the same routes. The plugin connects only to `wss://<session id>.cdp.browser-use.com` (and browsers on this machine).
+- Browser Use bills the person's account by the minute. Not checked yet on a Hermes Cloud (Nous-hosted) agent, where a
+  managed setting may override the bot's choice.
+
 ## How it works
 
 - **Agent processes** (the messaging gateway, the dashboard's chat gateway, profile chats, cron) load

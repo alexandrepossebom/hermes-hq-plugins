@@ -272,7 +272,7 @@ def merge(into: dict, values: dict) -> None:
 # ``external`` (its cdp_url's port is answered by a Chrome the person runs), ``no_browser`` (its browser tools are
 # switched off in Hermes: never offered, whatever else is set), ``starting`` (no Chrome of its own yet: the supervisor
 # hasn't come round to it).
-TAKE_OVER = ("real_profile", "released", "external", "fixed")
+TAKE_OVER = ("real_profile", "released", "external", "fixed", "cloud")
 REFUSED = {
     "off": "Hermes HQ’s browser add-on is switched off for this bot, so it can’t run its browser.",
     "no_browser": "This bot’s browser tools are turned off in Hermes, so there’s no browser to run.",
@@ -284,6 +284,7 @@ BLOCKED = {
     "real_profile": "This bot uses your real Chrome profile through Hermes’s own setting, so Hermes HQ doesn’t run its "
                     "browser.",
     "released": "This bot’s browser was turned off in its Hermes settings.",
+    "cloud": "This bot browses in Browser Use Cloud. Switch it back to its own browser to change this.",
     **REFUSED,
 }
 TAKE_OVER_WAIT = 25.0  # seconds take_over waits for the supervisor to bring the bot's Chrome up
@@ -293,7 +294,7 @@ def blocked_reason(fleet, config: dict, state: dict) -> str | None:
     """None when this plugin runs the bot's Chrome (its choice can be changed), else a short reason code."""
     reason = fleet.skip_reason(config, state)
     if reason is None:
-        if state.get("status") in ("external", "released"):
+        if state.get("status") in ("external", "released") and reason is None:
             reason = state["status"]
         elif not state.get("folder"):
             reason = "starting"
@@ -315,7 +316,7 @@ def read_choice(fleet, root: Path, profile: str, home: Path | None = None) -> di
     config = fleet.read_config(home) if home is not None else {}
     source = state.get("source") if isinstance(state.get("source"), dict) else None
     blocked = blocked_reason(fleet, config, state)
-    return {"schema": CHOICE_SCHEMA, "profile": profile, "mode": "copy" if source else "own",
+    return {"schema": CHOICE_SCHEMA, "profile": profile, "mode": "cloud" if blocked == "cloud" else "copy" if source else "own",
             "source": source, "copied_at": state.get("copied_at") if source else None,
             "window": "normal" if state.get("window") == "normal" else "hidden",
             # Only a Chrome this plugin runs for the bot can be changed (not a remote, real-profile or hand-made one).
@@ -438,7 +439,7 @@ def take_over(fleet, root: Path, profile: str, home: Path, *, wait: float | None
         current = str(fleet.browser_settings(config).get("cdp_url") or "").strip()
         if blocked == "real_profile" and fleet.port_of(current):
             url = current                       # already pointed at a Chrome of its own; only the real profile goes
-        elif blocked in ("real_profile", "released") and fleet.port_of(state.get("url")):
+        elif blocked in ("real_profile", "released", "cloud") and fleet.port_of(state.get("url")):
             url = state["url"]                  # the address this plugin gave it before: its Chrome folder is there
         else:
             url = ""                            # the supervisor gives it a port of its own and writes it
@@ -456,6 +457,8 @@ def take_over(fleet, root: Path, profile: str, home: Path, *, wait: float | None
                 settings = config["browser"] = {}
             if settings.get("use_real_profile"):
                 settings["use_real_profile"] = False
+            if str(settings.get("cloud_provider") or "").lower() == fleet.CLOUD_PROVIDER:
+                settings["cloud_provider"] = "local"
             settings["cdp_url"] = url
         try:
             fleet.write_config(home, change)
@@ -472,6 +475,49 @@ def take_over(fleet, root: Path, profile: str, home: Path, *, wait: float | None
         if time.time() >= deadline:
             break                               # it comes up on a later pass; the phone shows where it is
         time.sleep(0.5)
+    return read_choice(fleet, root, profile, home)
+
+
+CLOUD_REFUSED = ("off", "no_browser")
+
+
+def set_cloud(fleet, root: Path, profile: str, home: Path, *, now: float | None = None) -> dict:
+    """The bot browses in Browser Use Cloud from its next browser call (cloud.py). Only that profile's ``config.yaml``
+    changes, through Hermes' own writer, backed up first like ``take_over``: ``browser.cloud_provider`` names this
+    plugin's provider, ``browser.cdp_url`` is emptied (a set one would win over any cloud) and
+    ``browser.use_real_profile`` goes off. Its own Chrome is stopped; the folder with its sign-ins stays, and
+    ``take_over`` (the phone's "Its Own") brings it back. Raises ``ValueError`` (plain words) when it can't."""
+    now = time.time() if now is None else now
+    lock = fleet.state_folder(root) / f"{profile}.lock"
+    with fleet.Locked(lock):
+        config = fleet.read_config(home)
+        state = fleet.read_state(root, profile)
+        blocked = blocked_reason(fleet, config, state)
+        if blocked == "cloud":
+            return read_choice(fleet, root, profile, home)
+        if blocked in CLOUD_REFUSED:
+            raise ValueError(REFUSED[blocked])
+        _back_up_config(root, profile, home, now)
+        if state.get("folder") and state.get("status") != "external":
+            try:
+                stop_chrome(fleet, Path(state["folder"]), state.get("port"), profile)
+            except ValueError:
+                pass  # the supervisor ends it on its next pass (keep: reason "cloud")
+
+        def change(config):
+            settings = config.get("browser")
+            if not isinstance(settings, dict):
+                settings = config["browser"] = {}
+            if settings.get("use_real_profile"):
+                settings["use_real_profile"] = False
+            settings["cdp_url"] = ""
+            settings["cloud_provider"] = fleet.CLOUD_PROVIDER
+        try:
+            fleet.write_config(home, change)
+        except Exception:  # noqa: BLE001 - the config is as it was
+            raise ValueError("Couldn’t change this bot’s Hermes settings. Try again.") from None
+        fleet.write_state(root, profile, {**{k: v for k, v in state.items() if k not in ("pid", "error")},
+                                          "status": "cloud"})
     return read_choice(fleet, root, profile, home)
 
 

@@ -149,7 +149,7 @@ def public(record: dict, now: float | None = None) -> dict:
     return {"id": record.get("id"), "profile": record.get("profile"), "session_id": record.get("session_id"),
             "session_ids": list(record.get("session_ids") or [])[-16:], "opened_at": record.get("opened_at"),
             "agent_at": record.get("agent_at"), "url": record.get("url"), "busy": busy,
-            "active": busy > 0 or (agent_at > 0 and now - agent_at < ACTIVE_FOR)}
+            "active": busy > 0 or (agent_at > 0 and now - agent_at < ACTIVE_FOR), "cloud": bool(record.get("cloud"))}
 
 
 def blank(url) -> bool:
@@ -825,11 +825,16 @@ class Viewer:
 
     async def _front_tab(self):
         """The tab in front of the bot's Chrome: Chrome lists its tabs most recently activated first."""
-        found = re.match(r"^ws://((?:127\.0\.0\.1|localhost|\[::1\]):\d{1,5})/devtools/browser/", self.record.get("endpoint") or "")
-        if not found:
+        endpoint = self.record.get("endpoint") or ""
+        found = re.match(r"^ws://((?:127\.0\.0\.1|localhost|\[::1\]):\d{1,5})/devtools/browser/", endpoint)
+        if found:
+            address = f"http://{found.group(1)}/json/list"
+        elif self.cdp_module.cloud(endpoint):
+            address = "https://" + endpoint[len("wss://"):].split("/", 1)[0] + "/json/list"
+        else:
             return None
         try:
-            listing = await asyncio.to_thread(_get_json, f"http://{found.group(1)}/json/list")
+            listing = await asyncio.to_thread(_get_json, address)
         except Exception:  # noqa: BLE001
             return None
         tabs = self.cdp_module.page_tabs([{**t, "targetId": t.get("id")} for t in listing if isinstance(t, dict)])

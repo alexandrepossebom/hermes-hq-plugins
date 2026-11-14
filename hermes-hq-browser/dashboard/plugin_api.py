@@ -27,7 +27,7 @@ from fastapi import APIRouter, Body, HTTPException, WebSocket, WebSocketDisconne
 
 log = logging.getLogger("hermes-hq-browser")
 _ROOT = Path(__file__).parents[1]
-VERSION = "3.8.1"
+VERSION = "3.9.0"
 RETAIN_ENDED = 120.0
 MAX_VIEWERS = 8
 VIEWER_ID = re.compile(r"^[0-9a-f]{32}$")
@@ -69,6 +69,7 @@ stream = _load("stream")
 fleet = _load("fleet")
 tabs = _load("tabs")
 choice = _load("choice")
+cloud = _load("cloud")
 tracker = tabs.Tracker(cdp)
 router = APIRouter()
 _viewers = 0
@@ -266,7 +267,7 @@ def _live_records():
                 for kind in ("browsers", "control", "asks"):
                     spool.remove(spool.folder(kind) / f"{ident}.json")
             continue
-        if record.get("id") != ident or not cdp.LOOPBACK.match(record.get("endpoint") or ""):
+        if record.get("id") != ident or not cdp.usable(record.get("endpoint")):
             continue
         groups.setdefault(_chrome_of(record), []).append(record)
     rows = []
@@ -368,7 +369,7 @@ def _record(ident):
         raise HTTPException(404, "No such browser")
 
     def live(found):
-        return found is not None and found.get("id") == ident and spool.live(found) and cdp.LOOPBACK.match(found.get("endpoint") or "")
+        return found is not None and found.get("id") == ident and spool.live(found) and cdp.usable(found.get("endpoint"))
     record = spool.read(spool.folder("browsers") / f"{ident}.json")
     if not live(record):
         # Not listed (or not lately): ask every bot's Chrome now. A listed one skips that (it costs an HTTP round trip
@@ -393,7 +394,7 @@ def health():
     return {"ok": True, "schema": "dispatch-browser.health.v3", "version": VERSION, "protocol": stream.PROTOCOL,
             "installed": not missing and not drift, "missing": missing, "drift": drift,
             "features": {"watch": True, "control": True, "ask": True, "dialogs": True, "own_chrome": _own_chrome(),
-                         "choice": _own_chrome()}}
+                         "choice": _own_chrome(), "cloud": True}}
 
 
 def _own_chrome() -> bool:
@@ -449,6 +450,21 @@ def post_choice(body: dict = Body(...)):  # sync: a profile copy takes seconds, 
         return result
     mode, window = body.get("mode"), body.get("window")
     source = body.get("source")
+    root = fleet.hermes_root()
+    try:
+        if mode == "cloud":
+            if cloud.api_key(root) is None:
+                raise ValueError("Add your Browser Use API key first (Settings › Browser Use Cloud).")
+            result = choice.set_cloud(fleet, root, profile, home)
+            log.info("hermes-hq-browser: %s now browses in Browser Use Cloud", profile)
+            return result
+        if mode in ("own", "copy") and choice.read_choice(fleet, root, profile, home)["blocked"] == "cloud":
+            choice.take_over(fleet, root, profile, home)  # back to a Chrome of its own, then the choice below
+            log.info("hermes-hq-browser: %s is back on its own browser", profile)
+            if mode == "own" and window is None:
+                return choice.read_choice(fleet, root, profile, home)
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from None
     try:
         result = choice.set_choice(fleet, fleet.hermes_root(), profile, home,
                                    mode=mode if isinstance(mode, str) else None,
@@ -458,6 +474,26 @@ def post_choice(body: dict = Body(...)):  # sync: a profile copy takes seconds, 
     except ValueError as error:
         raise HTTPException(409, str(error)) from None
     log.info("hermes-hq-browser: %s's browser is now %s, %s window", profile, result["mode"], result["window"])
+    return result
+
+
+@router.get("/cloud")
+def get_cloud():
+    """Browser Use Cloud: whether the person's API key is saved (never the key itself)."""
+    return cloud.status(fleet.hermes_root())
+
+
+@router.post("/cloud")
+def post_cloud(body: dict = Body(...)):  # sync: asks Browser Use whether the key works, on a worker thread
+    """``{"key": "..."}`` saves the key once Browser Use accepts it; ``{"key": ""}`` forgets it."""
+    key = body.get("key")
+    if not isinstance(key, str):
+        raise HTTPException(400, "Send the API key.")
+    try:
+        result = cloud.save_key(key, fleet.hermes_root())
+    except cloud.CloudError as error:
+        raise HTTPException(409, str(error)) from None
+    log.info("hermes-hq-browser: Browser Use API key %s", "saved" if result["key_set"] else "removed")
     return result
 
 
