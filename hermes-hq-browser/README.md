@@ -80,8 +80,16 @@ Chrome on this machine: **Bot Info › Browser › Browser Use Cloud** in Hermes
 - **Use for All Bots** (3.10, **Settings › Browser Use Cloud** in Hermes HQ; `POST /cloud {"all": true}`) puts every
   bot on this machine in the cloud, and a new bot joins within one supervisor pass. A bot put back on its own browser
   from its Bot Info page is remembered as an exception. Turning it off gives each cloud bot its own Chrome back.
-- Browser Use bills the person's account by the minute. Not checked yet on a Hermes Cloud (Nous-hosted) agent, where a
-  managed setting may override the bot's choice.
+- Browser Use bills the person's account by the minute.
+- **A hosted Hermes** (3.11: Hermes Cloud, which Nous runs). There the plugin starts no Chrome and writes no `cdp_url`:
+  each bot keeps the cloud browser Hermes gives it (`blocked: "hosted"`) until the person chooses Browser Use Cloud for
+  it, and goes back to it when they undo that (`browser.cloud_provider` is removed, not emptied). The plugin knows it
+  is hosted from `HERMES_HQ_BROWSER_HOSTED=1`, a request that reached it under a `*.agents.nousresearch.com` address, or
+  Hermes HQ saying so (`POST /cloud {"hosted": true}`); `/health` reports `hosted`. A first install gives no bot a
+  Chrome for its first minute, so that word arrives first; a `cdp_url` written before it is taken back. Not yet run on
+  a real Hermes Cloud agent.
+- On any machine with no Chrome or Chromium, a bot that has no browser address yet is left as it is (`no_chrome`)
+  instead of being pointed at a Chrome that can't start.
 
 ## How it works
 

@@ -279,6 +279,7 @@ REFUSED = {
     "remote": "This bot uses a browser on another computer, so Hermes HQ leaves it alone.",
     "camofox": "This bot browses through Camofox, so Hermes HQ leaves it alone.",
     "starting": "Hermes HQ is still setting up this bot’s browser. Try again in a minute.",
+    "hosted": "On Hermes Cloud this bot uses the browser Hermes Cloud gives it. You can switch it to Browser Use Cloud.",
 }
 BLOCKED = {
     "real_profile": "This bot uses your real Chrome profile through Hermes’s own setting, so Hermes HQ doesn’t run its "
@@ -317,6 +318,7 @@ def read_choice(fleet, root: Path, profile: str, home: Path | None = None) -> di
     source = state.get("source") if isinstance(state.get("source"), dict) else None
     blocked = blocked_reason(fleet, config, state)
     return {"schema": CHOICE_SCHEMA, "profile": profile, "mode": "cloud" if blocked == "cloud" else "copy" if source else "own",
+            "hosted": fleet.hosted(root),  # a hosted Hermes: "own" is the browser Hermes gives the bot there
             "source": source, "copied_at": state.get("copied_at") if source else None,
             "window": "normal" if state.get("window") == "normal" else "hidden",
             # Only a Chrome this plugin runs for the bot can be changed (not a remote, real-profile or hand-made one).
@@ -434,6 +436,8 @@ def take_over(fleet, root: Path, profile: str, home: Path, *, wait: float | None
         blocked = blocked_reason(fleet, config, state)
         if blocked is None:
             return read_choice(fleet, root, profile, home)
+        if blocked == "cloud" and fleet.hosted(root):
+            return _leave_cloud_hosted(fleet, root, profile, home, state, now)
         if blocked not in TAKE_OVER:
             raise ValueError(REFUSED.get(blocked) or "Hermes HQ can’t run this bot’s browser.")
         current = str(fleet.browser_settings(config).get("cdp_url") or "").strip()
@@ -475,6 +479,29 @@ def take_over(fleet, root: Path, profile: str, home: Path, *, wait: float | None
         if time.time() >= deadline:
             break                               # it comes up on a later pass; the phone shows where it is
         time.sleep(0.5)
+    return read_choice(fleet, root, profile, home)
+
+
+def _leave_cloud_hosted(fleet, root: Path, profile: str, home: Path, state: dict, now: float) -> dict:
+    """A hosted Hermes: a bot leaves Browser Use Cloud for the browser Hermes gives it there. ``browser.cloud_provider``
+    is removed, not emptied: an empty one tells Hermes to pick no cloud browser at all. Under the bot's lock."""
+    _back_up_config(root, profile, home, now)
+
+    def change(config):
+        settings = config.get("browser")
+        if not isinstance(settings, dict):
+            return
+        if str(settings.get("cloud_provider") or "").lower() == fleet.CLOUD_PROVIDER:
+            settings.pop("cloud_provider", None)
+        if not str(settings.get("cdp_url") or "").strip():
+            settings.pop("cdp_url", None)
+        if not settings:
+            config.pop("browser", None)
+    try:
+        fleet.write_config(home, change)
+    except Exception:  # noqa: BLE001 - the config is as it was
+        raise ValueError("Couldn’t change this bot’s Hermes settings. Try again.") from None
+    fleet.write_state(root, profile, {"profile": profile, "status": "hosted"})
     return read_choice(fleet, root, profile, home)
 
 

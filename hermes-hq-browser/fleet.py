@@ -64,6 +64,10 @@ REFRESH_IDLE = 1200.0
 REFRESH_UNUSED = 4 * 3600.0
 REFRESH_SPACING = 180.0
 WINDOW = "1280,800"
+# A first install gives no bot a Chrome for this long: on a hosted Hermes, Hermes HQ says so within seconds of the
+# restart (it is watching for the plugin), and a Chrome started and a ``cdp_url`` written before that would only have to
+# be taken back.
+HOSTED_HOLD = 60.0
 CLOUD_PROVIDER = "hq-browser-use"  # cloud.PROVIDER
 LOCAL = re.compile(r"^(?:http|ws)://(?:127\.0\.0\.1|localhost|\[::1\]):(\d{2,5})/?$")
 LOOPBACK_FIXED = re.compile(r"^ws://(?:127\.0\.0\.1|localhost|\[::1\]):\d+/devtools/browser/")  # one browser, by id
@@ -106,6 +110,41 @@ def state_home(root: Path) -> Path:
 def hermes_root() -> Path:
     from hermes_constants import get_default_hermes_root
     return Path(get_default_hermes_root())
+
+
+# A hosted Hermes (Hermes Cloud, which Nous runs): its bots browse in the cloud browser Hermes sets up there, and the
+# machine is small. So this plugin starts no Chrome on it and writes no ``cdp_url``; a bot only changes when the person
+# chooses Browser Use Cloud for it in Hermes HQ (cloud.py), and goes back to Hermes' own browser when they undo that.
+# Known from ``HERMES_HQ_BROWSER_HOSTED`` (1 or 0), else a marker the dashboard writes once a request reaches it under
+# a Hermes Cloud address or Hermes HQ says so (dashboard/plugin_api.py).
+HOSTED_HOST = ".agents.nousresearch.com"
+
+
+def hosted_marker(root: Path) -> Path:
+    return state_home(root) / "hosted"
+
+
+def hosted(root: Path | None = None) -> bool:
+    forced = setting("HOSTED")
+    if forced in ("0", "1"):
+        return forced == "1"
+    try:
+        return hosted_marker(root or hermes_root()).is_file()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def set_hosted(root: Path, on: bool = True) -> bool:
+    """Remember that this Hermes is hosted. True when that is news."""
+    marker = hosted_marker(root)
+    if marker.is_file() == on:
+        return False
+    if on:
+        marker.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        marker.write_text("1\n")
+    else:
+        marker.unlink(missing_ok=True)
+    return True
 
 
 def profiles(root: Path) -> list[tuple[str, Path]]:
@@ -365,12 +404,15 @@ def skip_reason(config: dict, state: dict) -> str | None:
     choice.py reads the same): ``off`` (the plugin is disabled in that profile), ``real_profile`` (Hermes' own
     ``browser.use_real_profile``), ``fixed`` / ``remote`` (a ``cdp_url`` naming one browser by id, or another
     computer's), ``released`` (the plugin set ``cdp_url`` and the person removed it), ``cloud`` (Browser Use Cloud, chosen
-    in Hermes HQ), ``camofox``. None: the plugin runs it."""
+    in Hermes HQ), ``camofox``, ``hosted`` (a hosted Hermes: the bot keeps the browser Hermes gives it there). None: the
+    plugin runs it."""
     settings = browser_settings(config)
     enabled, disabled = plugin_lists(config)
     url = str(settings.get("cdp_url") or "").strip()
     if PLUGIN in disabled or (enabled is not None and PLUGIN not in enabled):
         return "off"
+    if hosted():
+        return "cloud" if not url and str(settings.get("cloud_provider") or "").lower() == CLOUD_PROVIDER else "hosted"
     if settings.get("use_real_profile") is True:
         return "real_profile"
     if url and port_of(url) is None:
@@ -429,6 +471,24 @@ def plan(bots: list[dict], states: dict, owners: dict, in_use) -> dict:
         claimed[port] = profile
         decisions[profile] = {"manage": port, "url": local_url(port), "write": True}
     return decisions
+
+
+def release(home: Path, url: str) -> bool:
+    """A hosted Hermes: take back the ``cdp_url`` this plugin wrote, so the bot is on Hermes' own browser again. Only
+    while the config still names that address. True when it was taken back."""
+    done = []
+
+    def change(config):
+        settings = config.get("browser")
+        if isinstance(settings, dict) and str(settings.get("cdp_url") or "").strip() == url:
+            settings.pop("cdp_url", None)
+            if not settings:
+                config.pop("browser", None)
+            done.append(True)
+    if str(browser_settings(read_config(home)).get("cdp_url") or "").strip() != url:
+        return False
+    write_config(home, change)
+    return bool(done)
 
 
 def point_at(home: Path, url: str) -> None:
@@ -734,6 +794,7 @@ class Supervisor:
         self.lock = None
         self.idle_for = None  # profile -> seconds nobody has used its browser (0 while in use); set by the dashboard
         self.refreshed_at = 0.0  # when a Chrome was last started afresh (one at a time, REFRESH_SPACING apart)
+        self.hold_until = 0.0    # no bot is given a Chrome before this (begin: a first install waits a minute)
 
     after_pass = None  # a callable run after each pass, set by the dashboard
 
@@ -779,6 +840,8 @@ class Supervisor:
     def keep(self, profile: str, home: Path, decision: dict, state: dict, processes, now: float) -> dict:
         if "skip" in decision:
             reason = decision["skip"]
+            if reason == "hosted":
+                return self.leave_hosted(profile, home, state)
             if reason in ("released", "cloud") and state.get("status") != reason:
                 if state.get("pid") and state.get("folder"):
                     end(int(state["pid"]), state["folder"])
@@ -789,6 +852,10 @@ class Supervisor:
         port, url = decision["manage"], decision["url"]
         folder = str(home / "chrome-debug")
         if decision["write"]:
+            if not chrome_binary():  # nothing to point it at: the bot keeps the browser it has until there is one
+                return {"profile": profile, "status": "no_chrome", "error": "No Chrome or Chromium found on this computer."}
+            if now < self.hold_until:  # a first install: Hermes HQ may be about to say this Hermes is hosted
+                return {"profile": profile, "status": "starting"}
             point_at(home, url)
             log.info("hermes-hq-browser: %s now browses in its own Chrome (%s)", profile, url)
         if state.get("url") != url or state.get("port") != port or state.get("folder") != folder:
@@ -833,6 +900,17 @@ class Supervisor:
         self.launched[profile], self.answered[profile] = True, False
         result = start(self.root, profile, home, port, url, now)
         return {"profile": profile, "status": result.get("status") or "starting", "port": port, "error": result.get("error")}
+
+    def leave_hosted(self, profile: str, home: Path, state: dict) -> dict:
+        """A hosted Hermes: no Chrome for this bot. One this plugin started before it knew (and the ``cdp_url`` it wrote)
+        is taken back, once."""
+        if state.get("status") != "hosted":
+            if state.get("pid") and state.get("folder") and state.get("status") != "external":
+                end(int(state["pid"]), state["folder"])
+            if port_of(state.get("url")) and release(home, state["url"]):
+                log.info("hermes-hq-browser: %s is back on Hermes' own browser (a hosted Hermes)", profile)
+            write_state(self.root, profile, {"profile": profile, "status": "hosted"})
+        return {"profile": profile, "status": "hosted"}
 
     def stale(self, profile: str, pid: int, port: int, now: float) -> bool:
         """Time to start this bot's Chrome afresh: old (or older than the installed Chrome) and unused for a while."""
@@ -880,6 +958,11 @@ class Supervisor:
             self.lock.__exit__()
             self.lock = None
             return False
+        try:  # a first install (no bot has a Chrome from this plugin yet): see HOSTED_HOLD
+            if not any(state_folder(self.root).glob("*.json")) and not hosted(self.root):
+                self.hold_until = time.time() + HOSTED_HOLD
+        except Exception:  # noqa: BLE001
+            pass
         self.thread = threading.Thread(target=self.run, name="hermes-hq-browser-chromes", daemon=True)
         self.thread.start()
         return True

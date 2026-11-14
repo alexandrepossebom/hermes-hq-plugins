@@ -169,3 +169,87 @@ class CloudForAllTests(Base):
         self.cloud.save_key("", self.root)
         self.api._cloud_for_all(self.root)
         self.assertIsNone(self.provider("sam"))
+
+
+class HostedTests(Base):
+    """A hosted Hermes (Hermes Cloud): the plugin starts no Chrome there and leaves each bot on the browser Hermes gives
+    it, until the person chooses Browser Use Cloud (the owner asked for Browser Use Cloud on a hosted gateway)."""
+
+    def setUp(self):
+        super().setUp()
+        self.api = tb.load("dashboard/plugin_api")
+        self.cloud = self.api.cloud
+        self.choice = tb.load("choice")
+        self.cloud.call = lambda method, path, body=None, *, key, timeout=30.0: {}
+        os.environ.pop("BROWSER_USE_API_KEY", None)
+        os.environ.pop("HERMES_HQ_BROWSER_HOSTED", None)
+        self.fleet.set_hosted(self.root)
+
+    def browser(self, name: str) -> dict:
+        return config(self.root / "profiles" / name).get("browser") or {}
+
+    def test_no_bot_is_given_a_chrome(self):
+        home = self.bot("sam", {})
+        supervisor = self.fleet.Supervisor(self.root, self.source, lambda profile: None)
+        self.assertEqual(supervisor.pass_once()["sam"], {"profile": "sam", "status": "hosted"})
+        self.assertEqual(self.browser("sam"), {})
+        choice = self.choice.read_choice(self.fleet, self.root, "sam", home)
+        self.assertEqual((choice["hosted"], choice["blocked"], choice["changeable"], choice["can_take_over"]),
+                         (True, "hosted", False, False))
+
+    def test_a_chrome_address_written_before_it_knew_is_taken_back(self):
+        url = f"http://127.0.0.1:{PORTS + 5}"
+        home = self.bot("sam", {"browser": {"cdp_url": url}, "model": {"default": "x"}})
+        self.fleet.write_state(self.root, "sam", {"profile": "sam", "port": PORTS + 5, "url": url,
+                                                  "folder": str(home / "chrome-debug"), "status": "no_chrome"})
+        mine = self.bot("jim", {"browser": {"cdp_url": "http://127.0.0.1:9333"}})  # one the person set: not ours
+        supervisor = self.fleet.Supervisor(self.root, self.source, lambda profile: None)
+        supervisor.pass_once()
+        self.assertNotIn("browser", config(home))
+        self.assertEqual(config(home)["model"], {"default": "x"})
+        self.assertEqual(config(mine)["browser"]["cdp_url"], "http://127.0.0.1:9333")
+
+    def test_a_bot_goes_to_browser_use_cloud_and_back_to_the_browser_hermes_gives_it(self):
+        home = self.bot("sam", {})
+        self.cloud.save_key(KEY, self.root)
+        result = self.choice.set_cloud(self.fleet, self.root, "sam", home)
+        self.assertEqual((result["mode"], result["blocked"], result["can_take_over"]), ("cloud", "cloud", True))
+        self.assertEqual(self.browser("sam")["cloud_provider"], "hq-browser-use")
+        back = self.choice.take_over(self.fleet, self.root, "sam", home, wait=0)
+        self.assertEqual((back["mode"], back["blocked"]), ("own", "hosted"))
+        self.assertNotIn("cloud_provider", self.browser("sam"), "an empty one would leave the bot with no browser")
+        self.assertNotIn("cdp_url", self.browser("sam"))
+
+    def test_use_for_all_bots_and_turning_it_off(self):
+        self.bot("sam", {})
+        self.cloud.save_key(KEY, self.root)
+        self.cloud.set_all(True, self.root)
+        self.assertEqual(self.api._cloud_for_all(self.root), [])
+        self.assertEqual(self.browser("sam")["cloud_provider"], "hq-browser-use")
+        self.cloud.set_all(False, self.root)
+        self.assertEqual(self.api._cloud_for_none(self.root), [])
+        self.assertEqual(self.browser("sam"), {})
+
+    def test_health_says_hosted_once_a_hermes_cloud_address_reaches_it(self):
+        self.fleet.set_hosted(self.root, False)
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        app = FastAPI()
+        app.include_router(self.api.router)
+        client = TestClient(app)
+        self.assertFalse(client.get("/health").json()["hosted"])
+        answer = client.get("/health", headers={"host": "otto-1234.agents.nousresearch.com"}).json()
+        self.assertTrue(answer["hosted"])
+        self.assertFalse(answer["features"]["own_chrome"])
+        self.fleet.set_hosted(self.root, False)
+        self.assertTrue(client.post("/cloud", json={"hosted": True}).status_code == 200)
+        self.assertTrue(self.fleet.hosted(self.root))
+
+
+class NoChromeTests(Base):
+    def test_a_computer_with_no_chrome_keeps_the_browser_a_bot_has(self):
+        self.bot("sam", {})
+        self.fleet.chrome_binary = lambda: None
+        supervisor = self.fleet.Supervisor(self.root, self.source, lambda profile: None)
+        self.assertEqual(supervisor.pass_once()["sam"]["status"], "no_chrome")
+        self.assertNotIn("browser", config(self.root / "profiles" / "sam"))

@@ -23,11 +23,11 @@ import time
 import uuid
 from pathlib import Path
 
-from fastapi import APIRouter, Body, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Body, HTTPException, Request, WebSocket, WebSocketDisconnect
 
 log = logging.getLogger("hermes-hq-browser")
 _ROOT = Path(__file__).parents[1]
-VERSION = "3.10.0"
+VERSION = "3.11.0"
 RETAIN_ENDED = 120.0
 MAX_VIEWERS = 8
 VIEWER_ID = re.compile(r"^[0-9a-f]{32}$")
@@ -389,16 +389,32 @@ def _record(ident):
     return record
 
 
+def _note_host(request: Request) -> None:
+    """A request that came in under a Hermes Cloud address: this Hermes is hosted (fleet.hosted)."""
+    try:
+        names = (request.headers.get("x-forwarded-host") or "", request.headers.get("host") or "")
+        if any(name.split(",")[0].strip().split(":")[0].lower().endswith(fleet.HOSTED_HOST) for name in names):
+            if fleet.set_hosted(fleet.hermes_root()):
+                log.info("hermes-hq-browser: this Hermes is hosted; bots keep the browser Hermes gives them")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 @router.get("/health")
-def health():
+def health(request: Request):
+    _note_host(request)
     missing, drift = _missing(), _drift()
     return {"ok": True, "schema": "dispatch-browser.health.v3", "version": VERSION, "protocol": stream.PROTOCOL,
             "installed": not missing and not drift, "missing": missing, "drift": drift,
+            "hosted": fleet.hosted(fleet.hermes_root()),
             "features": {"watch": True, "control": True, "ask": True, "dialogs": True, "own_chrome": _own_chrome(),
-                         "choice": _own_chrome(), "cloud": True, "cloud_all": True}}
+                         "choice": _own_chrome(), "cloud": True, "cloud_all": True, "hosted": True}}
 
 
 def _own_chrome() -> bool:
+    """Bots get a Chrome of their own from this plugin (never on a hosted Hermes)."""
+    if fleet.hosted(fleet.hermes_root()):
+        return False
     return _supervisor is not None or fleet.setting("OWN_CHROME", "1") != "0"
 
 
@@ -440,7 +456,7 @@ def post_choice(body: dict = Body(...)):  # sync: a profile copy takes seconds, 
         raise HTTPException(404, "No such bot")
     home = _bot_home(profile)
     if body.get("take_over") is True:
-        if not _own_chrome():
+        if not _own_chrome() and not fleet.hosted(fleet.hermes_root()):
             raise HTTPException(409, "Hermes HQ isn’t running bots’ browsers on this computer.")
         try:
             if cloud.all_bots(fleet.hermes_root()):
@@ -468,6 +484,10 @@ def post_choice(body: dict = Body(...)):  # sync: a profile copy takes seconds, 
             log.info("hermes-hq-browser: %s is back on its own browser", profile)
             if mode == "own" and window is None:
                 return choice.read_choice(fleet, root, profile, home)
+        if fleet.hosted(root):  # no Chrome of its own to choose there
+            if mode == "own" and window is None:
+                return choice.read_choice(fleet, root, profile, home)
+            raise ValueError(choice.REFUSED["hosted"])
     except ValueError as error:
         raise HTTPException(409, str(error)) from None
     try:
@@ -492,8 +512,12 @@ def get_cloud():
 def post_cloud(body: dict = Body(...)):  # sync: asks Browser Use whether the key works, on a worker thread
     """``{"key": "..."}`` saves the key once Browser Use accepts it; ``{"key": ""}`` forgets it. ``{"all": true}``
     puts every bot on Browser Use Cloud, new bots too (``skipped``: the bots it couldn't change); ``{"all": false}``
-    gives each of them its own browser back."""
+    gives each of them its own browser back. ``{"hosted": true}``: this Hermes is hosted (fleet.hosted)."""
     root = fleet.hermes_root()
+    if body.get("hosted") is True:  # Hermes HQ, connected to a Hermes Cloud address
+        if fleet.set_hosted(root):
+            log.info("hermes-hq-browser: this Hermes is hosted; bots keep the browser Hermes gives them")
+        return cloud.status(root)
     everyone = body.get("all")
     if isinstance(everyone, bool):
         if everyone and cloud.api_key(root) is None:
@@ -534,7 +558,8 @@ def _cloud_for_all(root) -> list[str]:
 
 
 def _cloud_for_none(root) -> list[str]:
-    """Each bot on the cloud gets a Chrome of its own back (the supervisor starts it; this doesn't wait for it)."""
+    """Each bot on the cloud gets a Chrome of its own back (the supervisor starts it; this doesn't wait for it); on a
+    hosted Hermes, the browser Hermes gives it there."""
     skipped = []
     for profile, home in fleet.profiles(root):
         try:
