@@ -77,6 +77,9 @@ Chrome on this machine: **Bot Info › Browser › Browser Use Cloud** in Hermes
   is used. A browser Hermes forgot to close stops by itself after two hours.
 - **Watch and Take Control** work as for a bot's own Chrome: the cloud browser is listed, streamed and held through
   the same routes. The plugin connects only to `wss://<session id>.cdp.browser-use.com` (and browsers on this machine).
+- **Use for All Bots** (3.10, **Settings › Browser Use Cloud** in Hermes HQ; `POST /cloud {"all": true}`) puts every
+  bot on this machine in the cloud, and a new bot joins within one supervisor pass. A bot put back on its own browser
+  from its Bot Info page is remembered as an exception. Turning it off gives each cloud bot its own Chrome back.
 - Browser Use bills the person's account by the minute. Not checked yet on a Hermes Cloud (Nous-hosted) agent, where a
   managed setting may override the bot's choice.
 
