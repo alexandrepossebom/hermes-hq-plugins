@@ -135,7 +135,44 @@ def save_key(key: str | None, root: Path | None = None) -> dict:
 def status(root: Path | None = None) -> dict:
     key = api_key(root)
     return {"schema": SCHEMA, "provider": PROVIDER, "key_set": key is not None,
-            "key_hint": f"…{key[-4:]}" if key else None}
+            "key_hint": f"…{key[-4:]}" if key else None, "all": all_bots(root)}
+
+
+# "Use for All Bots" (Settings › Browser Use Cloud on the phone): every bot browses in the cloud, new ones too, except
+# the bots the person has since put back on a browser of their own (Bot Info › Browser).
+
+def all_bots(root: Path | None = None) -> bool:
+    return read_store(root).get("all") is True
+
+
+def exceptions(root: Path | None = None) -> list[str]:
+    found = read_store(root).get("except")
+    return [name for name in found if isinstance(name, str)] if isinstance(found, list) else []
+
+
+def set_all(on: bool, root: Path | None = None) -> None:
+    """Turning it on (or off) starts over: no exceptions."""
+    with _lock:
+        value = read_store(root)
+        value["all"] = bool(on)
+        value["except"] = []
+        write_store(value, root)
+
+
+def set_exception(profile: str, excepted: bool, root: Path | None = None) -> None:
+    with _lock:
+        value = read_store(root)
+        names = [name for name in (value.get("except") or []) if isinstance(name, str) and name != profile]
+        if excepted:
+            names.append(profile)
+        if names != (value.get("except") or []):
+            value["except"] = names
+            write_store(value, root)
+
+
+def wanted(profile: str, root: Path | None = None) -> bool:
+    """This bot should be on the cloud because of "Use for All Bots"."""
+    return all_bots(root) and api_key(root) is not None and profile not in exceptions(root)
 
 
 def profile_id(profile: str, *, key: str, root: Path | None = None) -> str | None:

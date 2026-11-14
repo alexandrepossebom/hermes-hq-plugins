@@ -27,7 +27,7 @@ from fastapi import APIRouter, Body, HTTPException, WebSocket, WebSocketDisconne
 
 log = logging.getLogger("hermes-hq-browser")
 _ROOT = Path(__file__).parents[1]
-VERSION = "3.9.0"
+VERSION = "3.10.0"
 RETAIN_ENDED = 120.0
 MAX_VIEWERS = 8
 VIEWER_ID = re.compile(r"^[0-9a-f]{32}$")
@@ -86,6 +86,7 @@ def _supervise():
     try:
         supervisor = fleet.Supervisor(fleet.hermes_root(), _ROOT)
         supervisor.idle_for = _idle_for
+        supervisor.after_pass = lambda: _cloud_for_all(fleet.hermes_root())
         if supervisor.begin():
             _supervisor = supervisor
     except Exception:  # noqa: BLE001 - watching still works without it
@@ -394,7 +395,7 @@ def health():
     return {"ok": True, "schema": "dispatch-browser.health.v3", "version": VERSION, "protocol": stream.PROTOCOL,
             "installed": not missing and not drift, "missing": missing, "drift": drift,
             "features": {"watch": True, "control": True, "ask": True, "dialogs": True, "own_chrome": _own_chrome(),
-                         "choice": _own_chrome(), "cloud": True}}
+                         "choice": _own_chrome(), "cloud": True, "cloud_all": True}}
 
 
 def _own_chrome() -> bool:
@@ -442,6 +443,8 @@ def post_choice(body: dict = Body(...)):  # sync: a profile copy takes seconds, 
         if not _own_chrome():
             raise HTTPException(409, "Hermes HQ isn’t running bots’ browsers on this computer.")
         try:
+            if cloud.all_bots(fleet.hermes_root()):
+                cloud.set_exception(profile, True, fleet.hermes_root())
             result = choice.take_over(fleet, fleet.hermes_root(), profile, home)
         except ValueError as error:
             raise HTTPException(409, str(error)) from None
@@ -451,6 +454,8 @@ def post_choice(body: dict = Body(...)):  # sync: a profile copy takes seconds, 
     mode, window = body.get("mode"), body.get("window")
     source = body.get("source")
     root = fleet.hermes_root()
+    if cloud.all_bots(root) and mode in ("cloud", "own", "copy"):
+        cloud.set_exception(profile, mode != "cloud", root)  # "Use for All Bots" leaves this bot where the person put it
     try:
         if mode == "cloud":
             if cloud.api_key(root) is None:
@@ -485,16 +490,61 @@ def get_cloud():
 
 @router.post("/cloud")
 def post_cloud(body: dict = Body(...)):  # sync: asks Browser Use whether the key works, on a worker thread
-    """``{"key": "..."}`` saves the key once Browser Use accepts it; ``{"key": ""}`` forgets it."""
+    """``{"key": "..."}`` saves the key once Browser Use accepts it; ``{"key": ""}`` forgets it. ``{"all": true}``
+    puts every bot on Browser Use Cloud, new bots too (``skipped``: the bots it couldn't change); ``{"all": false}``
+    gives each of them its own browser back."""
+    root = fleet.hermes_root()
+    everyone = body.get("all")
+    if isinstance(everyone, bool):
+        if everyone and cloud.api_key(root) is None:
+            raise HTTPException(409, "Add your Browser Use API key first (Settings › Browser Use Cloud).")
+        cloud.set_all(everyone, root)
+        skipped = _cloud_for_all(root) if everyone else _cloud_for_none(root)
+        log.info("hermes-hq-browser: Browser Use Cloud for all bots %s", "on" if everyone else "off")
+        return {**cloud.status(root), "skipped": skipped}
     key = body.get("key")
     if not isinstance(key, str):
         raise HTTPException(400, "Send the API key.")
     try:
-        result = cloud.save_key(key, fleet.hermes_root())
+        result = cloud.save_key(key, root)
     except cloud.CloudError as error:
         raise HTTPException(409, str(error)) from None
     log.info("hermes-hq-browser: Browser Use API key %s", "saved" if result["key_set"] else "removed")
     return result
+
+
+def _cloud_for_all(root) -> list[str]:
+    """Every bot "Use for All Bots" covers that isn't on the cloud yet goes there. Returns the bots it couldn't change
+    (a bot with its browser turned off, a config that won't save). Cheap when there is nothing to do: the supervisor
+    runs it after every pass, so a new bot joins within one."""
+    skipped = []
+    if not cloud.all_bots(root) or cloud.api_key(root) is None:
+        return skipped
+    for profile, home in fleet.profiles(root):
+        if not cloud.wanted(profile, root):
+            continue
+        try:
+            if choice.read_choice(fleet, root, profile, home)["blocked"] == "cloud":
+                continue
+            choice.set_cloud(fleet, root, profile, home)
+            log.info("hermes-hq-browser: %s now browses in Browser Use Cloud (all bots)", profile)
+        except Exception:  # noqa: BLE001 - ValueError in plain words, or a config.yaml with a typo
+            skipped.append(profile)
+    return skipped
+
+
+def _cloud_for_none(root) -> list[str]:
+    """Each bot on the cloud gets a Chrome of its own back (the supervisor starts it; this doesn't wait for it)."""
+    skipped = []
+    for profile, home in fleet.profiles(root):
+        try:
+            if choice.read_choice(fleet, root, profile, home)["blocked"] != "cloud":
+                continue
+            choice.take_over(fleet, root, profile, home, wait=0)
+            log.info("hermes-hq-browser: %s is back on its own browser (all bots off)", profile)
+        except Exception:  # noqa: BLE001
+            skipped.append(profile)
+    return skipped
 
 
 @router.get("/sessions")

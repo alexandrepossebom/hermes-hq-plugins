@@ -108,3 +108,64 @@ class CloudBrowserTests(Base):
         self.assertIsNone(agent.browser_of({"bb_session_id": "x", "session_name": "bb_1", "cdp_url": "wss://connect.browserbase.com/x"}))
         self.assertEqual(agent.endpoint(("cloud", SOCKET)), SOCKET)
         self.assertTrue(agent._reachable(SOCKET))
+
+
+class CloudForAllTests(Base):
+    """Settings › Browser Use Cloud › Use for All Bots (owner 2026-11-14: "Add the settings switch for all bots")."""
+
+    def setUp(self):
+        super().setUp()
+        self.api = tb.load("dashboard/plugin_api")
+        self.cloud = self.api.cloud
+        self.cloud.call = lambda method, path, body=None, *, key, timeout=30.0: {}
+        os.environ.pop("BROWSER_USE_API_KEY", None)
+        self.cloud.save_key(KEY, self.root)
+
+    def provider(self, name: str):
+        return (config(self.root / "profiles" / name).get("browser") or {}).get("cloud_provider")
+
+    def test_every_bot_goes_to_the_cloud_and_a_new_bot_joins(self):
+        self.bot("sam", {"browser": {"cdp_url": ""}})
+        self.bot("off", {"plugins": {"disabled": ["hermes-hq-browser"]}})
+        self.assertFalse(self.cloud.status(self.root)["all"])
+        self.cloud.set_all(True, self.root)
+        self.assertEqual(self.api._cloud_for_all(self.root), ["off"], "a bot with the add-on off is left alone, and named")
+        self.assertEqual(self.provider("sam"), "hq-browser-use")
+        self.assertIsNone(self.provider("off"))
+        self.assertTrue(self.cloud.status(self.root)["all"])
+        self.bot("new", {})
+        self.api._cloud_for_all(self.root)  # what the supervisor runs after each pass
+        self.assertEqual(self.provider("new"), "hq-browser-use")
+
+    def test_a_bot_put_back_on_its_own_browser_stays_there(self):
+        self.bot("sam", {})
+        self.bot("jim", {})
+        self.cloud.set_all(True, self.root)
+        self.api._cloud_for_all(self.root)
+        self.cloud.set_exception("jim", True, self.root)  # Bot Info › Browser › Its Own Profile
+        self.choice = tb.load("choice")
+        self.choice.take_over(self.fleet, self.root, "jim", self.root / "profiles" / "jim", wait=0)
+        self.api._cloud_for_all(self.root)
+        self.assertNotEqual(self.provider("jim"), "hq-browser-use")
+        self.assertEqual(self.provider("sam"), "hq-browser-use")
+        self.assertFalse(self.cloud.wanted("jim", self.root))
+        self.cloud.set_exception("jim", False, self.root)  # … › Browser Use Cloud again
+        self.assertTrue(self.cloud.wanted("jim", self.root))
+
+    def test_turning_it_off_gives_each_bot_its_own_browser_back_and_new_bots_stay_put(self):
+        self.bot("sam", {})
+        self.cloud.set_all(True, self.root)
+        self.api._cloud_for_all(self.root)
+        self.cloud.set_all(False, self.root)
+        self.assertEqual(self.api._cloud_for_none(self.root), [])
+        self.assertNotEqual(self.provider("sam"), "hq-browser-use")
+        self.bot("new", {})
+        self.assertEqual(self.api._cloud_for_all(self.root), [])
+        self.assertIsNone(self.provider("new"))
+
+    def test_nothing_moves_without_a_key(self):
+        self.bot("sam", {})
+        self.cloud.set_all(True, self.root)
+        self.cloud.save_key("", self.root)
+        self.api._cloud_for_all(self.root)
+        self.assertIsNone(self.provider("sam"))

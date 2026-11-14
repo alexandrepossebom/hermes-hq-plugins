@@ -735,6 +735,8 @@ class Supervisor:
         self.idle_for = None  # profile -> seconds nobody has used its browser (0 while in use); set by the dashboard
         self.refreshed_at = 0.0  # when a Chrome was last started afresh (one at a time, REFRESH_SPACING apart)
 
+    after_pass = None  # a callable run after each pass, set by the dashboard
+
     def pass_once(self, now: float | None = None) -> dict:
         now = time.time() if now is None else now
         reap()
@@ -864,6 +866,11 @@ class Supervisor:
                 self.pass_once()
             except Exception:  # noqa: BLE001 - the supervisor outlives any one bad pass
                 log.warning("hermes-hq-browser: supervisor pass failed", exc_info=True)
+            try:
+                if self.after_pass is not None:
+                    self.after_pass()  # Browser Use Cloud for all bots: a new bot joins (dashboard/plugin_api.py)
+            except Exception:  # noqa: BLE001
+                log.warning("hermes-hq-browser: after-pass step failed", exc_info=True)
             time.sleep(PASS_EVERY)
 
     def begin(self) -> bool:
