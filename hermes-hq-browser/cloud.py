@@ -100,8 +100,8 @@ def call(method: str, path: str, body: dict | None = None, *, key: str, timeout:
 
 def _explain(status: int) -> str:
     return {
-        401: "Browser Use didn’t accept the API key. Check it in Hermes HQ › Settings.",
-        403: "Browser Use didn’t accept the API key. Check it in Hermes HQ › Settings.",
+        401: "Browser Use didn’t accept the API key. Check it in Hermes HQ › Bot Info › Browser.",
+        403: "Browser Use didn’t accept the API key. Check it in Hermes HQ › Bot Info › Browser.",
         402: "The Browser Use account is out of credits (or hit its spending limit). Add credits at browser-use.com.",
         429: "Too many Browser Use browsers are open at once on this account. Close one, or try again in a minute.",
     }.get(status, f"Browser Use refused the request ({status}).")
@@ -183,7 +183,7 @@ def provider():
         def create_session(self, task_id: str) -> dict:
             key = api_key()
             if key is None:
-                raise ValueError("Browser Use Cloud needs an API key. Add it in Hermes HQ › Settings › Browser Use Cloud.")
+                raise ValueError("Browser Use Cloud needs an API key. Add it in Hermes HQ › Bot Info › Browser.")
             bot = _profile_name()
             body = {"timeout": TIMEOUT_MINUTES, "proxyCountryCode": None,
                     "browserScreenWidth": WINDOW[0], "browserScreenHeight": WINDOW[1],
