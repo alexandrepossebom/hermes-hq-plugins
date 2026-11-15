@@ -256,6 +256,19 @@ made, its history) and what its bot writes with `tasks_update(page={summary, nex
 next, and parts such as options compared in a table, the numbers that matter, or what it found. The bot writes words,
 never HTML. The `task-page` skill (hermes-hq-push:task-page) tells bots what goes on it.
 
+Version 0.9.58 ties a plugin update you approve in the app to what the app showed you (the last open finding of the
+outside review). Hermes fetches the new version into a copy before it asks anything, and lists what that copy needs
+above each question. The add-on now says yes only when that list is exactly what you saw: the Python packages, the
+security scan's findings (severity, kind, file and line) when the scan said "caution", and what a catalog plugin's new
+pin adds. If the plugin changed in between, by even one package or finding, it says no, nothing changes, and the app
+is told what Hermes asks about now. `--force` is no longer passed: a "caution" scan is accepted at Hermes's own
+question, on its findings. The app tells it what it showed (`packages`, `findings`, `capabilities` on
+`POST /plugins/update`; `pluginUpdatesChecked` in the status); an older app's yes, which carried no list, is now
+answered no. Pinning the update to one exact revision needs `hermes plugins update` to take one, which Hermes doesn't
+yet. Also fixed: an update whose new version declares new capabilities no longer waits five minutes at Hermes's
+"Grant these capabilities?" (its console drops the `[y/N]`, so the add-on didn't see a question) and then reports a
+failure for an update that went in; the question is answered no, as before.
+
 Version 0.9.57 lets a bot that is handling a scheduled job's report ask you something. That turn runs in the
 messaging gateway with nobody watching the chat, so Hermes refused the bot's question (`clarify`) and a command's
 approval waited unseen until it timed out. Both now show as their usual card in the app's copy of the bot's chat, the

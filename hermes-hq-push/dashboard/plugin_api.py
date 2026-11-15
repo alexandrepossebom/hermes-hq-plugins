@@ -200,9 +200,22 @@ def status():
             **tasks.status(), **drafts.status(push.data_dir()), **plugin_updates.status()}
 
 
+class ScanFindingIn(BaseModel):
+    severity: str = Field(default="", max_length=32)
+    category: str = Field(default="", max_length=64)
+    file: str = Field(default="", max_length=1024)
+    line: int | None = None
+
+
 class PluginUpdateIn(BaseModel):
+    """0.9.58: what the app showed the owner, each answered yes only when Hermes asks about exactly that
+    (plugin_updates.py). ``accept_capabilities`` and ``force`` (0.9.52) are read no more: a yes with nothing
+    to compare against was the gap in hermes-hq-plugins#3."""
     profile: str = Field(default="default", max_length=64)
     name: str = Field(max_length=64)
+    packages: str | None = Field(default=None, max_length=8192)
+    findings: list[ScanFindingIn] | None = Field(default=None, max_length=500)
+    capabilities: list[str] | None = Field(default=None, max_length=200)
     accept_capabilities: bool = False
     force: bool = False
 
@@ -210,10 +223,14 @@ class PluginUpdateIn(BaseModel):
 @router.post("/plugins/update")
 def start_plugin_update(body: PluginUpdateIn):
     """0.9.52 (`pluginUpdates` in status): the owner approved, in the app, an update Hermes only applies from a terminal
-    (it adds Python packages). Hermes's own `hermes plugins update` runs on this computer and that one question is
-    answered yes (plugin_updates.py). Answers a job id at once; GET /plugins/update/<job> says how it went."""
+    (it adds Python packages, or its scan said caution). Hermes's own `hermes plugins update` runs on this computer and
+    its questions are answered yes only when they ask about what the app showed (0.9.58, `pluginUpdatesChecked`;
+    plugin_updates.py). Answers a job id at once; GET /plugins/update/<job> says how it went."""
+    approved = plugin_updates.Approved(
+        packages=body.packages, capabilities=body.capabilities,
+        findings=None if body.findings is None else [finding.model_dump() for finding in body.findings])
     try:
-        return plugin_updates.start(body.profile, body.name, accept_capabilities=body.accept_capabilities, force=body.force)
+        return plugin_updates.start(body.profile, body.name, approved=approved)
     except plugin_updates.UpdateError as error:
         raise HTTPException(error.status_code, error.detail) from None
 
