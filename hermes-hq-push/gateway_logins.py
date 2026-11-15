@@ -28,6 +28,8 @@ import socketserver
 import sys
 import threading
 import time
+import uuid
+import weakref
 from pathlib import Path
 
 log = logging.getLogger("hermes-hq-push")
@@ -342,9 +344,27 @@ def _closed(conn: socket.socket) -> bool:
         return True
 
 
-def answer(request: dict, conn: socket.socket | None = None, *, poll: float = 0.5) -> str:
+def _wait_for_chat(session_id: str, home: str, deadline: float, conn, poll: float, what: str):
+    """The app's copy of the chat, waiting until it is opened; None when the time runs out or the gateway hangs up."""
+    sid = find_chat(session_id, home)
+    while sid is None:
+        if time.monotonic() >= deadline or (conn is not None and _closed(conn)):
+            log.info("hermes-hq-push: %s for %s: the chat wasn't opened in the app in time", what, session_id)
+            return None
+        time.sleep(poll)
+        sid = find_chat(session_id, home)
+    return sid
+
+
+def answer(request: dict, conn: socket.socket | None = None, *, poll: float = 0.5):
     """Show one gateway prompt in the app's copy of its chat; wait for the chat to be opened first if it isn't."""
     method = request.get("method")
+    if method == HELLO:
+        return " ".join(ASK_KINDS)
+    if method == "approval":
+        return show_approval(request, conn, poll=poll)
+    if method == "clarify":
+        return show_clarify(request, conn, poll=poll)
     if method not in METHODS:
         return ""
     keys, longest = METHODS[method]
@@ -359,13 +379,9 @@ def answer(request: dict, conn: socket.socket | None = None, *, poll: float = 0.
     except (TypeError, ValueError):
         timeout = longest
     deadline = time.monotonic() + timeout
-    sid = find_chat(session_id, home)
-    while sid is None:
-        if time.monotonic() >= deadline or (conn is not None and _closed(conn)):
-            log.info("hermes-hq-push: %s for %s: the chat wasn't opened in the app in time", method, session_id)
-            return ""
-        time.sleep(poll)
-        sid = find_chat(session_id, home)
+    sid = _wait_for_chat(session_id, home, deadline, conn, poll, method)
+    if sid is None:
+        return ""
     from tui_gateway import server, server_requests
     done = threading.Event()
 
@@ -388,7 +404,7 @@ def answer(request: dict, conn: socket.socket | None = None, *, poll: float = 0.
 class _Handler(socketserver.StreamRequestHandler):
     def handle(self):
         try:
-            request = json.loads(self.rfile.readline(65536) or b"{}")
+            request = json.loads(self.rfile.readline(1 << 20) or b"{}")
         except ValueError:
             return
         value = ""
@@ -435,3 +451,479 @@ def start_server(data_dir: Path) -> str:
 def in_server() -> bool:
     """``hermes serve`` (its web server is loaded by the time the add-on's routes are)."""
     return "hermes_cli.web_server" in sys.modules
+
+
+# MARK: Approvals and questions in a job's Bot Chat turn (0.9.57)
+
+# A scheduled job's report reaches the bot's Bot Chat as a turn the messaging gateway runs on its own (a producer
+# turn: nobody typed it, Hermes's ``local_automation_v1``). Nobody watches that chat in the gateway, so Hermes refused
+# the bot's question (``LocalSessionAdapter.send_clarify``: "no viewer can answer this chat") and a command's approval
+# waited unseen until it timed out (a tester, public issue #60). The same socket now carries both to the app's copy
+# of the chat: the server shows the approval card and the clarify card a turn the app runs gets
+# (``server_requests`` "approval" and "clarify"), and the answer goes back to Hermes's own waits
+# (``tools.approval.resolve_gateway_approval``, ``tools.clarify_gateway.resolve_gateway_clarify``). A turn someone
+# typed, a chat a viewer is watching, another app's chat (Telegram, Discord…) and a hosted room are left as they were.
+HELLO = "hello"
+ASK_KINDS = ("approval", "clarify")
+ASK_MARK = "_hermes_hq_job_asks"
+_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
+_kinds = {"at": 0.0, "kinds": frozenset(), "path": ""}
+_adapters: "weakref.WeakSet" = weakref.WeakSet()   # Hermes's LocalSessionAdapter(s) in this process
+_noted: dict[str, tuple[dict, frozenset, float]] = {}   # session key → (where, kinds, when): the turn's own context
+_noted_lock = threading.Lock()
+_forwarded: set[str] = set()
+NOTE_TTL = 600.0
+# Kept as short as Hermes keeps them: an approval card as long as the approval waits, a question as long as clarify.
+LONGEST = 86400.0
+CLARIFY_BLOCK = ("Not asked: nobody can answer a question in this chat right now (this turn came from a scheduled "
+                 "job or another bot, and the Hermes HQ app can't be reached to show it). Don't call clarify again "
+                 "in this turn: finish what you can, then put your question at the end of your reply, so the user "
+                 "sees it when they open the chat.")
+
+
+def chat_of(key: str) -> str:
+    """The chat a local gateway key names (``agent:<profile>:local:dm:<chat>``), or ""."""
+    return str(key).split(":", 4)[4] if _local_chat(key) else ""
+
+
+def _hello(path: Path) -> frozenset:
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.settimeout(1)
+            conn.connect(str(path))
+            conn.sendall(json.dumps({"method": HELLO}).encode() + b"\n")
+            data = b""
+            while not data.endswith(b"\n") and len(data) < 4096:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+        value = json.loads(data or b"{}").get("value", "")
+    except (OSError, ValueError):
+        return frozenset()
+    return frozenset(str(value).split()) & frozenset(ASK_KINDS) if isinstance(value, str) else frozenset()
+
+
+def bridge_kinds(path: Path) -> frozenset:
+    """What the server's listener shows for the gateway besides logins (checked at most every 5 s). Empty: no
+    listener, or one from an add-on before 0.9.57 (it answers ``hello`` with nothing)."""
+    now = time.monotonic()
+    if _kinds["path"] != str(path) or now - _kinds["at"] >= 5:
+        _kinds.update(at=now, kinds=_hello(path), path=str(path))
+    return _kinds["kinds"]
+
+
+def _remember_adapter(adapter) -> None:
+    try:
+        _adapters.add(adapter)
+    except TypeError:
+        pass
+
+
+def _viewer_can(chat: str, capability: str):
+    """Whether a viewer attached to this local chat holds ``capability`` (``session:approve`` answers approvals,
+    ``session:respond`` questions): True/False, or None when this isn't a plain local chat we know (no adapter seen
+    yet, no live session, a hosted room or a forwarded peer), which leaves Hermes alone."""
+    for adapter in list(_adapters):
+        policies = getattr(adapter, "policies", None) or {}
+        if chat not in policies:
+            continue
+        policy = policies[chat]
+        if getattr(policy, "source", "") == "bot_room":
+            return None
+        try:
+            from gateway.session_a2a import is_forward_policy
+            if is_forward_policy(policy):
+                return None
+        except Exception:
+            return None
+        live = (getattr(getattr(adapter, "authority", None), "sessions", None) or {}).get(chat)
+        if live is None:
+            return None
+        try:
+            with live.event_stream.lock:
+                return any(capability in member.capabilities for member in live.subscribers.values())
+        except Exception:
+            return None
+    return None
+
+
+def _producer_turn() -> bool:
+    """This thread runs a turn nobody typed (a job's report, another bot's message): Hermes records the viewer
+    whose ``session.submit`` started a turn, and there is none (gateway/session_ingress.py ``viewer_turn``)."""
+    try:
+        from gateway.session_ingress import viewer_turn
+    except Exception:
+        return False
+    return viewer_turn.get() is None
+
+
+def job_turn(key: str, capability: str = "session:approve") -> dict | None:
+    """The chat's ``{session_id, home}`` when this thread's turn is one nobody can answer here: a local chat in the
+    gateway, a turn nobody typed, and no viewer attached that could answer. Else None (Hermes as it was)."""
+    chat = chat_of(key)
+    if not chat or _serving() or not _producer_turn() or _viewer_can(chat, capability) is not False:
+        return None
+    where = turn()
+    if where is None:
+        try:
+            from hermes_constants import get_hermes_home
+        except Exception:
+            return None
+        if not _SESSION.fullmatch(chat):
+            return None
+        where = {"session_id": chat, "home": str(get_hermes_home())}
+    return where
+
+
+def _choices(entry: dict) -> tuple:
+    """The answers the card offers, as Hermes's own card does (tui_gateway/server.py ``_approval_request_payload``)."""
+    choices = ["once"]
+    if not entry.get("smart_denied") and entry.get("allow_session") is not False:
+        choices.append("session")
+        if entry.get("allow_permanent") is not False:
+            choices.append("always")
+    return tuple(choices + ["deny"])
+
+
+def _approval_pending(key: str, request_id: str) -> bool:
+    try:
+        from tools.approval import list_gateway_approvals
+        return any(e.get("request_id") == request_id for e in list_gateway_approvals(key))
+    except Exception:
+        return False
+
+
+def _converse(path: Path, request: dict, still_waiting, timeout: float):
+    """Send one request to the server and read its answer; hang up (the server takes the card down) as soon as
+    ``still_waiting()`` says Hermes stopped waiting. The answer's ``value``, or None."""
+    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        conn.settimeout(5)
+        conn.connect(str(path))
+        conn.sendall(json.dumps(request).encode() + b"\n")
+        conn.settimeout(1)
+        deadline = time.monotonic() + timeout + 60
+        data = b""
+        while not data.endswith(b"\n") and len(data) < 1 << 20:
+            if time.monotonic() >= deadline or not still_waiting():
+                return None
+            try:
+                chunk = conn.recv(65536)
+            except socket.timeout:
+                continue
+            if not chunk:
+                break
+            data += chunk
+        return json.loads(data or b"{}").get("value")
+    except (OSError, ValueError):
+        log.info("hermes-hq-push: %s for %s not answered through the app", request.get("method"),
+                 request.get("session_id"), exc_info=True)
+        return None
+    finally:
+        try:
+            conn.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        conn.close()
+
+
+def forward_approval(path: Path, kwargs: dict) -> bool:
+    """``pre_approval_request`` in the gateway (the bot's own thread): a job's Bot Chat turn shows its approval as the
+    card in the app's copy of the chat, and the choice made there answers Hermes's wait. True when it went."""
+    key = str(kwargs.get("session_key") or "")
+    if kwargs.get("coalesced") or "approval" not in bridge_kinds(path):
+        return False
+    where = job_turn(key, "session:approve")
+    if where is None:
+        return False
+    from tools.approval import list_gateway_approvals
+    keys = list(kwargs.get("pattern_keys") or [])
+    match = [e for e in list_gateway_approvals(key) if e.get("command") == kwargs.get("command")
+             and list(e.get("pattern_keys") or []) == keys and _ID.fullmatch(str(e.get("request_id") or ""))
+             and e["request_id"] not in _forwarded]
+    if not match:
+        return False
+    entry = match[-1]
+    request_id = str(entry["request_id"])
+    params = {k: entry[k] for k in ("command", "description", "pattern_key", "pattern_keys", "allow_permanent",
+                                    "allow_session", "smart_denied") if k in entry}
+    params["request_id"] = request_id
+    try:
+        timeout = min(float(entry.get("timeout_s") or 300), LONGEST)
+    except (TypeError, ValueError):
+        timeout = 300.0
+    _forwarded.add(request_id)
+    threading.Thread(target=_approval_turn, args=(path, key, request_id, params, where, timeout),
+                     name="hermes-hq-job-approval", daemon=True).start()
+    log.info("hermes-hq-push: approval %s for %s sent to the app", request_id, where["session_id"])
+    return True
+
+
+def _approval_turn(path, key, request_id, params, where, timeout):
+    try:
+        request = {"method": "approval", "params": params, "session_id": where["session_id"], "home": where["home"],
+                   "timeout": timeout}
+        choice = _converse(path, request, lambda: _approval_pending(key, request_id), timeout)
+        if isinstance(choice, str) and choice in _choices(params):
+            from tools.approval import resolve_gateway_approval
+            resolved = resolve_gateway_approval(key, choice, request_id=request_id)
+            log.info("hermes-hq-push: approval %s answered in the app (%s, %d resolved)", request_id, choice, resolved)
+    except Exception:
+        log.warning("hermes-hq-push: an approval sent to the app failed", exc_info=True)
+    finally:
+        _forwarded.discard(request_id)
+
+
+def note_clarify(path: Path, key: str) -> None:
+    """``pre_tool_call`` for clarify, in the bot's own thread: keep the turn's chat and home for the question's send,
+    which runs on the gateway's loop where neither is known (one gateway may run several bots)."""
+    where = turn()
+    if where is None or chat_of(key) == "":
+        return
+    now = time.monotonic()
+    with _noted_lock:
+        for stale in [k for k, (_, _, at) in _noted.items() if now - at > NOTE_TTL]:
+            _noted.pop(stale, None)
+        _noted[key] = (where, bridge_kinds(path), now)
+
+
+def _take_note(key: str):
+    with _noted_lock:
+        kept = _noted.get(key)
+    if kept is None or time.monotonic() - kept[2] > NOTE_TTL:
+        return None
+    return kept
+
+
+def clarify_unreachable(path: Path, key: str) -> str | None:
+    """``pre_tool_call`` for clarify: the message the bot gets instead when nobody can answer here and the app can't
+    be reached to show the question. None whenever the question can be shown (or isn't ours to judge)."""
+    if job_turn(key, "session:respond") is None or "clarify" in bridge_kinds(path):
+        return None
+    return CLARIFY_BLOCK
+
+
+def would_forward_clarify(path: Path, key: str) -> bool:
+    """``on_human_input_request`` for clarify: this question goes to the app (its "input" alert goes out)."""
+    return job_turn(key, "session:respond") is not None and "clarify" in bridge_kinds(path)
+
+
+def install_job_asks(data_dir: Path) -> str:
+    """Let a job's Bot Chat turn ask through the app, once per process: "installed", "already", "absent" (no local
+    sessions in this Hermes, or this is the server) or "changed" (Hermes's adapter isn't shaped as expected: left
+    untouched)."""
+    import inspect
+
+    try:
+        from gateway.session_local import LocalSessionAdapter
+    except Exception:
+        return "absent"
+    send = getattr(LocalSessionAdapter, "send_clarify", None)
+    if getattr(send, ASK_MARK, False):
+        return "already"
+    wanted = {"send_clarify": ["self", "chat_id", "question", "choices", "clarify_id", "session_key", "metadata"],
+              "__init__": ["self", "authority"], "register_source": ["self", "source"],
+              "_unanswerable_clarify": ["self", "chat_id"]}
+    for name, params in wanted.items():
+        try:
+            if list(inspect.signature(getattr(LocalSessionAdapter, name)).parameters) != params:
+                return "changed"
+        except (AttributeError, TypeError, ValueError):
+            return "changed"
+    if not inspect.iscoroutinefunction(send):
+        return "changed"
+    path = socket_path(data_dir)
+    LocalSessionAdapter.send_clarify = _wrap_send_clarify(send, path)
+    LocalSessionAdapter.__init__ = _recording(LocalSessionAdapter.__init__)
+    LocalSessionAdapter.register_source = _recording(LocalSessionAdapter.register_source)
+    return "installed"
+
+
+def _recording(original):
+    def method(self, *args, **kwargs):
+        result = original(self, *args, **kwargs)
+        _remember_adapter(self)
+        return result
+
+    setattr(method, ASK_MARK, True)
+    method.__wrapped__ = original
+    method.__doc__ = original.__doc__
+    return method
+
+
+def _wrap_send_clarify(original, path: Path):
+    async def send_clarify(self, chat_id, question, choices, clarify_id, session_key, metadata=None):
+        _remember_adapter(self)
+        try:
+            sent = _forward_clarify(self, path, chat_id, question, choices, clarify_id, session_key)
+        except Exception:
+            log.warning("hermes-hq-push: a question for the app failed; Hermes's own path", exc_info=True)
+            sent = False
+        if sent:
+            from gateway.platforms.base import SendResult
+            return SendResult(success=True, message_id=uuid.uuid4().hex)
+        return await original(self, chat_id, question, choices, clarify_id, session_key, metadata)
+
+    setattr(send_clarify, ASK_MARK, True)
+    send_clarify.__wrapped__ = original
+    send_clarify.__doc__ = original.__doc__
+    return send_clarify
+
+
+def _forward_clarify(adapter, path, chat_id, question, choices, clarify_id, session_key) -> bool:
+    """On the gateway's loop: Hermes would refuse this question (nobody can answer the chat), the app can show it,
+    and the bot's own thread noted where the chat is. Then the question goes to the app on its own thread and
+    Hermes hears it was delivered; else Hermes's own send runs."""
+    if _serving() or not chat_of(session_key) or str(chat_id) != chat_of(session_key) \
+            or not _ID.fullmatch(str(clarify_id or "")):
+        return False
+    if not adapter._unanswerable_clarify(chat_id) or _viewer_can(str(chat_id), "session:respond") is not False:
+        return False
+    kept = _take_note(session_key)
+    if kept is None or "clarify" not in kept[1]:
+        return False
+    from tools import clarify_gateway
+    pending = clarify_gateway.get_pending(clarify_id)
+    if pending is None:
+        return False
+    try:
+        timeout = float(clarify_gateway.get_clarify_timeout())
+    except Exception:
+        timeout = 300.0
+    timeout = LONGEST if timeout <= 0 else min(timeout, LONGEST)
+    params = {"clarify_id": str(clarify_id), "question": str(question or ""),
+              "choices": [str(c) for c in choices] if choices else None,
+              "multi_select": bool(getattr(pending, "multi_select", False))}
+    where = kept[0]
+    threading.Thread(target=_clarify_turn, args=(path, str(clarify_id), params, where, timeout),
+                     name="hermes-hq-job-clarify", daemon=True).start()
+    log.info("hermes-hq-push: question %s for %s sent to the app", clarify_id, where["session_id"])
+    return True
+
+
+def _clarify_turn(path, clarify_id, params, where, timeout):
+    try:
+        from tools import clarify_gateway
+        request = {"method": "clarify", "params": params, "session_id": where["session_id"], "home": where["home"],
+                   "timeout": timeout}
+        reply = _converse(path, request, lambda: clarify_gateway.get_pending(clarify_id) is not None, timeout)
+        if not isinstance(reply, dict):
+            return
+        outcome = reply.get("outcome")
+        if outcome == "submitted":
+            answer = reply.get("answer")
+            if answer is None:
+                answer = getattr(clarify_gateway, "SKIPPED", "")
+            clarify_gateway.resolve_gateway_clarify(clarify_id, str(answer))
+            log.info("hermes-hq-push: question %s answered in the app", clarify_id)
+        elif outcome == "cancelled" and hasattr(clarify_gateway, "CANCELLED"):
+            clarify_gateway.resolve_gateway_clarify(clarify_id, clarify_gateway.CANCELLED)
+        # Timed out or not shown: Hermes's own wait ends it, as it would have.
+    except Exception:
+        log.warning("hermes-hq-push: a question sent to the app failed", exc_info=True)
+
+
+# The server's side of the two.
+
+def _where_of(request: dict):
+    session_id, home = str(request.get("session_id") or ""), str(request.get("home") or "")
+    if not _SESSION.fullmatch(session_id) or not home:
+        return None
+    try:
+        timeout = min(float(request.get("timeout") or 300), LONGEST)
+    except (TypeError, ValueError):
+        timeout = 300.0
+    return session_id, home, max(timeout, 0.0)
+
+
+def _text(value, limit: int) -> bool:
+    return isinstance(value, str) and len(value) <= limit
+
+
+def show_approval(request: dict, conn: socket.socket | None = None, *, poll: float = 0.5) -> str:
+    """The approval card in the app's copy of the chat, as a turn the app runs shows it (tui_gateway/server.py
+    ``_emit_approval_request``): the choice made ("once", "session", "always" or "deny"), "" when none was."""
+    params = request.get("params") if isinstance(request.get("params"), dict) else {}
+    where = _where_of(request)
+    if where is None or not _ID.fullmatch(str(params.get("request_id") or "")) \
+            or not _text(params.get("command", ""), 1 << 19) or not _text(params.get("description", ""), 8000):
+        return ""
+    keys = params.get("pattern_keys")
+    if keys is not None and (not isinstance(keys, list) or not all(_text(k, 200) for k in keys)):
+        return ""
+    data = {k: params[k] for k in ("command", "description", "pattern_key", "pattern_keys") if k in params}
+    data.update({k: bool(params[k]) for k in ("allow_permanent", "allow_session", "smart_denied") if k in params})
+    data["request_id"] = params["request_id"]
+    session_id, home, timeout = where
+    deadline = time.monotonic() + timeout
+    sid = _wait_for_chat(session_id, home, deadline, conn, poll, "approval")
+    if sid is None:
+        return ""
+    from tui_gateway import server, server_requests
+    builder = getattr(server, "_approval_request_payload", None)
+    payload = builder(data) if callable(builder) else {**data, "choices": list(_choices(data))}
+    box, done = {}, threading.Event()
+
+    def on_result(result):
+        box["result"] = result
+        done.set()
+
+    settle = server_requests.send_async("approval", sid, payload, on_result)
+    log.info("hermes-hq-push: approval %s for %s shown in the app", data["request_id"], session_id)
+    while not done.wait(poll):
+        if time.monotonic() >= deadline:
+            settle("timeout")
+            return ""
+        if conn is not None and _closed(conn):
+            # Answered elsewhere, timed out or the turn ended in the gateway: the card comes down.
+            settle("resolved")
+            return ""
+    result = box.get("result")
+    choice = str(result.get("choice") or "deny") if isinstance(result, dict) else ""
+    return choice if choice in payload.get("choices", _choices(data)) else ""
+
+
+def show_clarify(request: dict, conn: socket.socket | None = None, *, poll: float = 0.5) -> dict:
+    """The clarify card in the app's copy of the chat, as a turn the app runs shows it (tui_gateway/server.py
+    ``_clarify_block``): ``{"outcome": "submitted", "answer": text or None (skipped)}``, or another outcome
+    ("cancelled", "timed_out", "undelivered")."""
+    params = request.get("params") if isinstance(request.get("params"), dict) else {}
+    where = _where_of(request)
+    qid = str(params.get("clarify_id") or "")
+    choices = params.get("choices")
+    if where is None or not _ID.fullmatch(qid) or not _text(params.get("question"), 16000) or (
+            choices is not None and (not isinstance(choices, list) or len(choices) > 50
+                                     or not all(_text(c, 2000) for c in choices))):
+        return {"outcome": "undelivered"}
+    session_id, home, timeout = where
+    deadline = time.monotonic() + timeout
+    sid = _wait_for_chat(session_id, home, deadline, conn, poll, "clarify")
+    if sid is None:
+        return {"outcome": "timed_out"}
+    from tui_gateway import server_requests
+    done = threading.Event()
+
+    def withdraw():
+        while not done.wait(poll):
+            if conn is not None and _closed(conn):
+                server_requests.cancel(sid, "resolved", method="clarify")
+                return
+
+    if conn is not None:
+        threading.Thread(target=withdraw, name="hermes-hq-clarify-withdraw", daemon=True).start()
+    wire = [{"qid": qid, "question": params["question"], "choices": choices or None,
+             "multi_select": bool(params.get("multi_select")) and bool(choices)}]
+    try:
+        log.info("hermes-hq-push: question %s for %s shown in the app", qid, session_id)
+        result = server_requests.send("clarify", sid, {"questions": wire},
+                                      timeout=max(1.0, deadline - time.monotonic()), qids=[qid])
+    finally:
+        done.set()
+    if not isinstance(result, dict):
+        return {"outcome": "undelivered"}
+    answers = result.get("answers") if isinstance(result.get("answers"), dict) else {}
+    if qid in answers:
+        answer = answers[qid]
+        return {"outcome": "submitted", "answer": answer if isinstance(answer, str) else None}
+    return {"outcome": str(result.get("outcome") or "cancelled")}

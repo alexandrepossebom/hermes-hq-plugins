@@ -28,6 +28,10 @@ a turn the app runs (Hermes answered "this session cannot ask the user for a log
 browser tab in front, which was another site when the bot's own page didn't load (gateway_logins.unnamed_site).
 0.9.44 makes Hermes use the named site's tab, or ask nothing when none is open (gateway_logins.named_tab): Hermes's
 vault ignored the name and still asked for the first open tab with a password field, on any site.
+0.9.57 does the same for a command's approval and a question (clarify) in a scheduled job's Bot Chat turn, which the
+gateway runs with nobody watching: the card shows in the app's copy of the chat and the phone is alerted (Hermes
+refused the question and the approval waited unseen until it timed out). With the app out of reach the bot is told to
+ask in its reply instead (gateway_logins.forward_approval, install_job_asks).
 device_access.py (0.9.19, every kind since 0.9.21) gives bots what the owner shares from the app's Settings › Device
 Access (device_contacts_search, device_location, device_reminders, …): each use is a request the phone fetches (woken
 by a silent push) and answers.
@@ -175,15 +179,35 @@ def pre_approval_request(**kwargs):
         if not serves and not outside and not bot_chat:
             return
         from tools.approval import list_gateway_approvals
+        # [job-asks] A job's turn in a Bot Chat (nobody typed it, no viewer can answer): the card goes to the app's
+        # copy of the chat (gateway_logins.forward_approval), and the alert goes even for the "cli" surface a Bot
+        # Chat Hermes made itself reports (0.9.57).
+        job = bot_chat and _job_approval(kwargs, key)
         profile = _profile()
         kwargs = _in_its_chat(kwargs, profile)
         item = push.approval_push(kwargs, list_gateway_approvals(key), push.data_dir(), profile, _sender(profile),
-                                  outside, answerable=serves)
+                                  outside, answerable=serves, surfaces=("gateway", "cli") if job else ("gateway",))
         if item is not None:
             push.remember_approval(_sent_approvals, kwargs, item)
             _dispatcher_for().submit(item)
     except Exception:
         log.debug("hermes-hq-push approval hook failed", exc_info=True)
+
+
+def _job_approval(kwargs: dict, key: str) -> bool:
+    """[job-asks] This approval waits in a job's Bot Chat turn nobody can answer here; its card is sent to the app
+    when the server can show it. Never raises."""
+    try:
+        if gateway_logins.job_turn(key, "session:approve") is None:
+            return False
+    except Exception:
+        log.debug("hermes-hq-push: job approval check failed", exc_info=True)
+        return False
+    try:
+        gateway_logins.forward_approval(gateway_logins.socket_path(push.data_dir()), kwargs)
+    except Exception:
+        log.debug("hermes-hq-push: job approval not sent to the app", exc_info=True)
+    return True
 
 
 def post_approval_response(**kwargs):
@@ -199,8 +223,13 @@ def on_human_input_request(**kwargs):
     try:
         if not _serves_app_sessions():
             # [gateway-logins] A vault prompt in a gateway turn that goes to the app's copy of the chat (0.9.17).
-            if not str(kwargs.get("kind") or "").startswith("vault_") \
-                    or not gateway_logins.would_ask(gateway_logins.socket_path(push.data_dir())):
+            # [job-asks] So does a question in a job's Bot Chat turn (0.9.57).
+            kind = str(kwargs.get("kind") or "")
+            path = gateway_logins.socket_path(push.data_dir())
+            if kind.startswith("vault_"):
+                if not gateway_logins.would_ask(path):
+                    return
+            elif kind != "clarify" or not gateway_logins.would_forward_clarify(path, str(kwargs.get("session_key") or "")):
                 return
             kwargs = {**kwargs, "platform": "desktop"}
         profile = _profile()
@@ -293,11 +322,34 @@ def _desktop_theme():
 
 def pre_tool_call(tool_name="", args=None, **kwargs):
     verdict = (_veto(tool_name, args) or _ideas_veto(tool_name, kwargs.get("session_id"))
-               or _draft_veto(tool_name, args, kwargs.get("session_id")))
+               or _draft_veto(tool_name, args, kwargs.get("session_id")) or _job_clarify(tool_name))
     if verdict is None:
         _named_site(tool_name, args, kwargs.get("task_id"))
         _live_step(tool_name, args, kwargs)
     return verdict
+
+
+def _job_clarify(tool_name):
+    """[job-asks] clarify in a job's Bot Chat turn, in the gateway: note where the chat is for the question's send
+    (gateway_logins.note_clarify); when the app can't be reached to show it, tell the bot at once to ask in its
+    reply instead (Hermes would refuse the question). Only in the messaging gateway; never raises."""
+    if tool_name != "clarify" or _serves_app_sessions():
+        return None
+    try:
+        from tools import approval_context
+        key = approval_context.get_current_session_key(default="")
+        if not push.bot_chat(key):
+            return None
+        path = gateway_logins.socket_path(push.data_dir())
+        gateway_logins.note_clarify(path, key)
+        message = gateway_logins.clarify_unreachable(path, key)
+    except Exception:
+        log.debug("hermes-hq-push: job question check failed", exc_info=True)
+        return None
+    if not message:
+        return None
+    log.info("hermes-hq-push: clarify in a job's Bot Chat turn with the app out of reach: the bot asks in its reply")
+    return {"action": "block", "message": message}
 
 
 def _draft_veto(tool_name, args, session_id):
@@ -412,6 +464,10 @@ def _gateway_logins():
         log.info("hermes-hq-push: logins asked in gateway turns %s", gateway_logins.install_prompts(push.data_dir()))
     except Exception:
         log.debug("hermes-hq-push: logins asked in gateway turns not installed", exc_info=True)
+    try:  # [job-asks] the gateway's local chats; in the server it steps aside at each call (gateway_logins._serving)
+        log.info("hermes-hq-push: questions in job turns %s", gateway_logins.install_job_asks(push.data_dir()))
+    except Exception:
+        log.debug("hermes-hq-push: questions in job turns not installed", exc_info=True)
 
 
 def _page_previews():

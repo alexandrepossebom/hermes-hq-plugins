@@ -663,11 +663,14 @@ def bot_chat(session_key: str) -> bool:
 
 
 def approval_push(kwargs: dict, pending: Iterable[dict], root: Path, profile: str, sender: str = "",
-                  outside: str = "", answerable: bool = True) -> Push | None:
+                  outside: str = "", answerable: bool = True, surfaces: tuple = ("gateway",)) -> Push | None:
     """``pre_approval_request`` has no request id; the queued entry does (queued before the hook fires). ``outside``:
     the messaging app of a chat the messaging gateway runs; its alert carries no action token (nothing here can
-    answer it), nor does one that isn't ``answerable`` (a Bot Chat approval, waiting in the messaging gateway)."""
-    if kwargs.get("surface") != "gateway" or kwargs.get("coalesced"):
+    answer it), nor does one that isn't ``answerable`` (a Bot Chat approval, waiting in the messaging gateway).
+    ``surfaces``: the approval surfaces that alert. A Bot Chat Hermes made itself reports ``cli`` (its session's
+    platform), so a job's turn there that nobody can answer passes ``("gateway", "cli")`` (0.9.57); the alert's
+    ``session`` opens that chat."""
+    if kwargs.get("surface") not in surfaces or kwargs.get("coalesced"):
         return None
     session_key = str(kwargs.get("session_key") or "")
     if not session_key:
