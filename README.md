@@ -256,6 +256,13 @@ made, its history) and what its bot writes with `tasks_update(page={summary, nex
 next, and parts such as options compared in a table, the numbers that matter, or what it found. The bot writes words,
 never HTML. The `task-page` skill (hermes-hq-push:task-page) tells bots what goes on it.
 
+Version 0.9.57 lets a bot that is handling a scheduled job's report ask you something. That turn runs in the
+messaging gateway with nobody watching the chat, so Hermes refused the bot's question (`clarify`) and a command's
+approval waited unseen until it timed out. Both now show as their usual card in the app's copy of the bot's chat, the
+phone is alerted, and your answer goes back to the waiting turn. When the app can't be reached, the bot is told to
+put its question in its reply instead. Turns you typed, other apps' chats and hosted rooms are left as they were.
+Both the gateway and `hermes serve` need the new version (restart them after updating).
+
 Version 0.9.56 closes two findings from an outside review. The Task prep, Task check and Task ideas jobs are now the
 add-on's by the id it recorded when it made them, not by their name: a job of yours that happens to be called
 "Task prep" is never edited, run or removed. A job from an older version is taken over only when its name, its prompt
