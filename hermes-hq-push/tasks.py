@@ -1818,33 +1818,109 @@ PREP_JOB_PROMPT = (
     "next_check again if it still waits. When it needs them, give up to 3 short choices they can tap."
 )
 CHECK_JOB_NAME = "Task check"   # 0.9.37: one run at the time the next watched task's check is due
+PREP_JOB_MARK = "tasks_next_prep"   # in every version's Task prep and Task check instruction: how an old one is told
+OWN_JOB_SUFFIX = " (Hermes HQ)"     # our job's name when one of the person's own jobs already has the plain name
 
 
-def ensure_prep_job(hours) -> None:
-    """Create "Task prep" (or fix its schedule / re-enable it) for the bot whose own process this runs in."""
+# Our scheduled jobs are known by the id recorded when we made them (meta "job:<kind>:<bot>"), never by name alone:
+# Hermes finds a name case-insensitively, so a job of the person's own called "Task check" or "task prep" was
+# rewritten with our instruction or removed with its output (an outside review). A job made before ids were
+# recorded is taken on only when it plainly is ours: one of our names, our instruction and local delivery.
+
+def recorded_job_id(store: "Store", kind: str, profile: str) -> str:
+    with closing(store._db()) as db:
+        row = db.execute("select value from meta where key=?", (f"job:{kind}:{profile}",)).fetchone()
+    try:
+        value = json.loads(row[0]) if row else {}
+    except ValueError:
+        return ""
+    return str(value.get("id") or "") if isinstance(value, dict) else ""
+
+
+def record_job_id(store: "Store", kind: str, profile: str, job_id) -> None:
+    """Remember ``job_id`` as ``profile``'s ``kind`` job; ``None`` forgets it."""
+    with closing(store._write_db()) as db, db:
+        if job_id:
+            db.execute("insert into meta (key, value) values (?, ?) on conflict(key) do update set value=excluded.value",
+                       (f"job:{kind}:{profile}", json.dumps({"id": job_id})))
+        else:
+            db.execute("delete from meta where key=?", (f"job:{kind}:{profile}",))
+
+
+def own_job(cron_jobs, store: "Store", kind: str, profile: str, name: str, mark: str):
+    """``profile``'s ``kind`` job in the active schedule, or ``None``: the recorded one, else an older version's
+    job adopted (and recorded) by ``name`` (or ours with OWN_JOB_SUFFIX), ``mark`` in its instruction and local
+    delivery. It walks the list itself, so two jobs with that name don't stop it as a name lookup would."""
+    job_id = recorded_job_id(store, kind, profile)
+    if job_id:
+        job = cron_jobs.get_job(job_id)
+        if job is not None:
+            return job
+        record_job_id(store, kind, profile, None)   # removed by hand since: forget it, quietly
+    names = {name.casefold(), (name + OWN_JOB_SUFFIX).casefold()}
+    for job in cron_jobs.list_jobs(include_disabled=True):
+        if ((job.get("name") or "").strip().casefold() in names and mark in (job.get("prompt") or "")
+                and job.get("deliver") == "local"):
+            record_job_id(store, kind, profile, job["id"])
+            return job
+    return None
+
+
+def create_own_job(cron_jobs, store: "Store", kind: str, profile: str, name: str, **fields) -> dict:
+    """Make ``profile``'s ``kind`` job and record its id. Under ``name``, or ``name`` + OWN_JOB_SUFFIX when a job
+    of the person's already has that name (ours would make their name ambiguous, and theirs is left alone)."""
+    if any((job.get("name") or "").strip().casefold() == name.casefold()
+           for job in cron_jobs.list_jobs(include_disabled=True)):
+        name += OWN_JOB_SUFFIX
+    try:  # the dashboard's own path: saves the job and registers its first run with the scheduler
+        from cron.scheduler import create_job_with_scheduler_registration as create
+    except Exception:
+        create = cron_jobs.create_job
+    try:
+        job = create(name=name, deliver="local", **fields)
+    except Exception as error:
+        saved = getattr(error, "job", None)   # saved, but its first run wasn't registered: still ours to keep
+        if isinstance(saved, dict) and saved.get("id"):
+            record_job_id(store, kind, profile, saved["id"])
+        raise
+    record_job_id(store, kind, profile, job["id"])
+    return job
+
+
+def remove_own_job(store: "Store", kind: str, profile: str, name: str, mark: str) -> None:
+    """Remove ``profile``'s ``kind`` job, if it has one that is ours; a job that only shares the name stays."""
+    try:
+        from cron import jobs as cron_jobs
+        job = own_job(cron_jobs, store, kind, profile, name, mark)
+        if job is not None:
+            cron_jobs.remove_job(job["id"])
+            record_job_id(store, kind, profile, None)
+    except Exception:
+        log.debug("hermes-hq-push: tasks %s job not removed", kind, exc_info=True)
+
+
+def ensure_prep_job(hours, store: "Store", profile: str):
+    """Create "Task prep" (or fix its schedule / re-enable it) for ``profile``, in the active schedule. Its id."""
     try:
         from cron import jobs as cron_jobs
     except Exception:
         log.debug("hermes-hq-push: tasks prep job not ensured (no cron module)", exc_info=True)
-        return
+        return None
     minutes = max(1, int(hours)) * 60
     schedule = f"every {minutes}m"  # Hermes's own parse_schedule normalizes "every Nh" to minutes too (its
     # stored display is never "every Nh"), so comparing against the hours-worded string below would never
     # match an existing job and re-save it on every single reconcile; comparing minutes is what actually holds.
     try:
-        job = cron_jobs.resolve_job_ref(PREP_JOB_NAME)
+        job = own_job(cron_jobs, store, "prep", profile, PREP_JOB_NAME, PREP_JOB_MARK)
     except Exception:
         log.debug("hermes-hq-push: tasks prep job lookup failed", exc_info=True)
-        return
+        return None
     try:
         if job is None:
-            try:  # the dashboard's own path: saves the job and registers its first run with the scheduler
-                from cron.scheduler import create_job_with_scheduler_registration as create
-            except Exception:
-                create = cron_jobs.create_job
-            create(prompt=PREP_JOB_PROMPT, schedule=schedule, name=PREP_JOB_NAME, deliver="local")
+            job = create_own_job(cron_jobs, store, "prep", profile, PREP_JOB_NAME, prompt=PREP_JOB_PROMPT,
+                                 schedule=schedule)
             log.info("hermes-hq-push: tasks prep job created (%s)", schedule)
-            return
+            return job["id"]
         updates = {}
         if (job.get("prompt") or "") != PREP_JOB_PROMPT:
             updates["prompt"] = PREP_JOB_PROMPT   # 0.9.53: an older job's instruction learns ``how``
@@ -1854,20 +1930,15 @@ def ensure_prep_job(hours) -> None:
             updates.update(enabled=True, state="scheduled")
         if updates:
             cron_jobs.update_job(job["id"], updates)
+        return job["id"]
     except Exception:
         log.debug("hermes-hq-push: tasks prep job not ensured", exc_info=True)
+        return None
 
 
-def remove_prep_job() -> None:
-    """Remove "Task prep" for the bot whose own process this runs in; a no-op when it has none."""
-    try:
-        from cron import jobs as cron_jobs
-    except Exception:
-        return
-    try:
-        cron_jobs.remove_job(PREP_JOB_NAME)
-    except Exception:
-        log.debug("hermes-hq-push: tasks prep job not removed", exc_info=True)
+def remove_prep_job(store: "Store", profile: str) -> None:
+    """Remove ``profile``'s "Task prep" from the active schedule; a no-op when it has none."""
+    remove_own_job(store, "prep", profile, PREP_JOB_NAME, PREP_JOB_MARK)
 
 
 @contextmanager
@@ -1904,21 +1975,17 @@ def bot_home(profile: str):
         return None
 
 
-def ensure_check_job(at: float) -> None:
-    """"Task check": one run at ``at`` (epoch seconds, minute precision) for the bot whose process this runs in."""
+def ensure_check_job(at: float, store: "Store", profile: str) -> None:
+    """"Task check": one run at ``at`` (epoch seconds, minute precision) for ``profile``, in the active schedule."""
     try:
         from cron import jobs as cron_jobs
     except Exception:
         return
     when = time.strftime("%Y-%m-%dT%H:%M", time.localtime(at))
     try:
-        job = cron_jobs.resolve_job_ref(CHECK_JOB_NAME)
+        job = own_job(cron_jobs, store, "check", profile, CHECK_JOB_NAME, PREP_JOB_MARK)
         if job is None:
-            try:
-                from cron.scheduler import create_job_with_scheduler_registration as create
-            except Exception:
-                create = cron_jobs.create_job
-            create(prompt=PREP_JOB_PROMPT, schedule=when, name=CHECK_JOB_NAME, deliver="local")
+            create_own_job(cron_jobs, store, "check", profile, CHECK_JOB_NAME, prompt=PREP_JOB_PROMPT, schedule=when)
             log.info("hermes-hq-push: tasks check job set for %s", when)
             return
         display = (job.get("schedule") or {}).get("display") or ""
@@ -1928,12 +1995,8 @@ def ensure_check_job(at: float) -> None:
         log.debug("hermes-hq-push: tasks check job not ensured", exc_info=True)
 
 
-def remove_check_job() -> None:
-    try:
-        from cron import jobs as cron_jobs
-        cron_jobs.remove_job(CHECK_JOB_NAME)
-    except Exception:
-        log.debug("hermes-hq-push: tasks check job not removed", exc_info=True)
+def remove_check_job(store: "Store", profile: str) -> None:
+    remove_own_job(store, "check", profile, CHECK_JOB_NAME, PREP_JOB_MARK)
 
 
 def reconcile_prep_job(store: Store, profile: str, home=None) -> None:
@@ -1945,13 +2008,14 @@ def reconcile_prep_job(store: Store, profile: str, home=None) -> None:
         with _cron_home(home):
             ready, next_check = store.prep_schedule(profile) if store.enabled() else (0, None)
             if ready > 0:
-                ensure_prep_job(store.get_settings().get("prep_every_hours", DEFAULT_SETTINGS["prep_every_hours"]))
+                ensure_prep_job(store.get_settings().get("prep_every_hours", DEFAULT_SETTINGS["prep_every_hours"]),
+                                store, profile)
             else:
-                remove_prep_job()
+                remove_prep_job(store, profile)
             if next_check is not None:
-                ensure_check_job(next_check)
+                ensure_check_job(next_check, store, profile)
             else:
-                remove_check_job()
+                remove_check_job(store, profile)
     except Exception:
         log.debug("hermes-hq-push: tasks prep job not reconciled", exc_info=True)
 
@@ -1969,9 +2033,10 @@ def start_prep_now(store: Store, task: dict, profile: str, home=None) -> str:
     store.ask_start_now(task["id"], profile)
     try:
         with _cron_home(home):
-            ensure_prep_job(store.get_settings().get("prep_every_hours", DEFAULT_SETTINGS["prep_every_hours"]))
+            job_id = ensure_prep_job(store.get_settings().get("prep_every_hours", DEFAULT_SETTINGS["prep_every_hours"]),
+                                     store, profile)
             from cron import jobs as cron_jobs
-            if cron_jobs.trigger_job(PREP_JOB_NAME) is None:
+            if not job_id or cron_jobs.trigger_job(job_id) is None:
                 raise LookupError("no Task prep job")
     except Exception:
         log.debug("hermes-hq-push: tasks prep not started now", exc_info=True)

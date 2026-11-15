@@ -42,6 +42,7 @@ else:
 log = logging.getLogger("hermes-hq-push")
 
 JOB_NAME = "Task ideas"
+JOB_MARK = "tasks_ideas"   # in every version's Task ideas instruction: how an older, unrecorded one is told
 # In the Task ideas run these are refused: the run suggests, and the user adds.
 TASK_WRITES = frozenset({"tasks_add", "tasks_update", "tasks_next_prep"})
 WHO = ("me", "together", "bot")
@@ -360,19 +361,16 @@ def _cron_expr(at: str) -> str:
     return f"{int(minutes)} {int(hours)} * * *"
 
 
-def ensure_job(at: str) -> str | None:
-    """Create "Task ideas" in the active schedule (or bring its time, words and tool list up to date). Its id."""
+def ensure_job(at: str, store, profile: str) -> str | None:
+    """Create ``profile``'s "Task ideas" in the active schedule (or bring its time, words and tool list up to
+    date). Its id. Known by the id recorded when it was made, like the Task prep job (tasks.own_job)."""
     from cron import jobs as cron_jobs
     expr = _cron_expr(at)
-    job = cron_jobs.resolve_job_ref(JOB_NAME)
+    job = tasks.own_job(cron_jobs, store, "ideas", profile, JOB_NAME, JOB_MARK)
     if job is None:
-        try:
-            from cron.scheduler import create_job_with_scheduler_registration as create
-        except Exception:
-            create = cron_jobs.create_job
-        job = create(prompt=JOB_PROMPT, schedule=expr, name=JOB_NAME, deliver="local")
+        job = tasks.create_own_job(cron_jobs, store, "ideas", profile, JOB_NAME, prompt=JOB_PROMPT, schedule=expr)
         log.info("hermes-hq-push: task ideas job created (%s)", expr)
-        return (job or {}).get("id")
+        return job["id"]
     updates = {}
     if (job.get("schedule") or {}).get("expr") != expr:
         updates["schedule"] = expr
@@ -387,12 +385,9 @@ def ensure_job(at: str) -> str | None:
     return job["id"]
 
 
-def remove_job() -> None:
-    try:
-        from cron import jobs as cron_jobs
-        cron_jobs.remove_job(JOB_NAME)
-    except Exception:
-        log.debug("hermes-hq-push: task ideas job not removed", exc_info=True)
+def remove_job(store, profile: str) -> None:
+    """Ideas is off here: ``profile``'s own Task ideas job goes; a job of the person's with that name stays."""
+    tasks.remove_own_job(store, "ideas", profile, JOB_NAME, JOB_MARK)
 
 
 def _record_job(store, job_id: str) -> None:
@@ -408,11 +403,11 @@ def reconcile_job(store, profile: str, home=None) -> None:
         with tasks._cron_home(home):
             settings = store.get_settings()
             if store.enabled() and settings.get("ideas") and settings.get("ideas_bot") == profile:
-                job_id = ensure_job(settings["ideas_at"])
+                job_id = ensure_job(settings["ideas_at"], store, profile)
                 if job_id:
                     _record_job(store, job_id)
             else:
-                remove_job()
+                remove_job(store, profile)
     except Exception:
         log.debug("hermes-hq-push: task ideas job not reconciled", exc_info=True)
 
@@ -430,7 +425,7 @@ def run_now(store) -> dict:
         raise IdeaError(404, "No such bot.")
     try:
         with tasks._cron_home(home):
-            job_id = ensure_job(settings["ideas_at"])
+            job_id = ensure_job(settings["ideas_at"], store, settings["ideas_bot"])
             from cron import jobs as cron_jobs
             if not job_id or cron_jobs.trigger_job(job_id) is None:
                 raise LookupError("no Task ideas job")
@@ -479,19 +474,10 @@ def in_ideas_run(session_id, store_for: Callable) -> bool:
     if job_id in _known_runs:
         return _known_runs[job_id]
     answer = None
-    try:
-        from cron import jobs as cron_jobs
-        job = cron_jobs.get_job(job_id)
-        if job is not None:
-            answer = (job.get("name") or "") == JOB_NAME
+    try:   # by the ids we recorded, not the name: a job of the person's called "Task ideas" may add tasks
+        answer = job_id in (_meta(store_for(), "ideas_job").get("ids") or [])
     except Exception:
         pass
-    if not answer:
-        try:
-            if job_id in (_meta(store_for(), "ideas_job").get("ids") or []):
-                answer = True
-        except Exception:
-            pass
     if answer is not None:   # a lookup that failed isn't remembered: the next call asks again
         _known_runs[job_id] = answer
     return bool(answer)

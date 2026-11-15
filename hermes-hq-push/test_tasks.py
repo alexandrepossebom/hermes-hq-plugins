@@ -312,8 +312,8 @@ def test_tasks_off_drops_the_note_the_tools_and_the_prep_job(tmp_path, monkeypat
     assert not any(check() for check in ctx.checks.values())   # no bot sees the tools
     assert json.loads(ctx.tools["tasks_next_prep"]({}))["task"] is None
     removed, ensured = [], []
-    monkeypatch.setattr(tasks, "remove_prep_job", lambda: removed.append(1))
-    monkeypatch.setattr(tasks, "ensure_prep_job", lambda hours: ensured.append(hours))
+    monkeypatch.setattr(tasks, "remove_prep_job", lambda store, profile: removed.append(1))
+    monkeypatch.setattr(tasks, "ensure_prep_job", lambda hours, store, profile: ensured.append(hours))
     tasks.reconcile_prep_job(s, "otto")
     assert removed and not ensured
     assert len(s.list_all()) == 1   # the list is kept
@@ -447,25 +447,94 @@ def test_tasks_next_prep_tool_round_trips_the_store(tmp_path):
 
 @needs_cron
 def test_ensure_prep_job_creates_then_is_idempotent_then_reschedules(tmp_path):
+    s = store(tmp_path)
     with cron_jobs.use_cron_store(tmp_path):
         assert cron_jobs.resolve_job_ref(tasks.PREP_JOB_NAME) is None
-        tasks.ensure_prep_job(3)
+        job_id = tasks.ensure_prep_job(3, s, "otto")
         job = cron_jobs.resolve_job_ref(tasks.PREP_JOB_NAME)
         assert job is not None and job["schedule"]["minutes"] == 180 and job["enabled"]
-        tasks.ensure_prep_job(3)  # same hours again: still exactly one job, no duplicate
+        assert job["id"] == job_id == tasks.recorded_job_id(s, "prep", "otto")
+        assert tasks.ensure_prep_job(3, s, "otto") == job_id  # same hours again: still exactly one job, no duplicate
         assert len(cron_jobs.list_jobs(include_disabled=True)) == 1
-        tasks.ensure_prep_job(6)  # settings changed: reschedules the same job
+        tasks.ensure_prep_job(6, s, "otto")  # settings changed: reschedules the same job
         assert cron_jobs.resolve_job_ref(tasks.PREP_JOB_NAME)["schedule"]["minutes"] == 360
 
 
 @needs_cron
 def test_remove_prep_job_is_a_no_op_when_there_is_none(tmp_path):
+    s = store(tmp_path)
     with cron_jobs.use_cron_store(tmp_path):
-        tasks.remove_prep_job()  # doesn't raise
-        tasks.ensure_prep_job(3)
+        tasks.remove_prep_job(s, "otto")  # doesn't raise
+        tasks.ensure_prep_job(3, s, "otto")
         assert cron_jobs.resolve_job_ref(tasks.PREP_JOB_NAME) is not None
-        tasks.remove_prep_job()
+        tasks.remove_prep_job(s, "otto")
         assert cron_jobs.resolve_job_ref(tasks.PREP_JOB_NAME) is None
+        assert tasks.recorded_job_id(s, "prep", "otto") == ""
+
+
+# An outside review: the jobs were found by name, and Hermes matches a name case-insensitively, so a job of the
+# person's own called "Task check" or "task prep" was rewritten with our instruction, or removed with its output.
+def _theirs(name, prompt="Check my open pull requests each morning."):
+    job = cron_jobs.create_job(prompt=prompt, schedule="0 9 * * *", name=name, deliver="local")
+    return cron_jobs.get_job(job["id"])   # as stored, to compare with later
+
+
+@needs_cron
+def test_a_persons_job_with_our_name_is_never_rewritten_or_removed(tmp_path):
+    s = store(tmp_path, hour=10)
+    task = s.create(bot_task(prep=True), created_by="otto", source={"kind": "chat", "profile": "otto"})
+    with cron_jobs.use_cron_store(tmp_path):
+        prep, check = _theirs("task prep"), _theirs("Task check")
+        tasks.reconcile_prep_job(s, "otto")   # what every load does: ours is made beside theirs
+        assert cron_jobs.get_job(prep["id"]) == prep and cron_jobs.get_job(check["id"]) == check
+        ours = cron_jobs.get_job(tasks.recorded_job_id(s, "prep", "otto"))
+        assert ours["name"] == "Task prep (Hermes HQ)" and ours["prompt"] == tasks.PREP_JOB_PROMPT
+        tasks.reconcile_prep_job(s, "otto")   # managed by id from then on: no second one
+        assert len(cron_jobs.list_jobs(include_disabled=True)) == 3
+        tasks.reconcile_prep_job(s, "otto")
+        s.update_bot(task["id"], "otto", status="ready", status_note="done")
+        tasks.reconcile_prep_job(s, "otto")   # the last prep task closed: ours goes, theirs stays as it was
+        assert cron_jobs.get_job(ours["id"]) is None and tasks.recorded_job_id(s, "prep", "otto") == ""
+        assert cron_jobs.get_job(prep["id"]) == prep and cron_jobs.get_job(check["id"]) == check
+
+
+@needs_cron
+def test_an_older_versions_job_is_adopted_not_doubled(tmp_path):
+    s = store(tmp_path, hour=10)
+    s.create(bot_task(prep=True), created_by="otto", source={"kind": "chat", "profile": "otto"})
+    with cron_jobs.use_cron_store(tmp_path):
+        # made by an older add-on: our name and an older instruction, but no id recorded
+        old = cron_jobs.create_job(prompt="Work through Tasks prep. Call tasks_next_prep. Older words.",
+                                   schedule="every 180m", name=tasks.PREP_JOB_NAME, deliver="local")
+        tasks.reconcile_prep_job(s, "otto")
+        assert tasks.recorded_job_id(s, "prep", "otto") == old["id"]
+        assert len(cron_jobs.list_jobs(include_disabled=True)) == 1
+        assert cron_jobs.get_job(old["id"])["prompt"] == tasks.PREP_JOB_PROMPT   # still brought up to date
+
+
+@needs_cron
+def test_two_jobs_with_our_name_do_not_stop_the_reconcile(tmp_path):
+    s = store(tmp_path, hour=10)
+    s.create(bot_task(prep=True), created_by="otto", source={"kind": "chat", "profile": "otto"})
+    with cron_jobs.use_cron_store(tmp_path):
+        mine, again = _theirs("Task prep"), _theirs("TASK PREP", prompt="Water the plants.")
+        tasks.reconcile_prep_job(s, "otto")
+        ours = cron_jobs.get_job(tasks.recorded_job_id(s, "prep", "otto"))
+        assert ours is not None and ours["id"] not in (mine["id"], again["id"])
+        assert cron_jobs.get_job(mine["id"]) == mine and cron_jobs.get_job(again["id"]) == again
+
+
+@needs_cron
+def test_a_recorded_job_removed_by_hand_is_forgotten_and_made_again(tmp_path):
+    s = store(tmp_path, hour=10)
+    s.create(bot_task(prep=True), created_by="otto", source={"kind": "chat", "profile": "otto"})
+    with cron_jobs.use_cron_store(tmp_path):
+        tasks.reconcile_prep_job(s, "otto")
+        first = tasks.recorded_job_id(s, "prep", "otto")
+        cron_jobs.remove_job(first)
+        tasks.reconcile_prep_job(s, "otto")
+        again = tasks.recorded_job_id(s, "prep", "otto")
+        assert again and again != first and cron_jobs.get_job(again)["name"] == tasks.PREP_JOB_NAME
 
 
 @needs_cron
@@ -630,8 +699,8 @@ def test_tasks_off_starts_nothing_and_hands_out_no_task_of_a_bots_own(tmp_path, 
     s.create(bot_task(title="File the forms", who="bot"), created_by="you", source={"kind": "app"})
     s.put_settings({"enabled": False})
     ensured, removed = [], []
-    monkeypatch.setattr(tasks, "ensure_prep_job", lambda hours: ensured.append(hours))
-    monkeypatch.setattr(tasks, "remove_prep_job", lambda: removed.append(1))
+    monkeypatch.setattr(tasks, "ensure_prep_job", lambda hours, store, profile: ensured.append(hours))
+    monkeypatch.setattr(tasks, "remove_prep_job", lambda store, profile: removed.append(1))
     assert tasks.start_prep_now(s, prepped, "otto") == "not started: Tasks is turned off."
     assert not ensured
     ctx = FakeCtx()
@@ -1032,6 +1101,24 @@ def test_a_watched_task_gets_one_task_check_run_and_no_interval_job(tmp_path):
         s.update_route(task["id"], moved["rev"], {"status": "done"})
         tasks.reconcile_prep_job(s, "otto")
         assert cron_jobs.resolve_job_ref(tasks.CHECK_JOB_NAME) is None
+
+
+@needs_cron
+def test_a_persons_task_check_keeps_its_time_while_ours_comes_and_goes(tmp_path):
+    from datetime import datetime, timedelta
+    due = (datetime.now() + timedelta(days=2)).replace(hour=10, minute=0, second=0, microsecond=0)
+    s = tasks.Store(tmp_path / "tasks.db")
+    task = s.create(together(watch="her redlines", prep=True, due=due.strftime("%Y-%m-%dT%H:%M")),
+                    created_by="otto", source={})
+    with cron_jobs.use_cron_store(tmp_path):
+        theirs = _theirs("Task check")
+        tasks.reconcile_prep_job(s, "otto")
+        ours = cron_jobs.get_job(tasks.recorded_job_id(s, "check", "otto"))
+        assert ours["name"] == "Task check (Hermes HQ)" and ours["schedule"]["kind"] == "once"
+        assert cron_jobs.get_job(theirs["id"]) == theirs
+        s.update_route(task["id"], task["rev"], {"status": "done"})
+        tasks.reconcile_prep_job(s, "otto")
+        assert cron_jobs.get_job(ours["id"]) is None and cron_jobs.get_job(theirs["id"]) == theirs
 
 
 # ---------------------------------------------------------------------------

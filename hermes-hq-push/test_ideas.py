@@ -337,14 +337,18 @@ def test_guard_refuses_only_task_writes_in_the_ideas_run(tmp_path, monkeypatch):
 
 
 @needs_cron
-def test_guard_knows_the_ideas_job_by_its_name(tmp_path, monkeypatch):
+def test_guard_knows_the_ideas_job_by_its_recorded_id(tmp_path, monkeypatch):
     s = store(tmp_path)
     monkeypatch.setattr(ideas, "_known_runs", {})
     with cron_jobs.use_cron_store(tmp_path / "home"):
-        job_id = ideas.ensure_job("07:30")
+        theirs = cron_jobs.create_job(prompt="Plan my week", schedule="0 9 * * 1", name="Task ideas")
+        ideas.reconcile_job(s, "default")
+        job_id = tasks.recorded_job_id(s, "ideas", "default")
         other = cron_jobs.create_job(prompt="Water the plants", schedule="0 9 * * *", name="Plants")
         assert ideas.guard("tasks_add", f"cron_{job_id}_20261105_073000", lambda: s)
         assert ideas.guard("tasks_add", f"cron_{other['id']}_20261105_090000", lambda: s) is None
+        # a job of the person's that is only called "Task ideas" may add tasks
+        assert ideas.guard("tasks_add", f"cron_{theirs['id']}_20261105_090000", lambda: s) is None
 
 
 # ---------------------------------------------------------------------------
@@ -394,18 +398,19 @@ def test_the_tool_answers_only_inside_the_ideas_run(tmp_path, monkeypatch):
 
 @needs_cron
 def test_the_job_is_daily_at_its_time_with_the_bots_usual_tools(tmp_path):
+    s = store(tmp_path)
     with cron_jobs.use_cron_store(tmp_path):
-        job_id = ideas.ensure_job("07:30")
+        job_id = ideas.ensure_job("07:30", s, "default")
         job = cron_jobs.resolve_job_ref(ideas.JOB_NAME)
         assert job["id"] == job_id and job["schedule"]["expr"] == "30 7 * * *"
         assert job.get("enabled_toolsets") is None and job["deliver"] == "local"
         assert "only read" not in job["prompt"] and "tasks_ideas" in job["prompt"]
-        assert ideas.ensure_job("07:30") == job_id and len(cron_jobs.list_jobs(include_disabled=True)) == 1
-        ideas.ensure_job("06:05")
+        assert ideas.ensure_job("07:30", s, "default") == job_id and len(cron_jobs.list_jobs(include_disabled=True)) == 1
+        ideas.ensure_job("06:05", s, "default")
         assert cron_jobs.resolve_job_ref(ideas.JOB_NAME)["schedule"]["expr"] == "5 6 * * *"
         # A trial build's job kept a short tool list: it gets the bot's usual tools back.
         cron_jobs.update_job(job_id, {"enabled_toolsets": ["session_search", "web"]})
-        ideas.ensure_job("06:05")
+        ideas.ensure_job("06:05", s, "default")
         assert cron_jobs.resolve_job_ref(ideas.JOB_NAME).get("enabled_toolsets") is None
 
 
@@ -430,6 +435,46 @@ def test_reconcile_puts_the_job_with_the_ideas_bot_only_while_on(tmp_path):
     ideas.reconcile_job(s, "scout", home)
     with cron_jobs.use_cron_store(home):
         assert cron_jobs.resolve_job_ref(ideas.JOB_NAME) is None
+
+
+# An outside review: "Task ideas" was found by name, so a job of the person's with that name was rewritten, or
+# (Ideas is off by default) removed with its output at every load.
+@needs_cron
+def test_a_persons_task_ideas_job_survives_ideas_off_and_on(tmp_path):
+    s = store(tmp_path, on=False)
+    with cron_jobs.use_cron_store(tmp_path / "home"):
+        made = cron_jobs.create_job(prompt="Plan my week", schedule="0 9 * * 1", name="task ideas", deliver="local")
+        theirs = cron_jobs.get_job(made["id"])
+        ideas.reconcile_job(s, "default")   # Ideas off: what every load did
+        assert cron_jobs.get_job(theirs["id"]) == theirs
+        s.put_settings({"ideas": True})
+        ideas.reconcile_job(s, "default")
+        ours = cron_jobs.get_job(tasks.recorded_job_id(s, "ideas", "default"))
+        assert ours["name"] == "Task ideas (Hermes HQ)" and ours["prompt"] == ideas.JOB_PROMPT
+        assert cron_jobs.get_job(theirs["id"]) == theirs
+        s.put_settings({"ideas_at": "06:05"})
+        ideas.reconcile_job(s, "default")   # ours is still the one kept up to date
+        assert cron_jobs.get_job(ours["id"])["schedule"]["expr"] == "5 6 * * *"
+        assert len(cron_jobs.list_jobs(include_disabled=True)) == 2
+        s.put_settings({"ideas": False})
+        ideas.reconcile_job(s, "default")
+        assert cron_jobs.get_job(ours["id"]) is None and cron_jobs.get_job(theirs["id"]) == theirs
+
+
+@needs_cron
+def test_an_older_ideas_job_is_adopted_not_doubled(tmp_path):
+    s = store(tmp_path)
+    with cron_jobs.use_cron_store(tmp_path / "home"):
+        old = cron_jobs.create_job(prompt="Find task ideas for the user. First call tasks_ideas with action "
+                                   "'context'. Older words.", schedule="30 7 * * *", name="Task ideas",
+                                   deliver="local")
+        ideas.reconcile_job(s, "default")
+        assert tasks.recorded_job_id(s, "ideas", "default") == old["id"]
+        assert len(cron_jobs.list_jobs(include_disabled=True)) == 1
+        assert cron_jobs.get_job(old["id"])["prompt"] == ideas.JOB_PROMPT
+        s.put_settings({"ideas": False})
+        ideas.reconcile_job(s, "default")
+        assert cron_jobs.list_jobs(include_disabled=True) == []
 
 
 # ---------------------------------------------------------------------------
