@@ -256,6 +256,13 @@ made, its history) and what its bot writes with `tasks_update(page={summary, nex
 next, and parts such as options compared in a table, the numbers that matter, or what it found. The bot writes words,
 never HTML. The `task-page` skill (hermes-hq-push:task-page) tells bots what goes on it.
 
+Version 0.9.56 closes two findings from an outside review. The Task prep, Task check and Task ideas jobs are now the
+add-on's by the id it recorded when it made them, not by their name: a job of yours that happens to be called
+"Task prep" is never edited, run or removed. A job from an older version is taken over only when its name, its prompt
+and its delivery all match what the add-on writes. And the tile check (`check_tile.py`) now draws a tile in a browser
+that can read no other file and reach no network: no `--allow-file-access-from-files`, every host name unresolvable,
+a dead proxy, and the sandbox left on unless the browser can't start with it.
+
 Version 0.9.55 gives Tasks lists a keeper. A list (`GET`/`PUT /tasks/sections`) now also carries `color`, `icon`, `bot`
 (the bot that keeps it), `adds` (`ask`: that bot offers new tasks first) and `today` (`false`: left out of Today);
 a field an older app leaves out is kept. Bots get `tasks_offer`: a list to make, a batch of tasks for a list, or
