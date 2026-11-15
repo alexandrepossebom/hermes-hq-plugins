@@ -394,12 +394,31 @@ def render_problems(path, chromes, shots):
     return [], [], note
 
 
+# The tile is a bot's page, maybe with a script copied from anywhere, so it is drawn with no way out (an outside
+# review). No --allow-file-access-from-files: with it a file:// page can read any file this user can and send it
+# on; the frames report to the sheet by postMessage, which needs no such access, and the kit is inlined in the page.
+# No network: every name resolves to nothing, and what needs no name (an IP address, this computer itself, which a
+# proxy otherwise lets go direct) goes to a proxy that isn't there; WebRTC may not go round it. A tile loads nothing
+# from the network by the file rules, so the picture is the same.
+NO_NETWORK = ["--host-resolver-rules=MAP * ~NOTFOUND", "--proxy-server=127.0.0.1:9", "--proxy-bypass-list=<-loopback>",
+              "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"]
+
+
+def chrome_args(chrome, profile, height, sandbox=True):
+    """The browser's command line, less the page and what to do with it. Chrome's own sandbox stays on unless it
+    can't start with it (as root, or in a Linux container without the kernel features it needs)."""
+    return ([chrome, "--headless=new", "--disable-gpu", "--hide-scrollbars", "--no-first-run"]
+            + ([] if sandbox else ["--no-sandbox"])
+            + ["--force-device-scale-factor=2", f"--window-size={SHEET_WIDTH + 32},{height}",
+               "--virtual-time-budget=3000", f"--user-data-dir={profile}"] + NO_NETWORK)
+
+
 def render_with(path, chrome, shots):
     """The page drawn with one browser: (problems, warnings, note). Each line names the sizes it was seen at."""
     html = open(path, encoding="utf-8", errors="replace").read()
     name = os.path.basename(chrome)
     with tempfile.TemporaryDirectory() as tmp:
-        # Beside the original, so pictures and files it names by relative path still load.
+        # Beside the original, so pictures it names by relative path still load.
         tile = os.path.join(os.path.dirname(path), f".hq-tile-check-{os.getpid()}.html")
         with open(tile, "w", encoding="utf-8") as f:
             f.write(with_probe(html))
@@ -407,13 +426,18 @@ def render_with(path, chrome, shots):
         with open(host, "w", encoding="utf-8") as f:
             f.write(sheet(SHAPES).replace('src="tile.html', f'src="{os.path.basename(tile)}'))
         try:
-            base = [chrome, "--headless=new", "--disable-gpu", "--hide-scrollbars", "--no-sandbox", "--no-first-run",
-                    "--allow-file-access-from-files", "--force-device-scale-factor=2",
-                    f"--window-size={SHEET_WIDTH + 32},{sheet_height(SHAPES)}",
-                    "--virtual-time-budget=3000", f"--user-data-dir={tmp}/profile"]
+            # Root can't have Chrome's sandbox; anyone else tries it first and goes without only when Chrome says
+            # it can't start with it.
+            sandbox = not (hasattr(os, "geteuid") and os.geteuid() == 0)
             url = "file://" + host
             try:
-                dom = subprocess.run(base + ["--dump-dom", url], capture_output=True, text=True, timeout=45).stdout
+                run = subprocess.run(chrome_args(chrome, f"{tmp}/profile", sheet_height(SHAPES), sandbox) + ["--dump-dom", url],
+                                     capture_output=True, text=True, timeout=45)
+                if sandbox and "hq-tile-check" not in run.stdout and "sandbox" in (run.stderr or "").lower():
+                    sandbox = False
+                    run = subprocess.run(chrome_args(chrome, f"{tmp}/profile", sheet_height(SHAPES), sandbox) + ["--dump-dom", url],
+                                         capture_output=True, text=True, timeout=45)
+                dom = run.stdout
             except OSError as exc:
                 return [], [], f"NOT DRAWN: {name} wouldn't start ({exc}); only the file rules were checked"
             except subprocess.TimeoutExpired:
@@ -428,7 +452,7 @@ def render_with(path, chrome, shots):
                 for file, _, some in pages(SHAPES):
                     with open(host, "w", encoding="utf-8") as f:
                         f.write(sheet([s for _, s in some], [i for i, _ in some]).replace('src="tile.html', f'src="{os.path.basename(tile)}'))
-                    size = [a for a in base if not a.startswith("--window-size")] + [f"--window-size={SHEET_WIDTH + 32},{sheet_height([s for _, s in some])}"]
+                    size = chrome_args(chrome, f"{tmp}/profile", sheet_height([s for _, s in some]), sandbox)
                     try:
                         subprocess.run(size + [f"--screenshot={os.path.join(shots, file)}", url], capture_output=True, timeout=45)
                     except subprocess.TimeoutExpired:

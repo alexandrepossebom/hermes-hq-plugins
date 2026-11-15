@@ -234,6 +234,81 @@ def test_findings_are_said_once_per_kind_with_their_sizes():
     assert "show less" in problems[0] and "under 11 pt" in warnings[0]
 
 
+# An outside review: the tile was drawn with --allow-file-access-from-files and the network open, so a script in it
+# could read this user's files and send them out.
+def test_the_browser_gets_no_file_access_and_no_network():
+    for sandbox in (True, False):
+        args = check_tile.chrome_args("chrome", "/tmp/profile", 400, sandbox)
+        assert "--allow-file-access-from-files" not in args
+        assert {"--host-resolver-rules=MAP * ~NOTFOUND", "--proxy-server=127.0.0.1:9",
+                "--proxy-bypass-list=<-loopback>"} <= set(args)
+        assert ("--no-sandbox" in args) is (not sandbox)
+        assert "--user-data-dir=/tmp/profile" in args and "--virtual-time-budget=3000" in args
+
+
+def test_the_sandbox_is_left_off_only_when_chrome_cannot_start_with_it(tmp_path, monkeypatch):
+    """A Linux container's Chrome says it has no usable sandbox; then, and only then, it is drawn without."""
+    chrome = tmp_path / "chrome"
+    chrome.write_text('#!/bin/sh\ncase "$*" in *--no-sandbox*) echo \'<meta name="hq-tile-check" content="{}">\';;\n'
+                      '*) echo "No usable sandbox!" >&2; exit 1;; esac\n')
+    chrome.chmod(0o755)
+    seen = []
+    real = subprocess.run
+    monkeypatch.setattr(check_tile.subprocess, "run", lambda args, **kw: seen.append("--no-sandbox" in args) or real(args, **kw))
+    problems, _, note = check_tile.render_with(str(_tile(tmp_path, "tile.html")), str(chrome), None)
+    assert note is None and problems == []
+    assert seen == ([True] if os.geteuid() == 0 else [False, True])
+
+
+@needs_chrome
+def test_a_tiles_script_reads_no_file_and_reaches_no_network(tmp_path, monkeypatch):
+    import http.server
+    import threading
+    hits = []
+
+    class Note(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            hits.append(self.path)
+            self.send_response(200)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(b"reached")
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Note)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    secret = tmp_path / "secret.txt"
+    secret.write_text("the-secret-words")
+    here = f"http://127.0.0.1:{server.server_address[1]}"
+    # What it got is thrown as an error, which the probe reports as "a script failed: …".
+    leak = f"""<script>
+    var got = [];
+    function tryIt(name, url) {{ fetch(url).then(function (r) {{ return r.text(); }})
+      .then(function (t) {{ got.push(name + "=" + t); }}, function () {{ got.push(name + "=blocked"); }}); }}
+    tryIt("file", "file://{secret}"); tryIt("loopback", "{here}/fetch"); tryIt("named", "http://example.com/");
+    var img = new Image(); img.src = "{here}/picture.png";
+    setTimeout(function () {{ throw new Error("tried " + got.sort().join(" ")); }}, 400);
+    </script></body>"""
+    tile = _tile(tmp_path, "leaky.html", edit=lambda page: page.replace("</body>", leak, 1))
+    try:
+        problems, _, note = check_tile.render_problems(str(tile), check_tile.find_chromes(), None)
+        assert note is None
+        said = next(p for p in problems if "a script failed" in p)
+        assert "file=blocked" in said and "loopback=blocked" in said and "named=blocked" in said, said
+        assert "the-secret-words" not in said and hits == []
+        # The same tile with the old flag and only this computer reachable (nothing leaves it): the test sees what
+        # it is there to catch.
+        monkeypatch.setattr(check_tile, "NO_NETWORK", ["--allow-file-access-from-files",
+                                                       "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1"])
+        problems, _, note = check_tile.render_problems(str(tile), check_tile.find_chromes(), None)
+        said = next(p for p in problems if "a script failed" in p)
+        assert "file=the-secret-words" in said and "loopback=reached" in said and hits, (said, hits)
+    finally:
+        server.shutdown()
+
+
 @needs_chrome
 def test_drawn_at_every_size_the_template_fits_and_a_phone_page_does_not(tmp_path):
     tile = tmp_path / "revenue.html"
