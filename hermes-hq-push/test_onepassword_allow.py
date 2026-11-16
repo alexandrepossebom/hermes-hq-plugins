@@ -1,0 +1,236 @@
+"""Allow in 1Password (0.9.59): the job (waiting → choose → done), where the key is kept, Disconnect, and Hermes's
+backend reading a key saved a moment ago. ``~/.hermes/hermes-agent/.venv/bin/python -m pytest -q
+test_onepassword_allow.py`` from the plugin folder. conftest.py pins HERMES_HOME to a throwaway folder; ``op`` is never
+run here (every call that would is replaced), so the computer's own 1Password is never asked anything."""
+import importlib.util
+import os
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, os.environ.get("HERMES_AGENT", os.path.expanduser("~/.hermes/hermes-agent")))
+
+from hermes_constants import get_default_hermes_root  # noqa: E402
+
+HERE = Path(__file__).parent
+_spec = importlib.util.spec_from_file_location("onepassword_allow_under_test", HERE / "onepassword_allow.py")
+allow = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(allow)
+
+ROOT = get_default_hermes_root()
+assert ROOT.resolve() != (Path.home() / ".hermes").resolve()
+KEY = "ops_" + "A1b2C3d4" * 8
+OTHER = "ops_" + "Z9y8X7w6" * 8
+VAULTS = [{"id": "vaultaaaaaaaaaaaaaaaaaaaaa", "name": "Hermes", "items": 3},
+          {"id": "vaultbbbbbbbbbbbbbbbbbbbbb", "name": "Work", "items": 40}]
+ACCOUNT = [{"id": "ACCOUNTAAAAAAAAAAAAAAAAAAA", "url": "my.1password.com", "email": "someone@example.com"}]
+
+
+def home(name):
+    path = ROOT if name == "default" else ROOT / "profiles" / name
+    path.mkdir(parents=True, exist_ok=True)
+    if not (path / "config.yaml").exists():
+        (path / "config.yaml").write_text("{}\n")   # what makes a folder a bot to Hermes
+    return path
+
+
+@pytest.fixture
+def bots(tmp_path, monkeypatch):
+    monkeypatch.setattr(allow, "find_op", lambda: "/usr/bin/true")
+    monkeypatch.delenv(allow.TOKEN_ENV, raising=False)
+    with allow._lock:
+        allow._jobs.clear()
+    homes = [("default", home("default")), ("finance", home("finance"))]
+    for _, path in homes:
+        (path / ".env").unlink(missing_ok=True)
+    monkeypatch.setattr(allow, "bot_homes", lambda: homes)
+    yield tmp_path, homes
+    for _, path in homes:
+        (path / ".env").unlink(missing_ok=True)
+    os.environ.pop(allow.TOKEN_ENV, None)   # Hermes's save also sets it for the process's own bot
+
+
+def settle(key, *states, limit=5.0):
+    until = time.time() + limit
+    while time.time() < until:
+        job = allow.job(key)
+        if job["state"] in states:
+            return job
+        time.sleep(0.01)
+    raise AssertionError(f"job stayed {allow.job(key)['state']}")
+
+
+def allowed(data_dir):
+    started = allow.start(data_dir, lister=lambda account: [dict(v) for v in VAULTS], account_lister=lambda: ACCOUNT)
+    assert started["state"] == "waiting"
+    return settle(started["job"], "choose", "failed")
+
+
+# MARK: op's words
+
+def test_op_runs_as_the_person_never_with_a_saved_key():
+    env = allow.op_env({"PATH": "/bin", "HOME": "/h", "OP_SERVICE_ACCOUNT_TOKEN": KEY, "OP_SESSION_x": "s",
+                        "OP_CONNECT_TOKEN": "c", "OP_CONNECT_HOST": "h", "XAI_API_KEY": "k"})
+    assert env == {"PATH": "/bin", "HOME": "/h", "NO_COLOR": "1", "OP_BIOMETRIC_UNLOCK_ENABLED": "true"}
+
+
+def test_a_key_never_survives_in_an_error():
+    assert KEY not in allow.scrub(f"\x1b[31m[ERROR]\x1b[0m bad {KEY}")
+    assert KEY not in allow.problem(f"[ERROR] something odd {KEY}").detail
+
+
+@pytest.mark.parametrize("words, code", [
+    ("[ERROR] 2026/11/16 authorization prompt dismissed, please try again", "denied"),
+    ("[ERROR] connecting to desktop app: connection reset, make sure 1Password CLI is installed correctly", "integration-off"),
+    ("[ERROR] You've reached the maximum number of service accounts", "limit"),
+    ("[ERROR] (403) Forbidden: You do not have permission", "permission"),
+    ("[ERROR] the moon is wrong", "op-error"),
+])
+def test_ops_failures_in_the_apps_words(words, code):
+    assert allow.problem(words).code == code
+
+
+def test_private_vaults_are_never_offered(monkeypatch):
+    listed = [{"id": "vaultppppppppppppppppppppp", "name": "Private"}, {"id": VAULTS[1]["id"], "name": "Work"},
+              {"id": VAULTS[0]["id"], "name": "Hermes"}, {"id": "vaultsssssssssssssssssssss", "name": "Shared", "type": "EVERYONE"}]
+    kinds = {"vaultppppppppppppppppppppp": "PERSONAL", VAULTS[1]["id"]: "USER_CREATED", VAULTS[0]["id"]: "USER_CREATED"}
+
+    def answer(args, timeout=0):
+        if args[:2] == ["vault", "list"]:
+            return listed
+        return {"id": args[2], "type": kinds[args[2]], "items": 7}
+    monkeypatch.setattr(allow, "op_json", answer)
+    assert [(v["name"], v["items"]) for v in allow.open_vaults("ACCOUNT")] == [("Hermes", 7), ("Work", 7)]
+
+
+def test_the_key_is_read_only_for_the_picked_vaults(monkeypatch):
+    seen = {}
+
+    class Done:
+        returncode, stdout, stderr = 0, f"{KEY}\n", ""
+
+    def run(args, timeout=0):
+        seen["args"] = args
+        return Done()
+    monkeypatch.setattr(allow, "run_op", run)
+    assert allow.make_key("ACCOUNT", ["v1", "v2"]) == KEY
+    assert seen["args"][:2] == ["service-account", "create"] and "--raw" in seen["args"]
+    assert [a for a in seen["args"] if a.endswith(":read_items")] == ["v1:read_items", "v2:read_items"]
+    assert not any("write_items" in a or "can-create" in a for a in seen["args"])
+
+
+# MARK: Hermes's backend
+# Built inside the bot's own scope, as every Hermes turn and Settings call builds it (an earlier test here made the
+# process serve two bots, after which Hermes refuses a key read outside one). These run before the job's tests: once
+# the process serves two bots Hermes freezes the first bot's keys as they were then.
+
+def test_hermes_reads_a_key_saved_a_moment_ago_and_takes_allowed_for_the_card(bots):
+    _, homes = bots
+    from agent.vault_backends.onepassword import OnePasswordLoginBackend
+    assert allow.install() in ("installed", "already") and allow.install() == "already"
+    with allow._scope(""):
+        locked = OnePasswordLoginBackend({})
+        assert not locked._service_token
+        with pytest.raises(RuntimeError):
+            locked.unlock(allow.ALLOWED)                 # nothing saved yet: the card can't be answered with it
+        (homes[0][1] / ".env").write_text(f"{allow.TOKEN_ENV}={KEY}\n")
+        locked.unlock(allow.ALLOWED)                     # the turn that was waiting
+        assert locked._service_token == KEY and locked.is_unlocked()
+        assert OnePasswordLoginBackend({}).is_unlocked()  # and every one built after it
+    with allow._scope("finance"):
+        assert not OnePasswordLoginBackend({}).is_unlocked()   # another bot's .env has none
+
+
+def test_another_token_name_in_config_is_left_alone(bots):
+    _, homes = bots
+    from agent.vault_backends.onepassword import OnePasswordLoginBackend
+    allow.install()
+    (homes[0][1] / ".env").write_text(f"{allow.TOKEN_ENV}={KEY}\n")
+    with allow._scope(""):
+        assert not OnePasswordLoginBackend({"service_account_token_env": "MY_OWN_OP_TOKEN"})._service_token
+
+
+# MARK: The job
+
+def test_allow_then_pick_saves_the_key_for_every_bot(bots):
+    data_dir, homes = bots
+    job = allowed(data_dir)
+    assert job["state"] == "choose" and [v["name"] for v in job["vaults"]] == ["Hermes", "Work"]
+    assert job["account"] == "my.1password.com" and "email" not in str(job)
+    made = {}
+    allow.finish(job["job"], [VAULTS[0]["id"], "not-a-listed-vault"],
+                 key_maker=lambda account, ids: made.setdefault("ids", ids) and KEY)
+    done = settle(job["job"], "done", "failed")
+    assert done["state"] == "done" and done["saved"] == 2 and made["ids"] == [VAULTS[0]["id"]]
+    assert KEY not in str(done)
+    for _, path in homes:
+        assert allow.env_token(path) == KEY
+    state = allow.state(data_dir)
+    assert state["connected"] and state["ours"] and state["vaults"] == ["Hermes"] and state["bots"] == 2
+    assert KEY not in (data_dir / allow.STATE).read_text()
+
+
+def test_a_new_hermes_vault_when_asked(bots):
+    data_dir, _ = bots
+    job = allowed(data_dir)
+    made = {}
+    allow.finish(job["job"], [], create=True, vault_maker=lambda account: {"id": "newvault0000000000000000", "name": "Hermes", "items": 0},
+                 key_maker=lambda account, ids: made.setdefault("ids", ids) and KEY)
+    assert settle(job["job"], "done", "failed")["state"] == "done" and made["ids"] == ["newvault0000000000000000"]
+
+
+def test_no_vault_picked_is_refused(bots):
+    data_dir, _ = bots
+    job = allowed(data_dir)
+    with pytest.raises(allow.AllowError) as error:
+        allow.finish(job["job"], ["nope"])
+    assert error.value.code == "no-vault" and allow.job(job["job"])["state"] == "choose"
+
+
+def test_not_allowed_says_so(bots):
+    data_dir, _ = bots
+
+    def denied(account):
+        raise allow.problem("[ERROR] authorization prompt dismissed, please try again")
+    started = allow.start(data_dir, lister=denied, account_lister=lambda: ACCOUNT)
+    failed = settle(started["job"], "failed")
+    assert failed["code"] == "denied" and "Allow" in failed["detail"]
+
+
+def test_no_account_means_the_integration_is_off(bots):
+    data_dir, _ = bots
+    started = allow.start(data_dir, lister=lambda account: VAULTS, account_lister=lambda: [])
+    assert settle(started["job"], "failed")["code"] == "integration-off"
+
+
+def test_one_ask_at_a_time(bots):
+    data_dir, _ = bots
+    hold = __import__("threading").Event()
+    started = allow.start(data_dir, lister=lambda account: hold.wait(5) and VAULTS, account_lister=lambda: ACCOUNT)
+    with pytest.raises(allow.AllowError) as error:
+        allow.start(data_dir, lister=lambda account: VAULTS, account_lister=lambda: ACCOUNT)
+    hold.set()
+    assert error.value.code == "busy" and settle(started["job"], "choose")
+
+
+def test_a_bots_own_key_is_kept_and_disconnect_removes_only_ours(bots):
+    data_dir, homes = bots
+    (homes[1][1] / ".env").write_text(f"{allow.TOKEN_ENV}={OTHER}\n")
+    job = allowed(data_dir)
+    allow.finish(job["job"], [VAULTS[1]["id"]], key_maker=lambda account, ids: KEY)
+    assert settle(job["job"], "done", "failed")["saved"] == 1
+    assert allow.env_token(homes[0][1]) == KEY and allow.env_token(homes[1][1]) == OTHER
+    assert allow.disconnect(data_dir) == {"ok": True, "removed": 1}
+    assert allow.env_token(homes[0][1]) == "" and allow.env_token(homes[1][1]) == OTHER
+    assert allow.state(data_dir)["connected"] is False
+
+
+def test_allowing_again_replaces_our_own_key(bots):
+    data_dir, homes = bots
+    for key in (KEY, OTHER):
+        job = allowed(data_dir)
+        allow.finish(job["job"], [VAULTS[0]["id"]], key_maker=lambda account, ids, key=key: key)
+        assert settle(job["job"], "done", "failed")["saved"] == 2
+    assert allow.env_token(homes[0][1]) == OTHER

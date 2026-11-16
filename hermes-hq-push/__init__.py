@@ -470,6 +470,17 @@ def _gateway_logins():
         log.debug("hermes-hq-push: questions in job turns not installed", exc_info=True)
 
 
+def _onepassword_allow():
+    """[0.9.59] A 1Password key saved from the app works at once, in this process too (onepassword_allow.install)."""
+    try:
+        spec = importlib.util.spec_from_file_location("hermes_hq_push_onepassword_allow", Path(__file__).with_name("onepassword_allow.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        log.info("hermes-hq-push: allow in 1Password %s", module.install())
+    except Exception:
+        log.debug("hermes-hq-push: allow in 1Password not installed", exc_info=True)
+
+
 def _page_previews():
     try:
         log.info("hermes-hq-push: page previews %s", page_previews.install())
@@ -622,5 +633,6 @@ def register(ctx):
     _short_titles()
     _desktop_forward()
     _gateway_logins()
+    _onepassword_allow()
     _serve_warmup()
     _tasks_prep_job()

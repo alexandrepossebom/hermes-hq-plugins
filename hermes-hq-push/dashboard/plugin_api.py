@@ -94,6 +94,18 @@ else:
     sys.modules["hermes_hq_grok_live"] = grok_live
     _grok_live_spec.loader.exec_module(grok_live)
 
+if "hermes_hq_onepassword_allow" in sys.modules:
+    onepassword_allow = sys.modules["hermes_hq_onepassword_allow"]
+else:
+    _allow_spec = importlib.util.spec_from_file_location("hermes_hq_onepassword_allow", Path(__file__).parents[1] / "onepassword_allow.py")
+    onepassword_allow = importlib.util.module_from_spec(_allow_spec)
+    sys.modules["hermes_hq_onepassword_allow"] = onepassword_allow
+    _allow_spec.loader.exec_module(onepassword_allow)
+try:  # the server's own turns and its Passwords page read a key saved a moment ago
+    onepassword_allow.log.info("hermes-hq-push: allow in 1Password %s", onepassword_allow.install())
+except Exception:
+    onepassword_allow.log.debug("hermes-hq-push: allow in 1Password not installed", exc_info=True)
+
 if "hermes_hq_tasks" in sys.modules:
     tasks = sys.modules["hermes_hq_tasks"]
 else:
@@ -197,7 +209,8 @@ class ApprovalIn(BaseModel):
 def status():
     """The app probes this to offer push; a 404 means the plugin isn't installed or enabled."""
     return {**push.status_body(push.data_dir(), push.sender_from_env()), **terminal.status(push.data_dir()),
-            **tasks.status(), **drafts.status(push.data_dir()), **plugin_updates.status()}
+            **tasks.status(), **drafts.status(push.data_dir()), **plugin_updates.status(),
+            **onepassword_allow.status()}
 
 
 class ScanFindingIn(BaseModel):
@@ -241,6 +254,53 @@ def plugin_update_job(job: str):
         return plugin_updates.job(job)
     except plugin_updates.UpdateError as error:
         raise HTTPException(error.status_code, error.detail) from None
+
+
+# ---------------------------------------------------------------------------
+# Allow in 1Password (0.9.59, `onePasswordAllow` in status; onepassword_allow.py): the 1Password app on this computer
+# asks its person to allow it, they pick the vaults, and a read-only key for those vaults is saved for the bots. The
+# key itself never appears in an answer here.
+# ---------------------------------------------------------------------------
+
+class AllowStartIn(BaseModel):
+    account: str = Field(default="", max_length=64)
+
+
+class AllowFinishIn(BaseModel):
+    vaults: list[Annotated[str, Field(max_length=64)]] = Field(default_factory=list, max_length=60)
+    create: bool = False
+
+
+def _allow_call(call):
+    try:
+        return call()
+    except onepassword_allow.AllowError as error:
+        return JSONResponse(status_code=error.status_code, content={"ok": False, "detail": error.detail, "code": error.code})
+
+
+@router.get("/vault/onepassword")
+def onepassword_state(profile: str = ""):
+    return onepassword_allow.state(push.data_dir(), profile)
+
+
+@router.post("/vault/onepassword/allow")
+def onepassword_allow_start(body: AllowStartIn):
+    return _allow_call(lambda: onepassword_allow.start(push.data_dir(), body.account))
+
+
+@router.get("/vault/onepassword/allow/{job}")
+def onepassword_allow_job(job: str):
+    return _allow_call(lambda: onepassword_allow.job(job))
+
+
+@router.post("/vault/onepassword/allow/{job}")
+def onepassword_allow_finish(job: str, body: AllowFinishIn):
+    return _allow_call(lambda: onepassword_allow.finish(job, body.vaults, body.create))
+
+
+@router.delete("/vault/onepassword")
+def onepassword_disconnect():
+    return _allow_call(lambda: onepassword_allow.disconnect(push.data_dir()))
 
 
 @router.put("/drafts/cards")

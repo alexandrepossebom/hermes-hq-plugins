@@ -256,6 +256,18 @@ made, its history) and what its bot writes with `tasks_update(page={summary, nex
 next, and parts such as options compared in a table, the numbers that matter, or what it found. The bot writes words,
 never HTML. The `task-page` skill (hermes-hq-push:task-page) tells bots what goes on it.
 
+Version 0.9.59 adds Allow in 1Password. Hermes unlocks 1Password with your master password and asks again after half
+an hour idle. Now the app's unlock sheet and Passwords page have an Allow in 1Password button: the 1Password app on
+Hermes's computer asks you to allow it (a click or Touch ID, no master password), you pick which vaults your bots may
+fill from, and the add-on makes a read-only key for those vaults with 1Password's own command-line tool
+(`op service-account create … --vault <id>:read_items`) and saves it in each bot's `.env` as
+`OP_SERVICE_ACCOUNT_TOKEN`, the name Hermes already reads. From then on 1Password is never locked for your bots.
+1Password never lets such a key read your Private vault, so move a login into one of the vaults you picked (the app can
+make one named Hermes). The key never leaves the computer and is not sent to the app; a bot that already has a key of
+its own keeps it; Disconnect in the app removes the key from the bots (cancel the key itself at 1Password.com ›
+Developer › Service Accounts). Needs 1Password 8 with Settings › Developer › Integrate with 1Password CLI turned on,
+and the `op` tool installed, on the computer running Hermes.
+
 Version 0.9.58 ties a plugin update you approve in the app to what the app showed you (the last open finding of the
 outside review). Hermes fetches the new version into a copy before it asks anything, and lists what that copy needs
 above each question. The add-on now says yes only when that list is exactly what you saw: the Python packages, the
