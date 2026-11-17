@@ -256,6 +256,11 @@ made, its history) and what its bot writes with `tasks_update(page={summary, nex
 next, and parts such as options compared in a table, the numbers that matter, or what it found. The bot writes words,
 never HTML. The `task-page` skill (hermes-hq-push:task-page) tells bots what goes on it.
 
+Version 0.9.61 gives Dashboard tiles a new default look, Soft: a calm card in your own theme's colours, the heading
+in plain words, the numbers on small cards of their own, and a faint light in the corner only when a tile warns or is
+in trouble. A tile is drawn in it unless you ask a bot for another look (`app`, `midnight`, `terminal`, `vivid`).
+Tiles made before keep the look they have until they are changed or remade. (0.9.59 and 0.9.60 were not published.)
+
 Version 0.9.58 ties a plugin update you approve in the app to what the app showed you (the last open finding of the
 outside review). Hermes fetches the new version into a copy before it asks anything, and lists what that copy needs
 above each question. The add-on now says yes only when that list is exactly what you saw: the Python packages, the
