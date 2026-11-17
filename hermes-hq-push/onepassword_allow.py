@@ -43,6 +43,14 @@ TOKEN_ENV = "OP_SERVICE_ACCOUNT_TOKEN"
 # What the app answers the unlock card with once the key is saved. Never a real master password: 1Password's are typed
 # by a person, and this has a control character no keyboard field sends.
 ALLOWED = "\x1dhermes-hq:allowed-in-1password"
+# What the app answers the unlock card with when the person is on their phone, away from this computer, and will give
+# the login from 1Password there (owner, 2026-11-16: "it needs to open up in the 1Password app on my phone because
+# that's where I am"). 1Password's own Allow only ever shows on the computer; the phone's 1Password fills the app's
+# login sheet. So the unlock is refused with words that send the bot to ask for that login (``ON_PHONE``).
+PHONE = "\x1dhermes-hq:fill-on-phone"
+ON_PHONE = ("Not unlocked: the person is on their phone, away from this computer. Ask for this login instead: call "
+            "browser_vault action=save_login with origin set to the sign-in page's URL. They will fill it from "
+            "1Password on their phone, and it is saved for that site.")
 MARK = "_hermes_hq_onepassword_allow"
 NEW_VAULT = "Hermes"
 WAIT = 180.0        # how long the 1Password app's "Allow" may sit unanswered
@@ -305,7 +313,7 @@ def state(data_dir: Path, profile: str = "") -> dict:
     except Exception:
         token = ""
     ours = bool(token) and _hash(token) in set(saved.get("hashes") or [])
-    return {"ok": True, "supported": supported(), "connected": bool(token), "ours": ours,
+    return {"ok": True, "supported": supported(), "phone": True, "connected": bool(token), "ours": ours,
             "vaults": [str(name) for name in saved.get("vaults") or []] if ours else [],
             "name": str(saved.get("name") or "") if ours else "",
             "bots": len(saved.get("bots") or []) if ours else 0}
@@ -449,6 +457,8 @@ def install() -> str:
             self._service_token = fresh(self)
 
     def allowed_unlock(self, master_password):
+        if master_password == PHONE:
+            raise RuntimeError(ON_PHONE)
         if master_password != ALLOWED:
             return unlock(self, master_password)
         if not getattr(self, "_service_token", ""):

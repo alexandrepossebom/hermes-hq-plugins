@@ -144,6 +144,17 @@ def test_hermes_reads_a_key_saved_a_moment_ago_and_takes_allowed_for_the_card(bo
         assert not OnePasswordLoginBackend({}).is_unlocked()   # another bot's .env has none
 
 
+def test_on_the_phone_sends_the_bot_to_ask_for_the_login(bots):
+    from agent.vault_backends.onepassword import OnePasswordLoginBackend
+    allow.install()
+    with allow._scope(""):
+        backend = OnePasswordLoginBackend({})
+        with pytest.raises(RuntimeError) as error:
+            backend.unlock(allow.PHONE)
+    assert "save_login" in str(error.value) and len(str(error.value)) <= 300   # Hermes hands the bot 300 characters
+    assert allow.state(bots[0])["phone"] is True
+
+
 def test_another_token_name_in_config_is_left_alone(bots):
     _, homes = bots
     from agent.vault_backends.onepassword import OnePasswordLoginBackend
