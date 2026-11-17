@@ -486,6 +486,13 @@ def _gateway_logins():
         log.info("hermes-hq-push: questions in job turns %s", gateway_logins.install_job_asks(push.data_dir()))
     except Exception:
         log.debug("hermes-hq-push: questions in job turns not installed", exc_info=True)
+    try:  # [0.9.59] a 1Password login fills on its whole site (www., account., ...), as 1Password does
+        spec = importlib.util.spec_from_file_location("hermes_hq_push_site_match", Path(__file__).with_name("site_match.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        log.info("hermes-hq-push: 1Password logins on their whole site %s", module.install())
+    except Exception:
+        log.debug("hermes-hq-push: 1Password logins on their whole site not installed", exc_info=True)
 
 
 def _onepassword_allow():
