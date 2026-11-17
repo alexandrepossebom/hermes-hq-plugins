@@ -808,3 +808,8 @@ def test_a_tile_with_no_look_named_is_soft():
     assert '(/^(app|midnight|terminal|vivid)$/.test(d.look) ? d.look : "soft")' in script
     styles = open(os.path.join(os.path.dirname(make_tile.__file__), "kit", "tile.css"), encoding="utf-8").read()
     assert ":root.look-soft {" in styles and ".look-soft .foot:not(.failed) { display: none; }" in styles
+    # It wears the theme the app hands over, and only a tile that warns or is in trouble has a light in its corner.
+    # Its page colour is a plain colour (the app tells light from dark by it; a color-mix() reads to it as black).
+    soft = styles[styles.index(":root.look-soft {"):styles.index(":root.look-midnight {")]
+    assert "--page: var(--card, #ffffff);" in soft and "--page: color-mix" not in soft
+    assert "--surface: var(--card, #ffffff)" in styles and ":root.look-soft.mood-warn, :root.look-soft.mood-bad { --mood-strength: 9%; }" in styles

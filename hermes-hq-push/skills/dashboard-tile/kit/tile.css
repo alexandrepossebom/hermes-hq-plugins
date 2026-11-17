@@ -28,16 +28,26 @@ body { container-type: size; background: var(--page); color: var(--ink); font-fa
           --good-fill: #3fdd88; --warn-fill: #f6bb45; --bad-fill: #ff6d6d;
           --line: var(--border, rgba(255, 255, 255, .13)); --surface: rgba(160, 168, 190, .14); --mood-strength: 16%; }
 }
-/* Soft (the default): a calm card. A pale page, the parts on white cards of their own, the heading in plain words
-   in the ink's colour, no light in the corner. Follows the person's light or dark, and their accent. */
+/* Soft (the default): a calm card. A pale page, the parts on cards of their own, the heading in plain words in the
+   ink's colour. It wears the person's own theme (the app's --card, --foreground, --muted-foreground, --accent,
+   --border) a shade off, so the parts' cards stand on it; with no theme handed over, a pale grey and white. A tile
+   with nothing wrong has no light in its corner (every tile is the same card); one that warns or is in trouble has a
+   faint one. */
 :root.look-soft {
-  --page: #f3f5f9; --ink: #17191e; --ink2: #6a707d; --tint: var(--accent, #2563eb);
-  --line: rgba(40, 50, 72, .12); --surface: #ffffff; --lift: 0 1px 2px rgba(24, 32, 52, .07); --mood-strength: 0%;
-  --radius: 1em; --caps: none; --track: 0em;
+  /* The page is the theme's card with a wash of its ink over it, not one mixed colour: the app reads the page's own
+     background colour to tell a light page from a dark one, and a mixed colour reads to it as black. */
+  --page: var(--card, #ffffff); --wash: linear-gradient(color-mix(in srgb, var(--foreground, #17191e) 5%, transparent) 0 0);
+  --ink: var(--foreground, #17191e); --ink2: var(--muted-foreground, #6a707d); --tint: var(--accent, #2563eb);
+  --line: var(--border, rgba(40, 50, 72, .12)); --surface: var(--card, #ffffff); --lift: 0 1px 2px rgba(24, 32, 52, .07);
+  --mood-strength: 0%; --radius: 1em; --caps: none; --track: 0em;
 }
+:root.look-soft.mood-warn, :root.look-soft.mood-bad { --mood-strength: 9%; }
 @media (prefers-color-scheme: dark) {
-  :root.look-soft { --page: #20242d; --ink: #f3f4f7; --ink2: #a6acb8; --tint: var(--accent, #6ea8ff);
-                    --line: rgba(255, 255, 255, .13); --surface: rgba(255, 255, 255, .085); --lift: none; }
+  :root.look-soft { --page: var(--card, #1b1e26); --wash: linear-gradient(color-mix(in srgb, var(--foreground, #f3f4f7) 4%, transparent) 0 0);
+                    --ink: var(--foreground, #f3f4f7); --ink2: var(--muted-foreground, #a6acb8); --tint: var(--accent, #6ea8ff);
+                    --line: var(--border, rgba(255, 255, 255, .13));
+                    --surface: color-mix(in srgb, var(--foreground, #f3f4f7) 9%, transparent); --lift: none; }
+  :root.look-soft.mood-warn, :root.look-soft.mood-bad { --mood-strength: 12%; }
 }
 :root.look-midnight {
   color-scheme: dark;
@@ -417,7 +427,7 @@ body { background-image: var(--wash); }
 .look-vivid .scale-mark { background: #16181d; border-color: #fff; }
 
 /* Soft: the heading is the tile's name, in plain words; numbers and states sit on white cards; a list is plain
-   lines; a button is one white bar. The "Updated ..." line is left out (the app marks a tile that is late). */
+   lines; a button is one white bar. A small tile leaves the "Updated ..." line out (the app marks one that is late). */
 .look-soft .title { font-size: 1em; font-weight: 600; color: var(--ink); }
 .look-soft.has-accent .title { color: var(--ink); }
 .look-soft .big { font-weight: 650; }
@@ -440,3 +450,5 @@ body { background-image: var(--wash); }
 .look-soft .button { color: var(--ink); background: var(--surface); border-radius: .85em; box-shadow: var(--lift); }
 .look-soft .buttons .item:first-child .button { color: var(--ink); background: var(--surface); }
 .look-soft .foot:not(.failed) { display: none; }
+/* A big tile, or one opened, has the room to say when it was updated. */
+@container (min-height: 300px) { .look-soft .foot:not(.failed) { display: -webkit-box; } }
