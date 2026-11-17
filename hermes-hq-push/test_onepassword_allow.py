@@ -309,3 +309,57 @@ def test_a_password_from_the_phone_outranks_an_allow_nobody_clicks(bots):
     by_phone = allow.start(data_dir, password="pw", signer=lambda password, account: (CLI[0], {}), lister=lambda account: VAULTS)
     hold.set()
     assert by_phone["job"] != waiting["job"] and settle(by_phone["job"], "choose")["state"] == "choose"
+
+
+# MARK: The Private vault's logins, moved on the person's say
+
+def test_private_logins_move_to_main_and_the_key_reads_main(bots):
+    data_dir, homes = bots
+    private = {"id": "privatevault0000000000001", "name": "Private", "logins": [f"item{n:022d}" for n in range(7)]}
+    started = allow.start(data_dir, password="pw", signer=lambda password, account: (CLI[0], {"OP_SESSION_my": "tok"}),
+                          lister=lambda account: [dict(v) for v in VAULTS], private_lister=lambda account: dict(private))
+    job = settle(started["job"], "choose", "failed")
+    assert job["private"] == {"name": "Private", "logins": 7} and "item000" not in str(job)   # how many, never which
+    moved, made, keyed = [], [], {}
+
+    def mover(account, item, source, destination):
+        moved.append((item, source, destination, dict(allow._signed_in.session or {})))
+        return item != private["logins"][3]                       # one refuses to move
+
+    def maker(account, name=allow.NEW_VAULT):
+        made.append(name)
+        return {"id": "mainvault00000000000000001", "name": name, "items": 0}
+    allow.finish(job["job"], [VAULTS[0]["id"]], move_private=True, mover=mover, vault_maker=maker,
+                 key_maker=lambda account, ids: keyed.setdefault("ids", ids) and KEY)
+    done = settle(job["job"], "done", "failed")
+    assert done["state"] == "done" and done["moved"] == 6 and done["unmoved"] == 1 and done["total"] == 7
+    assert made == ["Main"] and len(moved) == 7
+    assert all(m[1] == private["id"] and m[2] == "mainvault00000000000000001" and m[3] == {"OP_SESSION_my": "tok"} for m in moved)
+    assert keyed["ids"] == [VAULTS[0]["id"], "mainvault00000000000000001"]
+    assert [v["name"] for v in done["vaults"]] == ["Hermes", "Main"] and "private" not in done
+
+
+def test_private_alone_is_enough_and_an_existing_main_is_used(bots):
+    data_dir, _ = bots
+    with_main = [dict(v) for v in VAULTS] + [{"id": "mainvaultexisting000000001", "name": "Main", "items": 2}]
+    started = allow.start(data_dir, password="pw", signer=lambda password, account: (CLI[0], {}),
+                          lister=lambda account: with_main,
+                          private_lister=lambda account: {"id": "privatevault0000000000001", "name": "Private", "logins": ["a" * 26]})
+    job = settle(started["job"], "choose", "failed")
+    keyed = {}
+    allow.finish(job["job"], [], move_private=True, mover=lambda *a: True,
+                 vault_maker=lambda *a: pytest.fail("Main is already there"),
+                 key_maker=lambda account, ids: keyed.setdefault("ids", ids) and KEY)
+    assert settle(job["job"], "done", "failed")["state"] == "done" and keyed["ids"] == ["mainvaultexisting000000001"]
+
+
+def test_nothing_moves_unless_asked(bots):
+    data_dir, _ = bots
+    started = allow.start(data_dir, password="pw", signer=lambda password, account: (CLI[0], {}),
+                          lister=lambda account: [dict(v) for v in VAULTS],
+                          private_lister=lambda account: {"id": "privatevault0000000000001", "name": "Private", "logins": ["a" * 26]})
+    job = settle(started["job"], "choose", "failed")
+    allow.finish(job["job"], [VAULTS[0]["id"]], mover=lambda *a: pytest.fail("not asked to move"),
+                 key_maker=lambda account, ids: KEY)
+    done = settle(job["job"], "done", "failed")
+    assert done["state"] == "done" and "moved" not in done

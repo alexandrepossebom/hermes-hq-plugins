@@ -53,6 +53,11 @@ ON_PHONE = ("Not unlocked: the person is on their phone, away from this computer
             "1Password on their phone, and it is saved for that site.")
 MARK = "_hermes_hq_onepassword_allow"
 NEW_VAULT = "Hermes"
+# Where the Private vault's logins go when the person asks for them (owner, 2026-11-16: "We need the main vault to
+# work"). 1Password never lets a key read the Private vault itself, so its logins are moved, on the person's say, into
+# a normal vault of theirs with this name, which the key reads.
+MAIN_VAULT = "Main"
+MOVERS = 3
 WAIT = 180.0        # how long the 1Password app's "Allow" may sit unanswered
 QUICK = 30.0
 JOB_LIFE = 15 * 60
@@ -244,6 +249,7 @@ def open_vaults(account: str) -> list[dict]:
     """The vaults a key can be made for, by name. The first call here is the one 1Password asks the person to allow."""
     raw = op_json(["vault", "list", "--account", account, "--format=json"], WAIT)
     out = []
+    _signed_in.private = None
     for row in (raw if isinstance(raw, list) else [])[:60]:
         if not isinstance(row, dict) or not _ID.fullmatch(str(row.get("id") or "")):
             continue
@@ -255,6 +261,8 @@ def open_vaults(account: str) -> list[dict]:
                 more = None
             if isinstance(more, dict):
                 kind, items = str(more.get("type") or "").upper(), more.get("items", items)
+        if kind in ("PERSONAL", "PRIVATE"):
+            _signed_in.private = {"id": str(row["id"]), "name": str(row.get("name") or "Private")[:120]}
         if kind in _CLOSED:
             continue
         out.append({"id": str(row["id"]), "name": str(row.get("name") or "Vault")[:120],
@@ -263,12 +271,30 @@ def open_vaults(account: str) -> list[dict]:
     return out
 
 
-def make_vault(account: str) -> dict:
-    raw = op_json(["vault", "create", NEW_VAULT, "--account", account, "--format=json",
+def private_logins(account: str) -> dict | None:
+    """The Private vault the last ``open_vaults`` on this thread saw, with its logins: {id, name, logins: [ids]}."""
+    found = getattr(_signed_in, "private", None)
+    if not found:
+        return None
+    raw = op_json(["item", "list", "--vault", found["id"], "--categories", "Login", "--account", account,
+                   "--format=json"], WAIT)
+    ids = [str(row["id"]) for row in raw if isinstance(row, dict) and _ID.fullmatch(str(row.get("id") or ""))] \
+        if isinstance(raw, list) else []
+    return {**found, "logins": ids}
+
+
+def move_login(account: str, item: str, source: str, destination: str) -> bool:
+    done = run_op(["item", "move", item, "--current-vault", source, "--destination-vault", destination,
+                   "--account", account], WAIT)
+    return done.returncode == 0
+
+
+def make_vault(account: str, name: str = NEW_VAULT) -> dict:
+    raw = op_json(["vault", "create", name, "--account", account, "--format=json",
                    "--description", "Logins your Hermes bots may fill."], WAIT)
     if not isinstance(raw, dict) or not _ID.fullmatch(str(raw.get("id") or "")):
         raise AllowError(502, "1Password didn’t say which vault it made.", "op-error")
-    return {"id": str(raw["id"]), "name": str(raw.get("name") or NEW_VAULT), "items": 0}
+    return {"id": str(raw["id"]), "name": str(raw.get("name") or name), "items": 0}
 
 
 def key_name(now: float | None = None) -> str:
@@ -397,11 +423,15 @@ def state(data_dir: Path, profile: str = "") -> dict:
 
 
 def _public(job: dict) -> dict:
-    return {key: job[key] for key in ("job", "state", "vaults", "detail", "code", "saved", "account") if key in job}
+    out = {key: job[key] for key in ("job", "state", "vaults", "detail", "code", "saved", "account", "moved", "total",
+                                     "unmoved") if key in job}
+    if job.get("private"):   # how many logins the Private vault holds, never which
+        out["private"] = {"name": job["private"]["name"], "logins": len(job["private"]["logins"])}
+    return out
 
 
 def start(data_dir: Path, account: str = "", lister=open_vaults, account_lister=accounts, password: str | None = None,
-          signer=sign_in) -> dict:
+          signer=sign_in, private_lister=private_logins) -> dict:
     """Ask 1Password. Answers a job at once: ``waiting`` while the 1Password app shows Allow (or, with ``password``
     from the phone, while 1Password signs in with it and nobody is needed at this computer), then ``choose`` with
     the vaults, or ``failed`` with why."""
@@ -420,7 +450,7 @@ def start(data_dir: Path, account: str = "", lister=open_vaults, account_lister=
             _jobs.pop(asked["job"], None)   # a password from the phone outranks an Allow nobody is there to click
         elif asked is not None:
             raise AllowError(409, "1Password is signing in. Give it a moment.", "busy")
-        if any(v["state"] == "making" for v in _jobs.values()):
+        if any(v["state"] in ("making", "moving") for v in _jobs.values()):
             raise AllowError(409, "A key is being saved. Give it a moment.", "busy")
         if password is not None:
             job["by_password"] = True
@@ -444,9 +474,13 @@ def start(data_dir: Path, account: str = "", lister=open_vaults, account_lister=
                                           "Developer › Integrate with 1Password CLI.", "integration-off")
             with using(session):
                 vaults = lister(chosen["id"])
+                try:
+                    private = private_lister(chosen["id"])
+                except AllowError:
+                    private = None
             with _lock:
                 job.update(state="choose", vaults=vaults, account=chosen["url"], account_id=chosen["id"], at=time.time(),
-                           session=session)
+                           session=session, private=private if private and private.get("logins") else None)
         except AllowError as error:
             with _lock:
                 job.update(state="failed", detail=error.detail, code=error.code)
@@ -461,8 +495,10 @@ def start(data_dir: Path, account: str = "", lister=open_vaults, account_lister=
 
 
 def finish(key: str, vault_ids: list[str], create: bool = False, vault_maker=make_vault, key_maker=make_key,
-           saver=save_key) -> dict:
-    """The person picked: make the key for those vaults (and a new Hermes vault when asked) and save it."""
+           saver=save_key, move_private: bool = False, mover=move_login) -> dict:
+    """The person picked: make the key for those vaults (and a new Hermes vault when asked) and save it. With
+    ``move_private`` the Private vault's logins are first moved into their Main vault (made if there is none), which
+    the key then reads."""
     with _lock:
         job = _jobs.get(key)
         if job is None:
@@ -471,7 +507,8 @@ def finish(key: str, vault_ids: list[str], create: bool = False, vault_maker=mak
             raise AllowError(409, "That request isn’t waiting for a vault.", "busy")
         known = {vault["id"]: vault for vault in job.get("vaults") or []}
         picked = [vault for vault in dict.fromkeys(vault_ids) if vault in known]
-        if not picked and not create:
+        private = job.get("private") if move_private else None
+        if not picked and not create and not private:
             raise AllowError(400, "Pick a vault.", "no-vault")
         job.update(state="making", at=time.time())
     account, data_dir = job["account_id"], Path(job["data_dir"])
@@ -480,11 +517,37 @@ def finish(key: str, vault_ids: list[str], create: bool = False, vault_maker=mak
         try:
             names = [known[vault]["name"] for vault in picked]
             ids = list(picked)
-            with using(job.pop("session", None)):   # the phone's sign-in ends with the key
+            session = job.pop("session", None)   # the phone's sign-in ends with the key
+            with using(session):
                 if create:
                     made = vault_maker(account)
                     ids.append(made["id"])
                     names.append(made["name"])
+                if private:
+                    main = next((v for v in known.values() if v["name"].lower() == MAIN_VAULT.lower()), None) \
+                        or vault_maker(account, MAIN_VAULT)
+                    if main["id"] not in ids:
+                        ids.append(main["id"])
+                        names.append(main["name"])
+                    logins = list(private["logins"])
+                    with _lock:
+                        job.update(state="moving", moved=0, total=len(logins), unmoved=0, at=time.time())
+
+                    def move(item):
+                        with using(session):
+                            try:
+                                ok = mover(account, item, private["id"], main["id"])
+                            except AllowError:
+                                ok = False
+                        with _lock:
+                            job["moved" if ok else "unmoved"] += 1
+                            job["at"] = time.time()
+
+                    from concurrent.futures import ThreadPoolExecutor
+                    with ThreadPoolExecutor(max_workers=MOVERS, thread_name_prefix="hq-onepassword-move") as pool:
+                        list(pool.map(move, logins))
+                    with _lock:
+                        job.update(state="making", at=time.time())
                 token = key_maker(account, ids)
             try:
                 saved = read_state(data_dir)
@@ -500,6 +563,7 @@ def finish(key: str, vault_ids: list[str], create: bool = False, vault_maker=mak
             with _lock:
                 job.update(state="done", saved=len(bots), vaults=[{"id": i, "name": n} for i, n in zip(ids, names)],
                            at=time.time())
+                job.pop("private", None)
         except AllowError as error:
             with _lock:
                 job.update(state="failed", detail=error.detail, code=error.code)
