@@ -453,3 +453,18 @@ def test_a_login_code_or_unlock_tells_the_phone_and_takes_the_alert_down(logins,
 def test_a_hermes_that_reports_its_own_vault_prompts_is_not_alerted_twice(logins, monkeypatch):
     import tools.browser_vault_tool as tool
     assert logins.hermes_alerts() is ("human_input_request" in __import__("inspect").getsource(tool))
+
+
+# MARK: A code the site sent (0.9.59)
+
+def test_the_first_ask_for_a_code_sends_the_bot_to_look_then_the_person_is_asked(logins):
+    logins._code_asked.clear()
+    ask = {"action": "enter_code", "origin": "https://app.example.com"}
+    first = logins.sent_code("browser_vault", ask, "chat-1", now=1000.0)
+    assert first and "enter_code again" in first and "mail" in first
+    assert logins.sent_code("browser_vault", ask, "chat-1", now=1030.0) is None          # asked again: goes through
+    assert logins.sent_code("browser_vault", ask, "chat-2", now=1030.0)                   # another chat looks for itself
+    assert logins.sent_code("browser_vault", {**ask, "origin": "https://other.example"}, "chat-1", now=1031.0)
+    assert logins.sent_code("browser_vault", ask, "chat-1", now=1000.0 + logins.CODE_LOOK + 1)   # a later sign-in
+    assert logins.sent_code("browser_vault", {"action": "fill", "handle": "op:x"}, "chat-1") is None
+    assert logins.sent_code("terminal", ask, "chat-1") is None

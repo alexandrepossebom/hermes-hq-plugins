@@ -321,7 +321,8 @@ def _desktop_theme():
 
 
 def pre_tool_call(tool_name="", args=None, **kwargs):
-    verdict = (_veto(tool_name, args) or _ideas_veto(tool_name, kwargs.get("session_id"))
+    verdict = (_veto(tool_name, args) or _code_veto(tool_name, args, kwargs)
+               or _ideas_veto(tool_name, kwargs.get("session_id"))
                or _draft_veto(tool_name, args, kwargs.get("session_id")) or _job_clarify(tool_name))
     if verdict is None:
         _named_site(tool_name, args, kwargs.get("task_id"))
@@ -409,6 +410,19 @@ def _veto(tool_name, args):
         return None
     if message:
         log.warning("hermes-hq-push: blocked a %s call that ran launchctl submit", tool_name)
+        return {"action": "block", "message": message}
+    return None
+
+
+def _code_veto(tool_name, args, kwargs):
+    """[0.9.59] The first ask for a site's code is sent back once so the bot looks for an emailed or texted code
+    itself (gateway_logins.sent_code). Never logs the call's arguments."""
+    try:
+        message = gateway_logins.sent_code(tool_name, args, kwargs.get("session_id") or kwargs.get("task_id") or "")
+    except Exception:
+        return None
+    if message:
+        log.info("hermes-hq-push: a code was asked for; the bot looks for a sent one first")
         return {"action": "block", "message": message}
     return None
 

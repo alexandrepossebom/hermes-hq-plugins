@@ -242,6 +242,38 @@ def unnamed_site(tool_name: str, args) -> str | None:
             f"load, open it first.")
 
 
+# MARK: A code the site sent (0.9.59)
+
+# Owner, 2026-11-16, at the code card for a site whose login 1Password had just filled: "I wish 1pass would auto load
+# here too as well as any other things that should auto load." A code from an authenticator app loads by itself when
+# the login in the password manager holds it. A code the site emails or texts exists nowhere until it is sent, and a
+# bot that can read the person's mail can fetch it. So the first time a turn asks the person for a code for a site,
+# the bot is sent back once to look for it itself; asking again goes straight to the person (or the saved
+# authenticator code), as before.
+CODE_LOOK = 15 * 60
+_code_asked: dict[tuple, float] = {}
+SENT_CODE = ("Not asked yet. If the page says the code was emailed or texted and you have a tool that reads the "
+             "person's mail or messages, find the newest code from this site (sent in the last few minutes) and type "
+             "it into the page yourself. If the page wants an authenticator-app code, or you can't read their mail, or "
+             "no code is there within a minute, call browser_vault action=enter_code again exactly as before: it then "
+             "uses the code saved in the password manager, or asks the person.")
+
+
+def sent_code(tool_name: str, args, who: str, now: float | None = None) -> str | None:
+    """The message a bot gets the first time it asks for a site's code in a turn's chat, else None."""
+    if tool_name != "browser_vault" or not isinstance(args, dict) or str(args.get("action") or "") != "enter_code":
+        return None
+    now = time.time() if now is None else now
+    site = str(args.get("origin") or args.get("url") or args.get("handle") or "").strip().lower()
+    key = (str(who or ""), site)
+    for old in [k for k, at in _code_asked.items() if now - at > CODE_LOOK]:
+        _code_asked.pop(old, None)
+    if key in _code_asked:
+        return None
+    _code_asked[key] = now
+    return SENT_CODE
+
+
 # MARK: The site the bot named (0.9.44)
 
 # Hermes's vault (tools/browser_vault_tool.py) doesn't read ``origin``: save_login and enter_code focus the FIRST open
