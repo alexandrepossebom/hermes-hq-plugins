@@ -256,6 +256,18 @@ made, its history) and what its bot writes with `tasks_update(page={summary, nex
 next, and parts such as options compared in a table, the numbers that matter, or what it found. The bot writes words,
 never HTML. The `task-page` skill (hermes-hq-push:task-page) tells bots what goes on it.
 
+Version 0.9.60 adds **shopping cards**. Asked to find, compare or recommend something to buy, a bot shows the products
+it found on store pages as product cards in the Hermes HQ app (its `show_products` tool): photo, name, price (the old
+price struck through), store and rating, and a tap opens the product's page with the bot's reasons, other stores'
+prices, **Buy** and **Notify Me**. Buy sends the bot a message: it takes the item to the last step of checkout in its
+browser and shows the order as a card (`order_card`) with the store, items, charges, total, **Cancel** and **Pay**.
+The bot is told never to press the store's final button before your Pay for that exact order; the add-on itself pays
+for nothing and only checks the cards (https links, prices as numbers, an old price above the price, the counts) and
+tells the bot in words what to fix. Notify Me asks the bot for a scheduled job that tells you when the item is back in
+stock or cheaper. Bots get the two tools only once an app that draws the cards has connected to this computer
+(`PUT /shopping/cards`; `shoppingCards` and `shoppingCardsShown` in the status), and only in the app's own chats;
+create `shopping.off` in the add-on's data folder to turn them off for every bot.
+
 Version 0.9.59 adds Allow in 1Password. Hermes unlocks 1Password with your master password and asks again after half
 an hour idle. Now the app's unlock sheet and Passwords page have an Allow in 1Password button: the 1Password app on
 Hermes's computer asks you to allow it (a click or Touch ID, no master password), you pick which vaults your bots may

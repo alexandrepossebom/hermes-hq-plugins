@@ -99,6 +99,13 @@ else:
     drafts = importlib.util.module_from_spec(_drafts_spec)
     sys.modules["hermes_hq_drafts"] = drafts
     _drafts_spec.loader.exec_module(drafts)
+if "hermes_hq_shopping" in sys.modules:   # one copy for this process: the tools, the answers and the route share it
+    shopping = sys.modules["hermes_hq_shopping"]
+else:
+    _shopping_spec = importlib.util.spec_from_file_location("hermes_hq_shopping", Path(__file__).with_name("shopping.py"))
+    shopping = importlib.util.module_from_spec(_shopping_spec)
+    sys.modules["hermes_hq_shopping"] = shopping
+    _shopping_spec.loader.exec_module(shopping)
 if "hermes_hq_tasks" in sys.modules:   # one copy for this process: ideas.py and the dashboard routes share it
     tasks = sys.modules["hermes_hq_tasks"]
 else:
@@ -258,6 +265,10 @@ def pre_llm_call(platform="", parent_session_id="", user_message=None, conversat
         drafts.note_decision(user_message, str(session_id or ""))
     except Exception:
         log.debug("hermes-hq-push: draft answer not noted")
+    try:  # [shopping] the person's Buy, Notify Me, Pay or Cancel on a shopping card (shopping.py)
+        shopping.note_decision(user_message, str(session_id or ""))
+    except Exception:
+        log.debug("hermes-hq-push: shopping answer not noted")
     # Only turns ``hermes serve`` runs: a card asked from a turn the messaging gateway runs in an app chat (another
     # bot's message, a job's hand-off) can't reach the app and comes back undelivered. [tasks] The same restriction
     # keeps the Tasks note out of cron runs and hand-offs: only a conversation with the user adds it.
@@ -623,6 +634,13 @@ def _draft_tool(ctx):
         log.warning("hermes-hq-push: draft_message tool not registered", exc_info=True)
 
 
+def _shopping_tools(ctx):
+    try:
+        shopping.register_tool(ctx, push.data_dir, _serves_app_sessions)
+    except Exception:
+        log.warning("hermes-hq-push: shopping tools not registered", exc_info=True)
+
+
 def _tasks_prep_job():
     """Startup safety net: reconcile this bot's "Task prep" job against its tasks.db right now, in case it fell
     out of sync (the job was removed by hand while prep tasks are still open, or vice versa)."""
@@ -649,6 +667,7 @@ def register(ctx):
     _device_tools(ctx)
     _tasks_tools(ctx)
     _draft_tool(ctx)
+    _shopping_tools(ctx)
     _dashboard_skill(ctx)
     _task_page_skill(ctx)
     _desktop_theme()

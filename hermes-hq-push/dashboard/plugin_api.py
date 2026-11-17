@@ -77,6 +77,13 @@ else:
     drafts = importlib.util.module_from_spec(_drafts_spec)
     sys.modules["hermes_hq_drafts"] = drafts
     _drafts_spec.loader.exec_module(drafts)
+if "hermes_hq_shopping" in sys.modules:
+    shopping = sys.modules["hermes_hq_shopping"]
+else:
+    _shopping_spec = importlib.util.spec_from_file_location("hermes_hq_shopping", Path(__file__).parents[1] / "shopping.py")
+    shopping = importlib.util.module_from_spec(_shopping_spec)
+    sys.modules["hermes_hq_shopping"] = shopping
+    _shopping_spec.loader.exec_module(shopping)
 
 if "hermes_hq_terminal" in sys.modules:
     terminal = sys.modules["hermes_hq_terminal"]
@@ -209,7 +216,8 @@ class ApprovalIn(BaseModel):
 def status():
     """The app probes this to offer push; a 404 means the plugin isn't installed or enabled."""
     return {**push.status_body(push.data_dir(), push.sender_from_env()), **terminal.status(push.data_dir()),
-            **tasks.status(), **drafts.status(push.data_dir()), **plugin_updates.status(),
+            **tasks.status(), **drafts.status(push.data_dir()), **shopping.status(push.data_dir()),
+            **plugin_updates.status(),
             **onepassword_allow.status()}
 
 
@@ -336,6 +344,14 @@ def onepassword_disconnect():
 def draft_cards():
     """[drafts] An app that draws draft cards uses this computer: bots get draft_message from now on (drafts.py)."""
     drafts.note_cards(push.data_dir())
+    return {"ok": True}
+
+
+@router.put("/shopping/cards")
+def shopping_cards():
+    """[shopping] An app that draws product and order cards uses this computer: bots get show_products and
+    order_card from now on (shopping.py)."""
+    shopping.note_cards(push.data_dir())
     return {"ok": True}
 
 
