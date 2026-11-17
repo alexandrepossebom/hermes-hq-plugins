@@ -149,6 +149,42 @@ def would_ask(path: Path) -> bool:
     return turn() is not None and reachable(path)
 
 
+# The phone's alert for a login, a code or an unlock (0.9.59). Hermes tells plugins a bot is waiting on a person for
+# approvals, questions and sudo passwords (tools/human_input_hooks.py), and not for these three: nothing reached the
+# phone while the card waited in a chat that wasn't open (owner, 2026-11-16: "I'm not getting a notification on my
+# phone when the agent is trying to ask for a login"). Each prompt now runs inside Hermes's own human_input_request,
+# so on_human_input_request / _resolved fire as they do for a question, with the kinds push.ASKS already names.
+ALERT_KINDS = {"unlock": ("vault_unlock", "manager", 1), "save_login": ("vault_save_login", "site", 1),
+               "code": ("vault_code", "site", 0)}
+
+
+def hermes_alerts() -> bool:
+    """A Hermes whose vault tool reports its own prompts: left alone, or the phone would be alerted twice."""
+    try:
+        import inspect
+        import tools.browser_vault_tool as tool
+        return "human_input_request" in inspect.getsource(tool)
+    except Exception:
+        return False
+
+
+def alerting(kind: str, prompt):
+    name, field, index = ALERT_KINDS[kind]
+
+    def asked(*args):
+        try:
+            from tools.human_input_hooks import human_input_request
+        except Exception:
+            return prompt(*args)
+        named = str((args[index] if len(args) > index else "") or (args[0] if args else "") or "")
+        with human_input_request(name, **{field: named}) as human:
+            answer = prompt(*args)
+            human.outcome = "answered" if answer else "declined"
+            return answer
+    asked.__wrapped__ = prompt
+    return asked
+
+
 def install_prompts(data_dir: Path) -> str:
     """Wrap the three getters once per process. Returns "installed", "already" or "absent"."""
     try:
@@ -164,12 +200,16 @@ def install_prompts(data_dir: Path) -> str:
     path = socket_path(data_dir)
     ours = prompts(path)
 
+    alerts = not hermes_alerts()
+
     def wrap(kind, original):
         def getter():
             own = original()
             if own is not None:
-                return own
-            return ours[kind] if would_ask(path) else None
+                return alerting(kind, own) if alerts else own
+            if not would_ask(path):
+                return None
+            return alerting(kind, ours[kind]) if alerts else ours[kind]
         setattr(getter, MARK, True)
         getter.__wrapped__ = original
         getter.__doc__ = original.__doc__

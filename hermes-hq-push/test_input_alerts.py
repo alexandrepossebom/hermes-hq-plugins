@@ -40,7 +40,7 @@ class Wording(unittest.TestCase):
                               prompt="online.adp.com"),
                          {"title": "Hermes", "body": "Wants you to save a login for online.adp.com"})
         self.assertEqual(body("vault_code", site="online.adp.com")["body"], "Needs a code for online.adp.com")
-        self.assertEqual(body("vault_unlock", manager="1Password")["body"], "Needs your 1Password master password")
+        self.assertEqual(body("vault_unlock", manager="1Password")["body"], "Needs you to unlock 1Password")
         self.assertEqual(body("secret", env_var="TENOR_API_KEY", skill_name="tenor", prompt="Tenor API key")["body"],
                          "Needs a secret: TENOR_API_KEY")
         self.assertEqual(body("sudo", prompt="sudo systemctl restart nginx")["body"],

@@ -268,6 +268,10 @@ its own keeps it; Disconnect in the app removes the key from the bots (cancel th
 Developer › Service Accounts). Needs 1Password 8 with Settings › Developer › Integrate with 1Password CLI turned on,
 and the `op` tool installed, on the computer running Hermes.
 
+0.9.59 also alerts your phone when a bot waits for a login, a one-time code or a password manager's unlock in a
+chat you don't have open. Hermes told plugins about approvals, questions and sudo passwords only, so those three
+waited unseen.
+
 Version 0.9.58 ties a plugin update you approve in the app to what the app showed you (the last open finding of the
 outside review). Hermes fetches the new version into a copy before it asks anything, and lists what that copy needs
 above each question. The add-on now says yes only when that list is exactly what you saw: the Python packages, the

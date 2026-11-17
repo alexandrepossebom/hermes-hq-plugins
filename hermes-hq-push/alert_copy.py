@@ -323,7 +323,7 @@ def ask_line(ask: str, detail: str = "") -> str:
     if ask == "vault_code":
         return f"Needs a code for {name}" if name else "Needs a sign-in code"
     if ask == "vault_unlock":
-        return f"Needs your {name} master password" if name else "Needs your password manager unlocked"
+        return f"Needs you to unlock {name}" if name else "Needs your password manager unlocked"
     if ask == "secret":
         return f"Needs a secret: {name}" if name else "Needs a secret"
     return "Is waiting for your answer"

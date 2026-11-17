@@ -237,7 +237,8 @@ def test_a_turns_own_prompt_wins(vault, listener, monkeypatch):
     vault.set_save_login_prompt_callback(own)
     try:
         with bot_chat_turn(monkeypatch):
-            assert vault.get_save_login_prompt_callback() is own
+            got = vault.get_save_login_prompt_callback()   # the turn's own, inside the phone's alert (0.9.59)
+            assert got is own or got.__wrapped__ is own
     finally:
         vault.set_save_login_prompt_callback(None)
 
@@ -429,3 +430,26 @@ def test_the_hook_keeps_the_name_for_the_tool(monkeypatch):
     kept.clear()
     assert addon.pre_tool_call(tool_name="browser_vault", args={"action": "save_login"}, task_id="t9")["action"] == "block"
     assert kept == [], "a blocked call keeps nothing"
+
+
+# MARK: The phone's alert for a login, a code or an unlock (0.9.59)
+
+def test_a_login_code_or_unlock_tells_the_phone_and_takes_the_alert_down(logins, monkeypatch):
+    import tools.human_input_hooks as hooks
+    fired = []
+    monkeypatch.setattr(hooks, "_fire", lambda name, payload: fired.append((name, dict(payload))))
+    assert logins.alerting("unlock", lambda backend, name: "master")("onepassword", "1Password") == "master"
+    assert logins.alerting("save_login", lambda origin, site: None)("https://shop.example", "Example Shop") is None
+    assert logins.alerting("code", lambda site, hint: "123456")("Example Shop", "text message") == "123456"
+    asked = [(payload["kind"], payload.get("manager") or payload.get("site")) for name, payload in fired
+             if name == "on_human_input_request"]
+    assert asked == [("vault_unlock", "1Password"), ("vault_save_login", "Example Shop"), ("vault_code", "Example Shop")]
+    ended = [payload["outcome"] for name, payload in fired if name == "on_human_input_resolved"]
+    assert ended == ["answered", "declined", "answered"]
+    assert all("master" not in str(payload) and "123456" not in str(payload) for _, payload in fired)
+    assert [p["request_id"] for n, p in fired][0::2] == [p["request_id"] for n, p in fired][1::2]
+
+
+def test_a_hermes_that_reports_its_own_vault_prompts_is_not_alerted_twice(logins, monkeypatch):
+    import tools.browser_vault_tool as tool
+    assert logins.hermes_alerts() is ("human_input_request" in __import__("inspect").getsource(tool))
