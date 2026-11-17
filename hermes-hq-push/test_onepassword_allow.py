@@ -205,14 +205,13 @@ def test_no_account_means_the_integration_is_off(bots):
     assert settle(started["job"], "failed")["code"] == "integration-off"
 
 
-def test_one_ask_at_a_time(bots):
+def test_asking_again_while_1password_waits_is_the_same_request(bots):
     data_dir, _ = bots
     hold = __import__("threading").Event()
     started = allow.start(data_dir, lister=lambda account: hold.wait(5) and VAULTS, account_lister=lambda: ACCOUNT)
-    with pytest.raises(allow.AllowError) as error:
-        allow.start(data_dir, lister=lambda account: VAULTS, account_lister=lambda: ACCOUNT)
+    again = allow.start(data_dir, lister=lambda account: VAULTS, account_lister=lambda: ACCOUNT)
     hold.set()
-    assert error.value.code == "busy" and settle(started["job"], "choose")
+    assert again["job"] == started["job"] and settle(started["job"], "choose")
 
 
 def test_a_bots_own_key_is_kept_and_disconnect_removes_only_ours(bots):

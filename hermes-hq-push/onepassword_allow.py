@@ -322,8 +322,12 @@ def start(data_dir: Path, account: str = "", lister=open_vaults, account_lister=
     with _lock:
         for old in [k for k, v in _jobs.items() if time.time() - v["at"] > JOB_LIFE]:
             _jobs.pop(old, None)
-        if any(v["state"] in ("waiting", "making") for v in _jobs.values()):
-            raise AllowError(409, "1Password is already being asked. Answer it on this computer first.", "busy")
+        # The app asked again while 1Password still shows Allow (the sheet was closed and opened): the same request.
+        asked = next((v for v in _jobs.values() if v["state"] == "waiting"), None)
+        if asked is not None:
+            return _public(asked)
+        if any(v["state"] == "making" for v in _jobs.values()):
+            raise AllowError(409, "A key is being saved. Give it a moment.", "busy")
         _jobs[key] = job
 
     def work():
