@@ -238,7 +238,9 @@ def test_a_turns_own_prompt_wins(vault, listener, monkeypatch):
     try:
         with bot_chat_turn(monkeypatch):
             got = vault.get_save_login_prompt_callback()   # the turn's own, inside the phone's alert (0.9.59)
-            assert got is own or got.__wrapped__ is own
+            while got is not own and hasattr(got, "__wrapped__"):   # inside the alert and the moved-login note
+                got = got.__wrapped__
+            assert got is own
     finally:
         vault.set_save_login_prompt_callback(None)
 
@@ -468,3 +470,21 @@ def test_the_first_ask_for_a_code_sends_the_bot_to_look_then_the_person_is_asked
     assert logins.sent_code("browser_vault", ask, "chat-1", now=1000.0 + logins.CODE_LOOK + 1)   # a later sign-in
     assert logins.sent_code("browser_vault", {"action": "fill", "handle": "op:x"}, "chat-1") is None
     assert logins.sent_code("terminal", ask, "chat-1") is None
+
+
+# MARK: A login the person moved instead of typing (0.9.59)
+
+def test_a_moved_login_tells_the_bot_to_fill_it_from_the_password_manager(logins, monkeypatch):
+    import tools.browser_vault_tool as tool
+    answers = iter([{"identifier": logins.MOVED, "password": "moved"}, None, {"identifier": "me@example.com", "password": "pw"}])
+    asked = logins.moving(lambda origin, site: next(answers))
+
+    def hermes_save_login(label="", task_id=None):
+        answer = asked("https://shop.example", "shop.example")
+        return json.dumps({"success": bool(answer), "error_type": None if answer else "save_declined"})
+    monkeypatch.setattr(tool, "browser_vault_save_login", hermes_save_login)
+    assert logins.install_moved() == "installed" and logins.install_moved() == "already"
+    moved = json.loads(tool.browser_vault_save_login())
+    assert moved["success"] and moved["moved_to_password_manager"] and "action=fill" in moved["next"]
+    assert json.loads(tool.browser_vault_save_login())["error_type"] == "save_declined"     # a real "no" stays a no
+    assert json.loads(tool.browser_vault_save_login()) == {"success": True, "error_type": None}   # a typed login is untouched

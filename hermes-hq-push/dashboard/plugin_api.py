@@ -302,6 +302,31 @@ def onepassword_allow_finish(job: str, body: AllowFinishIn):
     return _allow_call(lambda: onepassword_allow.finish(job, body.vaults, body.create))
 
 
+class MoveStartIn(BaseModel):
+    """One login out of the person's own vaults into the one the bots read, on their approval (0.9.59)."""
+    password: str = Field(max_length=1024)
+    origin: str = Field(max_length=2048)
+
+
+class MoveFinishIn(BaseModel):
+    item: str = Field(max_length=64)
+
+
+@router.post("/vault/onepassword/move")
+def onepassword_move_start(body: MoveStartIn):
+    return _allow_call(lambda: onepassword_allow.move_start(push.data_dir(), body.password, body.origin))
+
+
+@router.get("/vault/onepassword/move/{job}")
+def onepassword_move_job(job: str):
+    return _allow_call(lambda: onepassword_allow.job(job))
+
+
+@router.post("/vault/onepassword/move/{job}")
+def onepassword_move_finish(job: str, body: MoveFinishIn):
+    return _allow_call(lambda: onepassword_allow.move_finish(job, body.item))
+
+
 @router.delete("/vault/onepassword")
 def onepassword_disconnect():
     return _allow_call(lambda: onepassword_allow.disconnect(push.data_dir()))

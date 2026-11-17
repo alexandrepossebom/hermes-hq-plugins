@@ -478,6 +478,10 @@ def _gateway_logins():
         log.info("hermes-hq-push: logins asked in gateway turns %s", gateway_logins.install_prompts(push.data_dir()))
     except Exception:
         log.debug("hermes-hq-push: logins asked in gateway turns not installed", exc_info=True)
+    try:  # [0.9.59] a login the person moved into the bots' vault instead of typing it
+        log.info("hermes-hq-push: moved logins %s", gateway_logins.install_moved())
+    except Exception:
+        log.debug("hermes-hq-push: moved logins not installed", exc_info=True)
     try:  # [job-asks] the gateway's local chats; in the server it steps aside at each call (gateway_logins._serving)
         log.info("hermes-hq-push: questions in job turns %s", gateway_logins.install_job_asks(push.data_dir()))
     except Exception:

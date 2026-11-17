@@ -363,3 +363,73 @@ def test_nothing_moves_unless_asked(bots):
                  key_maker=lambda account, ids: KEY)
     done = settle(job["job"], "done", "failed")
     assert done["state"] == "done" and "moved" not in done
+
+
+# MARK: One login out of Private, when a bot needs it
+
+FOUND = [{"id": "itembestbuy00000000000001", "title": "Best Buy", "user": "me@example.com", "vault": "Private",
+          "vault_id": "privatevault0000000000001"}]
+
+
+def connected(data_dir):
+    allow.write_state(data_dir, {"hashes": ["x"], "vaults": ["Shared", "Hermes"], "bots": ["default"]})
+
+
+def test_a_site_is_matched_by_its_name_not_its_page():
+    assert allow.site_host("https://www.bestbuy.com/identity/signin?x=1") == "bestbuy.com"
+    assert allow.same_site("bestbuy.com", "https://www.bestbuy.com/") and allow.same_site("bestbuy.com", "bestbuy.com")
+    assert allow.same_site("bestbuy.com", "https://signin.bestbuy.com/login")
+    assert not allow.same_site("bestbuy.com", "https://notbestbuy.com") and not allow.same_site("bestbuy.com", "")
+
+
+def test_only_logins_the_bots_cant_read_are_offered(monkeypatch):
+    rows = [{"id": "itembestbuy00000000000001", "title": "Best Buy", "additional_information": "me@example.com",
+             "vault": {"id": "privatevault0000000000001", "name": "Private"}, "urls": [{"href": "https://www.bestbuy.com"}]},
+            {"id": "itembestbuy00000000000002", "title": "Best Buy (shared)", "vault": {"id": "v2", "name": "Hermes"},
+             "urls": [{"href": "https://www.bestbuy.com"}]},
+            {"id": "itemother0000000000000003", "title": "Bank", "vault": {"id": "privatevault0000000000001", "name": "Private"},
+             "urls": [{"href": "https://bank.example"}]}]
+    monkeypatch.setattr(allow, "op_json", lambda args, timeout=0: rows)
+    found = allow.logins_for("ACCOUNT", "bestbuy.com", {"Hermes", "Shared"})
+    assert [(m["title"], m["user"], m["vault"]) for m in found] == [("Best Buy", "me@example.com", "Private")]
+
+
+def test_one_approval_moves_that_one_login_into_the_bots_vault(bots):
+    data_dir, _ = bots
+    connected(data_dir)
+    started = allow.move_start(data_dir, "pw", "https://www.bestbuy.com/identity/signin",
+                               signer=lambda password, account: (CLI[0], {"OP_SESSION_my": "tok"}),
+                               finder=lambda account, host, readable: [dict(m) for m in FOUND] if host == "bestbuy.com" and readable == {"Shared", "Hermes"} else [])
+    job = settle(started["job"], "found", "failed")
+    assert job["state"] == "found" and job["site"] == "bestbuy.com"
+    assert job["matches"] == [{"id": FOUND[0]["id"], "title": "Best Buy", "user": "me@example.com", "vault": "Private"}]
+    assert "tok" not in str(job) and "pw" not in str(job) and "vault_id" not in str(job)
+    moved = []
+    with pytest.raises(allow.AllowError):
+        allow.move_finish(job["job"], "not-one-of-them")                       # only a login it was shown
+    allow.move_finish(job["job"], FOUND[0]["id"], destination=lambda account, readable: {"id": "hermesvault", "name": "Hermes"},
+                      mover=lambda account, item, source, dest: moved.append((item, source, dest, dict(allow._signed_in.session or {}))) or True)
+    done = settle(job["job"], "done", "failed")
+    assert done["state"] == "done" and done["moved_to"] == "Hermes"
+    assert moved == [(FOUND[0]["id"], "privatevault0000000000001", "hermesvault", {"OP_SESSION_my": "tok"})]   # that one, nothing else
+    assert "session" not in allow._jobs[job["job"]]
+
+
+def test_no_login_for_the_site_says_so_and_needs_the_bots_connected_first(bots):
+    data_dir, _ = bots
+    with pytest.raises(allow.AllowError) as error:
+        allow.move_start(data_dir, "pw", "https://www.bestbuy.com")
+    assert error.value.code == "not-connected"
+    connected(data_dir)
+    started = allow.move_start(data_dir, "pw", "https://www.bestbuy.com", signer=lambda p, a: (CLI[0], {}),
+                               finder=lambda account, host, readable: [])
+    failed = settle(started["job"], "failed")
+    assert failed["code"] == "none" and "bestbuy.com" in failed["detail"]
+
+
+def test_the_moved_login_goes_to_hermes_else_the_first_vault_the_key_reads(monkeypatch):
+    monkeypatch.setattr(allow, "op_json", lambda args, timeout=0: [{"id": "a1", "name": "Shared"}, {"id": "h1", "name": "Hermes"}])
+    assert allow.key_vault("ACCOUNT", ["Shared", "Hermes"]) == {"id": "h1", "name": "Hermes"}
+    assert allow.key_vault("ACCOUNT", ["Shared"]) == {"id": "a1", "name": "Shared"}
+    with pytest.raises(allow.AllowError):
+        allow.key_vault("ACCOUNT", ["Gone"])

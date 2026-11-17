@@ -185,6 +185,54 @@ def alerting(kind: str, prompt):
     return asked
 
 
+# One login moved out of the person's own vault (0.9.59, onepassword_allow.move_finish). The app answers the login
+# card with ``MOVED`` in place of a login: nothing is typed or saved here, the login now sits in the password
+# manager's vault the bots read. The tool is then told so, in place of "the user chose not to save".
+MOVED = "\x1dhermes-hq:moved"
+MOVED_NEXT = ("The person just moved this site's login into the password manager vault you can read. Call "
+              "browser_vault action=list, find the login for this site (its handle starts with op:), and call "
+              "browser_vault action=fill with that handle.")
+_moved = threading.local()
+
+
+def moving(prompt):
+    """A save-login prompt whose ``MOVED`` answer is noted for this thread's tool call and passed on as no login."""
+    def asked(*args):
+        answer = prompt(*args)
+        if isinstance(answer, dict) and answer.get("identifier") == MOVED:
+            _moved.now = True
+            return None
+        return answer
+    asked.__wrapped__ = prompt
+    return asked
+
+
+def install_moved() -> str:
+    """Hermes's save_login answers the bot with ``MOVED_NEXT`` when the person moved the login instead of typing it."""
+    try:
+        import tools.browser_vault_tool as tool
+    except Exception:
+        return "absent"
+    original = getattr(tool, "browser_vault_save_login", None)
+    if not callable(original):
+        return "absent"
+    if getattr(original, MARK, False):
+        return "already"
+
+    def save_login(*args, **kwargs):
+        _moved.now = False
+        result = original(*args, **kwargs)
+        if getattr(_moved, "now", False):
+            _moved.now = False
+            return json.dumps({"success": True, "moved_to_password_manager": True, "next": MOVED_NEXT})
+        return result
+    setattr(save_login, MARK, True)
+    save_login.__wrapped__ = original
+    save_login.__doc__ = original.__doc__
+    tool.browser_vault_save_login = save_login
+    return "installed"
+
+
 def install_prompts(data_dir: Path) -> str:
     """Wrap the three getters once per process. Returns "installed", "already" or "absent"."""
     try:
@@ -205,11 +253,13 @@ def install_prompts(data_dir: Path) -> str:
     def wrap(kind, original):
         def getter():
             own = original()
-            if own is not None:
-                return alerting(kind, own) if alerts else own
-            if not would_ask(path):
-                return None
-            return alerting(kind, ours[kind]) if alerts else ours[kind]
+            if own is None:
+                if not would_ask(path):
+                    return None
+                own = ours[kind]
+            if kind == "save_login":
+                own = moving(own)
+            return alerting(kind, own) if alerts else own
         setattr(getter, MARK, True)
         getter.__wrapped__ = original
         getter.__doc__ = original.__doc__

@@ -416,6 +416,7 @@ def state(data_dir: Path, profile: str = "") -> dict:
         token = ""
     ours = bool(token) and _hash(token) in set(saved.get("hashes") or [])
     return {"ok": True, "supported": supported(), "phone": True, "password": supported() and password_works(),
+            "move": ours and supported() and password_works(),
             "connected": bool(token), "ours": ours,
             "vaults": [str(name) for name in saved.get("vaults") or []] if ours else [],
             "name": str(saved.get("name") or "") if ours else "",
@@ -425,6 +426,12 @@ def state(data_dir: Path, profile: str = "") -> dict:
 def _public(job: dict) -> dict:
     out = {key: job[key] for key in ("job", "state", "vaults", "detail", "code", "saved", "account", "moved", "total",
                                      "unmoved") if key in job}
+    if job.get("kind") == "move":
+        out["site"] = job.get("site", "")
+        if "matches" in job:   # what the person picks from: names only, never an id of a vault or a secret
+            out["matches"] = [{"id": m["id"], "title": m["title"], "user": m["user"], "vault": m["vault"]} for m in job["matches"]]
+        if "moved_to" in job:
+            out["moved_to"] = job["moved_to"]
     if job.get("private"):   # how many logins the Private vault holds, never which
         out["private"] = {"name": job["private"]["name"], "logins": len(job["private"]["logins"])}
     return out
@@ -576,6 +583,135 @@ def finish(key: str, vault_ids: list[str], create: bool = False, vault_maker=mak
 
     first = _public(job)
     threading.Thread(target=work, name="hq-onepassword-key", daemon=True).start()
+    return first
+
+
+# MARK: One login out of Private, when a bot needs it
+
+# Owner, 2026-11-16, at the login sheet for a site whose login is only in his Private vault: "I want it to move my
+# best buy password to a shared vault when I try to have it use it. A one time approval to move the login creds so
+# that it now can use it." The bots' key can't read Private and can't write anywhere, so the move is the person's
+# own: their 1Password password once (filled on the phone), the logins for that site are found, they pick the one,
+# and that one item is moved into a vault the key reads. Nothing else in 1Password is touched.
+
+def site_host(origin: str) -> str:
+    """The site's name without the scheme, port, path or a leading www."""
+    host = str(origin or "").strip().lower().split("://", 1)[-1].split("/", 1)[0].split("@")[-1].split(":", 1)[0]
+    return host[4:] if host.startswith("www.") else host
+
+
+def same_site(host: str, url: str) -> bool:
+    """A saved web address is for this site: the same host, or one a subdomain of the other."""
+    other = site_host(url)
+    return bool(host and other) and (host == other or host.endswith("." + other) or other.endswith("." + host))
+
+
+def logins_for(account: str, host: str, readable: set[str]) -> list[dict]:
+    """The person's logins for this site that the bots' key can't read (any vault not in ``readable``)."""
+    raw = op_json(["item", "list", "--categories", "Login", "--account", account, "--format=json"], WAIT)
+    out = []
+    for row in raw if isinstance(raw, list) else []:
+        vault = row.get("vault") if isinstance(row, dict) else None
+        if not isinstance(vault, dict) or not _ID.fullmatch(str(row.get("id") or "")):
+            continue
+        if str(vault.get("name") or "") in readable:
+            continue
+        urls = [str(u.get("href") or "") for u in row.get("urls") or [] if isinstance(u, dict)]
+        if any(same_site(host, url) for url in urls):
+            out.append({"id": str(row["id"]), "title": str(row.get("title") or host)[:120],
+                        "user": str(row.get("additional_information") or "")[:120],
+                        "vault": str(vault.get("name") or "")[:120], "vault_id": str(vault.get("id") or "")})
+    return out[:12]
+
+
+def key_vault(account: str, readable: list[str]) -> dict:
+    """Where a moved login goes: the key's vault named Hermes, else the first one it reads."""
+    raw = op_json(["vault", "list", "--account", account, "--format=json"], WAIT)
+    found = {str(v.get("name") or ""): str(v.get("id") or "") for v in raw if isinstance(v, dict)} if isinstance(raw, list) else {}
+    for name in sorted(readable, key=lambda n: n.lower() != NEW_VAULT.lower()):
+        if found.get(name):
+            return {"id": found[name], "name": name}
+    raise AllowError(409, "The vault your bots read is gone from 1Password. Open Passwords › 1Password › Change Vaults.",
+                     "no-vault")
+
+
+def move_start(data_dir: Path, password: str, origin: str, signer=sign_in, finder=logins_for) -> dict:
+    """Find the person's logins for ``origin`` that the bots can't read. A job: ``waiting`` → ``found`` (the
+    logins, by name and username) | ``failed``."""
+    host = site_host(origin)
+    saved = read_state(data_dir)
+    readable = [str(name) for name in saved.get("vaults") or []]
+    if not host or not readable or not password:
+        raise AllowError(409, "1Password isn’t allowed for your bots yet. Do that first in Passwords › 1Password.", "not-connected")
+    key = secrets.token_urlsafe(12)
+    entry = {"job": key, "state": "waiting", "at": time.time(), "data_dir": str(data_dir), "kind": "move", "site": host,
+             "by_password": True}
+    with _lock:
+        for old in [k for k, v in _jobs.items() if time.time() - v["at"] > JOB_LIFE]:
+            _jobs.pop(old, None)
+        _jobs[key] = entry
+    secret = password
+
+    def work():
+        nonlocal secret
+        try:
+            try:
+                chosen, session = signer(secret, "")
+            finally:
+                secret = None
+            with using(session):
+                matches = finder(chosen["id"], host, set(readable))
+            if not matches:
+                raise AllowError(404, f"1Password has no login for {host} outside the vaults your bots already read.", "none")
+            with _lock:
+                entry.update(state="found", matches=matches, account_id=chosen["id"], session=session, readable=readable,
+                             at=time.time())
+        except AllowError as error:
+            with _lock:
+                entry.update(state="failed", detail=error.detail, code=error.code)
+        except Exception as error:
+            log.warning("hermes-hq-push: 1Password login not looked up (%s)", type(error).__name__)
+            with _lock:
+                entry.update(state="failed", detail="1Password couldn’t be searched on this computer.", code="failed")
+
+    first = _public(entry)
+    threading.Thread(target=work, name="hq-onepassword-find", daemon=True).start()
+    return first
+
+
+def move_finish(key: str, item: str, destination=key_vault, mover=move_login) -> dict:
+    """The person approved: move that one login into the vault the key reads. ``done`` names the vault."""
+    with _lock:
+        entry = _jobs.get(key)
+        if entry is None or entry.get("kind") != "move":
+            raise AllowError(404, "That request is gone. Start again.", "gone")
+        if entry["state"] != "found":
+            raise AllowError(409, "That request isn’t waiting for your approval.", "busy")
+        match = next((m for m in entry.get("matches") or [] if m["id"] == item), None)
+        if match is None:
+            raise AllowError(400, "Pick the login to move.", "no-item")
+        entry.update(state="moving", at=time.time())
+    account = entry["account_id"]
+
+    def work():
+        try:
+            with using(entry.pop("session", None)):
+                where = destination(account, entry["readable"])
+                if not mover(account, match["id"], match["vault_id"], where["id"]):
+                    raise AllowError(502, "1Password wouldn’t move that login. It may be shared or locked by a policy.", "op-error")
+            log.info("hermes-hq-push: one login moved into the bots' vault on the owner's approval")
+            with _lock:
+                entry.update(state="done", moved_to=where["name"], at=time.time())
+        except AllowError as error:
+            with _lock:
+                entry.update(state="failed", detail=error.detail, code=error.code)
+        except Exception as error:
+            log.warning("hermes-hq-push: 1Password login not moved (%s)", type(error).__name__)
+            with _lock:
+                entry.update(state="failed", detail="The login couldn’t be moved.", code="failed")
+
+    first = _public(entry)
+    threading.Thread(target=work, name="hq-onepassword-move-one", daemon=True).start()
     return first
 
 
