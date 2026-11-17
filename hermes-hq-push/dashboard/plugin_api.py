@@ -272,8 +272,6 @@ class AllowStartIn(BaseModel):
 class AllowFinishIn(BaseModel):
     vaults: list[Annotated[str, Field(max_length=64)]] = Field(default_factory=list, max_length=60)
     create: bool = False
-    # Move the Private vault's logins into the person's Main vault first (0.9.59; 1Password lets no key read Private).
-    move_private: bool = False
 
 
 def _allow_call(call):
@@ -300,7 +298,8 @@ def onepassword_allow_job(job: str):
 
 @router.post("/vault/onepassword/allow/{job}")
 def onepassword_allow_finish(job: str, body: AllowFinishIn):
-    return _allow_call(lambda: onepassword_allow.finish(job, body.vaults, body.create, move_private=body.move_private))
+    # Never ``move_private`` from here: the owner (2026-11-16) wants logins given one at a time, not a vault moved.
+    return _allow_call(lambda: onepassword_allow.finish(job, body.vaults, body.create))
 
 
 @router.delete("/vault/onepassword")

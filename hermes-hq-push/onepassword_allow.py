@@ -474,10 +474,12 @@ def start(data_dir: Path, account: str = "", lister=open_vaults, account_lister=
                                           "Developer › Integrate with 1Password CLI.", "integration-off")
             with using(session):
                 vaults = lister(chosen["id"])
-                try:
-                    private = private_lister(chosen["id"])
-                except AllowError:
-                    private = None
+                private = None
+                if private_lister is not private_logins:   # not listed from the app: nothing there moves a vault now
+                    try:
+                        private = private_lister(chosen["id"])
+                    except AllowError:
+                        private = None
             with _lock:
                 job.update(state="choose", vaults=vaults, account=chosen["url"], account_id=chosen["id"], at=time.time(),
                            session=session, private=private if private and private.get("logins") else None)
