@@ -68,7 +68,7 @@ draws each):
 {
   "name": "Revenue This Week",
   "title": "Revenue",
-  "look": "app",
+  "look": "soft",
   "value": "$12,480", "delta": "+8.2%", "trend": "up",
   "caption": "This week, to Sunday",
   "blocks": [
@@ -90,7 +90,7 @@ Only `name` is required.
 | `caption` | One short line under the headline (about 40 characters). |
 | `badge`, `badge_state` | A short fact beside the heading that stays true in a picture: `9/9 up`, `3 late`. Never `LIVE` or `now`. It gives way to the heading in a narrow tile, so never the only place a problem shows: that is the headline's `state`. |
 | `blocks` | Up to four parts, **the most important first** (below). |
-| `look` | `app`, the person's own theme: **use this unless they ask for a look** (the examples show the others only so you can see them). `midnight` (deep blue: "dark", "like Grafana"), `terminal` (green on black, monospace), `vivid` (a bold colour that follows the state; best for one number or a quote). `"accent": "#rrggbb"` changes the tint ("make it green", a brand colour). |
+| `look` | `soft`, a calm card with its parts on white cards, in the person's light or dark: **use this unless they ask for a look** (the examples show the others only so you can see them). `app` (the colours of the person's own app theme), `midnight` (deep blue: "dark", "like Grafana"), `terminal` (green on black, monospace), `vivid` (a bold colour that follows the state; best for one number or a quote). `"accent": "#rrggbb"` changes the tint ("make it green", a brand colour). |
 | `backdrop` | `{"file": "<path>"}`: a picture behind the whole tile (a place, an album cover), under white words. |
 | `source` | Where the data came from (`Grafana`): shown in big tiles. |
 | `foot` | `false` leaves out the "Updated ..." line, for a tile with nothing to update (a quote, a photo). |

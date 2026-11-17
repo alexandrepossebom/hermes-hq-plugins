@@ -1,7 +1,7 @@
 {
  "name": "Weather Today",
  "title": "Weather",
- "look": "app",
+ "look": "soft",
  "value": "72°",
  "caption": "Sunny, high 78°, low 61°",
  "badge": "UV 6",

@@ -1,7 +1,7 @@
 {
  "name": "Needs A Reply",
  "title": "Needs a reply",
- "look": "app",
+ "look": "soft",
  "value": "5",
  "state": "warn",
  "caption": "2 waiting over a day",

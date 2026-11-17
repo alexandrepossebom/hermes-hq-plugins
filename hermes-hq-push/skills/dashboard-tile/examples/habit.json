@@ -1,7 +1,7 @@
 {
  "name": "Workout Streak",
  "title": "Workouts",
- "look": "app",
+ "look": "soft",
  "accent": "#16a34a",
  "value": "12 days",
  "state": "good",

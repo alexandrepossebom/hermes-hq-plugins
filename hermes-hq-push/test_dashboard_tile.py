@@ -486,7 +486,7 @@ def test_new_data_keeps_the_look_and_stamps_the_time(tmp_path, capsys):
     patch.write_text(json.dumps({"value": "DEGRADED", "state": "warn", "caption": "</script><b>1 node down</b>"}))
     assert make_tile.main(["set", str(tile), str(patch)]) == 0
     spec = make_tile.read_spec(str(tile))
-    assert (spec["value"], spec["state"], spec["look"], spec["error"]) == ("DEGRADED", "warn", "app", None)
+    assert (spec["value"], spec["state"], spec["look"], spec["error"]) == ("DEGRADED", "warn", "soft", None)
     assert spec["caption"] == "</script><b>1 node down</b>" and tile.read_text().count("</script>") == 3
     assert spec["updated"] != "2026-11-03T15:30:00Z" and len(spec["blocks"][0]["items"]) == 9
     assert make_tile.main(["set", str(tile), str(patch)]) == 0   # again: the same page
@@ -798,3 +798,13 @@ def test_hermes_lets_the_add_on_install():
     result = plugin_guard.scan_plugin(HERE)
     worst = [f"{f.pattern_id} {f.file}:{f.line} {f.match}" for f in result.findings if f.severity == "critical"]
     assert not worst and result.verdict != "dangerous", worst
+
+
+def test_a_tile_with_no_look_named_is_soft():
+    """Soft is the look a tile gets by default: the first one named, and what the page draws when the data names none
+    (or one it doesn't know)."""
+    assert make_tile.LOOKS[0] == "soft"
+    script = open(os.path.join(os.path.dirname(make_tile.__file__), "kit", "tile.js"), encoding="utf-8").read()
+    assert '(/^(app|midnight|terminal|vivid)$/.test(d.look) ? d.look : "soft")' in script
+    styles = open(os.path.join(os.path.dirname(make_tile.__file__), "kit", "tile.css"), encoding="utf-8").read()
+    assert ":root.look-soft {" in styles and ".look-soft .foot:not(.failed) { display: none; }" in styles

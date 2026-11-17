@@ -1,7 +1,7 @@
 {
  "name": "Homelab Go / No-Go",
  "title": "Homelab",
- "look": "app",
+ "look": "soft",
  "badge": "4 of 6 go",
  "badge_state": "bad",
  "value": "NO-GO",

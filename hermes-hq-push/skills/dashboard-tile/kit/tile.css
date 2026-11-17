@@ -28,6 +28,17 @@ body { container-type: size; background: var(--page); color: var(--ink); font-fa
           --good-fill: #3fdd88; --warn-fill: #f6bb45; --bad-fill: #ff6d6d;
           --line: var(--border, rgba(255, 255, 255, .13)); --surface: rgba(160, 168, 190, .14); --mood-strength: 16%; }
 }
+/* Soft (the default): a calm card. A pale page, the parts on white cards of their own, the heading in plain words
+   in the ink's colour, no light in the corner. Follows the person's light or dark, and their accent. */
+:root.look-soft {
+  --page: #f3f5f9; --ink: #17191e; --ink2: #6a707d; --tint: var(--accent, #2563eb);
+  --line: rgba(40, 50, 72, .12); --surface: #ffffff; --lift: 0 1px 2px rgba(24, 32, 52, .07); --mood-strength: 0%;
+  --radius: 1em; --caps: none; --track: 0em;
+}
+@media (prefers-color-scheme: dark) {
+  :root.look-soft { --page: #20242d; --ink: #f3f4f7; --ink2: #a6acb8; --tint: var(--accent, #6ea8ff);
+                    --line: rgba(255, 255, 255, .13); --surface: rgba(255, 255, 255, .085); --lift: none; }
+}
 :root.look-midnight {
   color-scheme: dark;
   --page: #0b1222; --wash: linear-gradient(165deg, #0d1730 0%, #0a101f 70%); --ink: #eaf0ff; --ink2: #a3b3d6;
@@ -404,3 +415,28 @@ body { background-image: var(--wash); }
 .look-vivid .bar { background: rgba(255, 255, 255, .45); }
 .look-vivid .more.bad, .look-vivid .more.warn { color: #fff; text-decoration: underline; }
 .look-vivid .scale-mark { background: #16181d; border-color: #fff; }
+
+/* Soft: the heading is the tile's name, in plain words; numbers and states sit on white cards; a list is plain
+   lines; a button is one white bar. The "Updated ..." line is left out (the app marks a tile that is late). */
+.look-soft .title { font-size: 1em; font-weight: 600; color: var(--ink); }
+.look-soft.has-accent .title { color: var(--ink); }
+.look-soft .big { font-weight: 650; }
+.look-soft .big.empty { font-weight: 600; }
+.look-soft .block-label, .look-soft .label { font-weight: 600; }
+.look-soft .status .item, .look-soft .status .more, .look-soft .strip .item, .look-soft .box { box-shadow: var(--lift); }
+.look-soft .status .item, .look-soft .status .more { padding: .5em .75em; }
+.look-soft .status .name { color: var(--ink2); }
+.look-soft .status .amount { font-size: 1.25em; font-weight: 650; letter-spacing: -.02em; }
+.look-soft .status .item.bad, .look-soft .status .item.warn { box-shadow: none; }
+.look-soft .stats { gap: .5em; }
+.look-soft .stats .item { border-left: 0; padding: .5em .75em; background: var(--surface); border-radius: var(--radius); box-shadow: var(--lift); }
+.look-soft .stats .amount { font-size: 1.25em; font-weight: 650; letter-spacing: -.02em; }
+.look-soft .rows .item, .look-soft .rows .more { padding: .5em 0; }
+.look-soft .rows .item:first-child { border-top: 0; }
+.look-soft .rows .name { font-weight: 600; }
+.look-soft .rows .amount { color: var(--ink2); }
+.look-soft .track { background: color-mix(in srgb, var(--ink2) 16%, transparent); }
+.look-soft .badge:not(.good):not(.warn):not(.bad), .look-soft .delta:not(.up):not(.down) { box-shadow: var(--lift); }
+.look-soft .button { color: var(--ink); background: var(--surface); border-radius: .85em; box-shadow: var(--lift); }
+.look-soft .buttons .item:first-child .button { color: var(--ink); background: var(--surface); }
+.look-soft .foot:not(.failed) { display: none; }

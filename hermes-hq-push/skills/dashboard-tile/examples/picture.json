@@ -3,7 +3,7 @@
  "title": "Launch",
  "value": "3 days",
  "caption": "Version 2 ships Friday",
- "look": "app",
+ "look": "soft",
  "foot": false,
  "blocks": [
   {

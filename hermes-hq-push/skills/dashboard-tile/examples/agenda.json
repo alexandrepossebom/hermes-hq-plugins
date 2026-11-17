@@ -1,7 +1,7 @@
 {
  "name": "Today's Agenda",
  "title": "Today",
- "look": "app",
+ "look": "soft",
  "value": "5 events",
  "caption": "Next: Standup in 20 min",
  "blocks": [

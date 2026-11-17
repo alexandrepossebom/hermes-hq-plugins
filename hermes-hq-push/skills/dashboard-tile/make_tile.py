@@ -19,7 +19,7 @@ The spec:
     {
       "name": "Revenue This Week",      the tile's name in the app, plain words, Title Case, at most 40 characters
       "title": "Revenue",               the heading inside the tile: a word or two
-      "look": "app",                    app (the person's own theme), midnight, terminal or vivid
+      "look": "soft",                   soft (a calm card; the default), app (the person's own theme), midnight, terminal or vivid
       "accent": "#rrggbb",              the tint, when the person asks for a colour
       "badge": "2/2 up", "badge_state": "good",          a short fact beside the heading
       "value": "$12,480", "state": null,                 the headline: a number or a word; state good, warn, bad
@@ -45,7 +45,7 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-LOOKS = ("app", "midnight", "terminal", "vivid")
+LOOKS = ("soft", "app", "midnight", "terminal", "vivid")
 STATES = ("good", "warn", "bad")
 KEYS = {"name", "title", "look", "accent", "badge", "badge_state", "value", "state", "delta", "trend", "caption", "empty",
         "blocks", "backdrop", "source", "job", "refresh", "foot", "updated", "error"}

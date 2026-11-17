@@ -16,7 +16,7 @@
   function nums(list) { return (list || []).filter(function (v) { return typeof v === "number" && isFinite(v); }); }
   // The look and the tile's state are the page's: the looks' colours hang off them.
   var root = document.documentElement;
-  root.className = "look-" + (/^(midnight|terminal|vivid)$/.test(d.look) ? d.look : "app") + (state(d.state) ? " mood-" + state(d.state) : "");
+  root.className = "look-" + (/^(app|midnight|terminal|vivid)$/.test(d.look) ? d.look : "soft") + (state(d.state) ? " mood-" + state(d.state) : "");
   if (/^#[0-9a-f]{3,8}$/i.test(d.accent || "")) { root.style.setProperty("--tint", d.accent); root.style.setProperty("--accent-own", d.accent); root.className += " has-accent"; }
   // A picture behind the whole tile, under a shade dark enough for white words.
   if (d.backdrop && has(d.backdrop.src)) {

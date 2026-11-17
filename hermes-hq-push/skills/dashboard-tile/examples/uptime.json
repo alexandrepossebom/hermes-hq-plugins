@@ -1,7 +1,7 @@
 {
  "name": "Site Uptime",
  "title": "Uptime",
- "look": "app",
+ "look": "soft",
  "value": "99.2%",
  "state": "warn",
  "caption": "2 outages in 30 days",

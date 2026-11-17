@@ -1,7 +1,7 @@
 {
  "name": "Homelab Health",
  "title": "Homelab",
- "look": "app",
+ "look": "soft",
  "badge": "9/9 up",
  "badge_state": "good",
  "value": "ONLINE",
