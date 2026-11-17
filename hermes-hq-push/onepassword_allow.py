@@ -112,8 +112,11 @@ def problem(stderr: str) -> AllowError:
     """op's failure in the app's words."""
     text = scrub(stderr)
     low = text.lower()
+    if "authorization timeout" in low:
+        return AllowError(408, "1Password asked on this computer and nobody answered within a minute. Try again when "
+                               "you’re at it.", "timeout")
     if any(word in low for word in ("authorization prompt dismissed", "authorization denied", "not approved",
-                                    "authorization timeout", "user cancel", "prompt dismissed")):
+                                    "user cancel", "prompt dismissed")):
         return AllowError(403, "1Password wasn’t allowed. Try again, then click Allow in 1Password.", "denied")
     if any(word in low for word in ("connecting to desktop app", "desktop app integration", "connect to the 1password",
                                     "1password app", "biometric", "no accounts configured", "not currently signed in",

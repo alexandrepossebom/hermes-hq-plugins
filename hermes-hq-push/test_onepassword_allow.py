@@ -83,6 +83,7 @@ def test_a_key_never_survives_in_an_error():
 
 @pytest.mark.parametrize("words, code", [
     ("[ERROR] 2026/11/16 authorization prompt dismissed, please try again", "denied"),
+    ("[ERROR] 2026/11/16 authorization timeout", "timeout"),
     ("[ERROR] connecting to desktop app: connection reset, make sure 1Password CLI is installed correctly", "integration-off"),
     ("[ERROR] You've reached the maximum number of service accounts", "limit"),
     ("[ERROR] (403) Forbidden: You do not have permission", "permission"),
