@@ -264,6 +264,9 @@ def plugin_update_job(job: str):
 
 class AllowStartIn(BaseModel):
     account: str = Field(default="", max_length=64)
+    # From a phone: the 1Password account password, used once on this computer to sign in and make the key. Never
+    # logged or kept (onepassword_allow.sign_in).
+    password: str | None = Field(default=None, max_length=1024)
 
 
 class AllowFinishIn(BaseModel):
@@ -285,7 +288,7 @@ def onepassword_state(profile: str = ""):
 
 @router.post("/vault/onepassword/allow")
 def onepassword_allow_start(body: AllowStartIn):
-    return _allow_call(lambda: onepassword_allow.start(push.data_dir(), body.account))
+    return _allow_call(lambda: onepassword_allow.start(push.data_dir(), body.account, password=body.password or None))
 
 
 @router.get("/vault/onepassword/allow/{job}")

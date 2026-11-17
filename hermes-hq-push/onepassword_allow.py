@@ -86,13 +86,32 @@ def find_op() -> str | None:
     return None
 
 
-def op_env(source: dict | None = None) -> dict:
-    """What ``op`` runs with: the person's own sign-in through the 1Password app. Any saved key, session or Connect
-    server is left out, or op would use that and never ask the app."""
+# The sign-in this thread's ``op`` calls run under: None = through the 1Password app (it shows Allow on this computer);
+# a dict = a session made from the account password sent from the phone (``sign_in``), with the app left out of it.
+_signed_in = threading.local()
+
+
+class using:
+    """``with using(session):`` this thread's op calls use that session (None: the 1Password app)."""
+    def __init__(self, session: dict | None):
+        self.session = session
+
+    def __enter__(self):
+        self.before = getattr(_signed_in, "session", None)
+        _signed_in.session = self.session
+
+    def __exit__(self, *exc):
+        _signed_in.session = self.before
+
+
+def op_env(source: dict | None = None, session: dict | None = None, app: bool = True) -> dict:
+    """What ``op`` runs with: the person's own sign-in, through the 1Password app or (``session``, or ``app`` False)
+    without it. Any saved key, other session or Connect server is left out, or op would use that instead."""
     source = os.environ if source is None else source
     env = {key: source[key] for key in _ENV_KEEP if key in source}
     env["NO_COLOR"] = "1"
-    env["OP_BIOMETRIC_UNLOCK_ENABLED"] = "true"
+    env["OP_BIOMETRIC_UNLOCK_ENABLED"] = "true" if app and session is None else "false"
+    env.update(session or {})
     return env
 
 
@@ -102,12 +121,15 @@ def scrub(text: str) -> str:
     return _TOKEN.sub("ops_…", text).strip()
 
 
-def run_op(args: list[str], timeout: float = QUICK) -> subprocess.CompletedProcess:
+def run_op(args: list[str], timeout: float = QUICK, app: bool = True, secret: str | None = None) -> subprocess.CompletedProcess:
     op = find_op()
     if op is None:
         raise AllowError(409, "1Password’s command-line tool isn’t installed on this computer.", "no-cli")
+    env = op_env(session=getattr(_signed_in, "session", None), app=app)
     try:
-        return subprocess.run([op, *args], env=op_env(), stdin=subprocess.DEVNULL, capture_output=True, text=True,
+        if secret is not None:   # on stdin, never in the arguments
+            return subprocess.run([op, *args], env=env, input=secret, capture_output=True, text=True, timeout=timeout)
+        return subprocess.run([op, *args], env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True,
                               timeout=timeout)
     except subprocess.TimeoutExpired:
         raise AllowError(408, "1Password didn’t answer in time. Open 1Password on this computer and try again.",
@@ -162,6 +184,60 @@ def accounts() -> list[dict]:
             out.append({"id": str(row["account_uuid"]), "url": str(row.get("url") or ""),
                         "email": str(row.get("email") or "")})
     return out
+
+
+# MARK: From the phone, with nobody at this computer
+
+def cli_accounts() -> list[dict]:
+    """The accounts 1Password's tool itself knows (added to it once, with their Secret Key): the ones it can sign in
+    to with the account password alone, no 1Password app and nobody at this computer."""
+    done = run_op(["account", "list", "--format=json"], app=False)
+    if done.returncode != 0:
+        return []
+    try:
+        raw = json.loads(done.stdout or "null")
+    except ValueError:
+        return []
+    out = []
+    for row in raw if isinstance(raw, list) else []:
+        if isinstance(row, dict) and row.get("account_uuid") and row.get("shorthand"):
+            out.append({"id": str(row["account_uuid"]), "url": str(row.get("url") or "").replace("https://", ""),
+                        "shorthand": str(row["shorthand"]), "user": str(row.get("user_uuid") or "")})
+    return out
+
+
+_cli_known = {"at": 0.0, "ok": False}
+
+
+def password_works() -> bool:
+    """Whether a password sent from the phone can sign in here (kept a minute: the Passwords page asks often)."""
+    if time.time() - _cli_known["at"] > 60:
+        try:
+            _cli_known.update(at=time.time(), ok=bool(cli_accounts()))
+        except AllowError:
+            _cli_known.update(at=time.time(), ok=False)
+    return bool(_cli_known["ok"])
+
+
+def sign_in(password: str, account: str = "", lister=cli_accounts) -> tuple[dict, dict]:
+    """Sign in to 1Password with the account password, as the person would in a terminal: (the account, the session
+    for ``using``). The password goes to op on stdin and is not kept; the session lives in memory until the key is
+    made (owner, 2026-11-16: "It can't go to the computer. No one is ever on their computer")."""
+    found = lister()
+    chosen = next((row for row in found if row["id"] == account), None) if account else (found[0] if found else None)
+    if chosen is None:
+        raise AllowError(409, "1Password on this computer can’t be signed in to from here. Allow it at the computer "
+                              "instead.", "no-password")
+    with using(None):
+        done = run_op(["signin", "--raw", "--account", chosen["shorthand"]], WAIT, app=False, secret=password)
+    token = (done.stdout or "").strip()
+    if done.returncode != 0 or not token:
+        low = scrub(done.stderr).lower()
+        if any(word in low for word in ("unauthorized", "(401)", "incorrect", "invalid", "authentication", "wrong password")):
+            raise AllowError(401, "1Password didn’t take that password. Try again.", "password")
+        raise problem(done.stderr or "1Password didn’t sign in.")
+    names = {chosen["shorthand"], chosen["user"]} - {""}
+    return chosen, {f"OP_SESSION_{name}": token for name in names}
 
 
 def open_vaults(account: str) -> list[dict]:
@@ -313,7 +389,8 @@ def state(data_dir: Path, profile: str = "") -> dict:
     except Exception:
         token = ""
     ours = bool(token) and _hash(token) in set(saved.get("hashes") or [])
-    return {"ok": True, "supported": supported(), "phone": True, "connected": bool(token), "ours": ours,
+    return {"ok": True, "supported": supported(), "phone": True, "password": supported() and password_works(),
+            "connected": bool(token), "ours": ours,
             "vaults": [str(name) for name in saved.get("vaults") or []] if ours else [],
             "name": str(saved.get("name") or "") if ours else "",
             "bots": len(saved.get("bots") or []) if ours else 0}
@@ -323,8 +400,10 @@ def _public(job: dict) -> dict:
     return {key: job[key] for key in ("job", "state", "vaults", "detail", "code", "saved", "account") if key in job}
 
 
-def start(data_dir: Path, account: str = "", lister=open_vaults, account_lister=accounts) -> dict:
-    """Ask 1Password. Answers a job at once: ``waiting`` while the 1Password app shows Allow, then ``choose`` with
+def start(data_dir: Path, account: str = "", lister=open_vaults, account_lister=accounts, password: str | None = None,
+          signer=sign_in) -> dict:
+    """Ask 1Password. Answers a job at once: ``waiting`` while the 1Password app shows Allow (or, with ``password``
+    from the phone, while 1Password signs in with it and nobody is needed at this computer), then ``choose`` with
     the vaults, or ``failed`` with why."""
     if not supported():
         raise AllowError(409, "1Password’s command-line tool isn’t installed on this computer.", "no-cli")
@@ -335,22 +414,39 @@ def start(data_dir: Path, account: str = "", lister=open_vaults, account_lister=
             _jobs.pop(old, None)
         # The app asked again while 1Password still shows Allow (the sheet was closed and opened): the same request.
         asked = next((v for v in _jobs.values() if v["state"] == "waiting"), None)
-        if asked is not None:
+        if asked is not None and password is None and not asked.get("by_password"):
             return _public(asked)
+        if asked is not None and not asked.get("by_password"):
+            _jobs.pop(asked["job"], None)   # a password from the phone outranks an Allow nobody is there to click
+        elif asked is not None:
+            raise AllowError(409, "1Password is signing in. Give it a moment.", "busy")
         if any(v["state"] == "making" for v in _jobs.values()):
             raise AllowError(409, "A key is being saved. Give it a moment.", "busy")
+        if password is not None:
+            job["by_password"] = True
         _jobs[key] = job
+    secret = password
 
     def work():
+        nonlocal secret
         try:
-            found = account_lister()
-            chosen = next((row for row in found if row["id"] == account), None) if account else (found[0] if found else None)
-            if chosen is None:
-                raise AllowError(409, "1Password isn’t ready on this computer. Open 1Password, then turn on Settings › "
-                                      "Developer › Integrate with 1Password CLI.", "integration-off")
-            vaults = lister(chosen["id"])
+            session = None
+            if secret is not None:
+                try:
+                    chosen, session = signer(secret, account)
+                finally:
+                    secret = None
+            else:
+                found = account_lister()
+                chosen = next((row for row in found if row["id"] == account), None) if account else (found[0] if found else None)
+                if chosen is None:
+                    raise AllowError(409, "1Password isn’t ready on this computer. Open 1Password, then turn on Settings › "
+                                          "Developer › Integrate with 1Password CLI.", "integration-off")
+            with using(session):
+                vaults = lister(chosen["id"])
             with _lock:
-                job.update(state="choose", vaults=vaults, account=chosen["url"], account_id=chosen["id"], at=time.time())
+                job.update(state="choose", vaults=vaults, account=chosen["url"], account_id=chosen["id"], at=time.time(),
+                           session=session)
         except AllowError as error:
             with _lock:
                 job.update(state="failed", detail=error.detail, code=error.code)
@@ -384,11 +480,12 @@ def finish(key: str, vault_ids: list[str], create: bool = False, vault_maker=mak
         try:
             names = [known[vault]["name"] for vault in picked]
             ids = list(picked)
-            if create:
-                made = vault_maker(account)
-                ids.append(made["id"])
-                names.append(made["name"])
-            token = key_maker(account, ids)
+            with using(job.pop("session", None)):   # the phone's sign-in ends with the key
+                if create:
+                    made = vault_maker(account)
+                    ids.append(made["id"])
+                    names.append(made["name"])
+                token = key_maker(account, ids)
             try:
                 saved = read_state(data_dir)
                 write_state(data_dir, {"hashes": [*(saved.get("hashes") or [])[-4:], _hash(token)], "vaults": names,

@@ -245,3 +245,67 @@ def test_allowing_again_replaces_our_own_key(bots):
         allow.finish(job["job"], [VAULTS[0]["id"]], key_maker=lambda account, ids, key=key: key)
         assert settle(job["job"], "done", "failed")["saved"] == 2
     assert allow.env_token(homes[0][1]) == OTHER
+
+
+# MARK: From the phone: the account password, once, and nobody at the computer
+
+CLI = [{"id": "ACCOUNTAAAAAAAAAAAAAAAAAAA", "url": "my.1password.example", "shorthand": "my", "user": "USERAAAAAAAAAAAAAAAAAAAAAA"}]
+
+
+def test_a_session_keeps_the_1password_app_out_of_it():
+    env = allow.op_env({"PATH": "/bin"}, session={"OP_SESSION_my": "tok"})
+    assert env["OP_BIOMETRIC_UNLOCK_ENABLED"] == "false" and env["OP_SESSION_my"] == "tok"
+    assert allow.op_env({"PATH": "/bin"}, app=False)["OP_BIOMETRIC_UNLOCK_ENABLED"] == "false"
+
+
+def test_the_password_goes_on_stdin_and_makes_a_session(monkeypatch):
+    seen = {}
+
+    class Done:
+        returncode, stdout, stderr = 0, "session-token\n", ""
+
+    def run(args, timeout=0, app=True, secret=None):
+        seen.update(args=args, app=app, secret=secret)
+        return Done()
+    monkeypatch.setattr(allow, "run_op", run)
+    account, session = allow.sign_in("correct horse", lister=lambda: CLI)
+    assert seen["args"] == ["signin", "--raw", "--account", "my"] and seen["app"] is False
+    assert seen["secret"] == "correct horse" and "correct horse" not in " ".join(seen["args"])
+    assert account["id"] == CLI[0]["id"]
+    assert session == {"OP_SESSION_my": "session-token", "OP_SESSION_USERAAAAAAAAAAAAAAAAAAAAAA": "session-token"}
+
+
+def test_a_wrong_password_says_so_and_no_account_means_the_computer(monkeypatch):
+    class Refused:
+        returncode, stdout, stderr = 1, "", "[ERROR] 2026/11/16 Unauthorized: (401) authentication required"
+    monkeypatch.setattr(allow, "run_op", lambda *a, **k: Refused())
+    with pytest.raises(allow.AllowError) as error:
+        allow.sign_in("nope", lister=lambda: CLI)
+    assert error.value.code == "password" and "nope" not in error.value.detail
+    with pytest.raises(allow.AllowError) as error:
+        allow.sign_in("anything", lister=lambda: [])
+    assert error.value.code == "no-password"
+
+
+def test_from_the_phone_the_whole_thing_runs_under_that_session(bots):
+    data_dir, homes = bots
+    session, under = {"OP_SESSION_my": "tok"}, []
+    started = allow.start(data_dir, password="correct horse", signer=lambda password, account: (CLI[0], dict(session)),
+                          lister=lambda account: under.append(dict(getattr(allow._signed_in, "session", None) or {})) or VAULTS)
+    job = settle(started["job"], "choose", "failed")
+    assert job["state"] == "choose" and under == [session]
+    assert "tok" not in str(job) and "correct horse" not in str(job) and "session" not in job
+    allow.finish(job["job"], [VAULTS[0]["id"]],
+                 key_maker=lambda account, ids: under.append(dict(allow._signed_in.session or {})) or KEY)
+    assert settle(job["job"], "done", "failed")["state"] == "done" and under == [session, session]
+    assert "session" not in allow._jobs[job["job"]]            # the phone's sign-in ends with the key
+    assert allow.env_token(homes[0][1]) == KEY
+
+
+def test_a_password_from_the_phone_outranks_an_allow_nobody_clicks(bots):
+    data_dir, _ = bots
+    hold = __import__("threading").Event()
+    waiting = allow.start(data_dir, lister=lambda account: hold.wait(5) and VAULTS, account_lister=lambda: ACCOUNT)
+    by_phone = allow.start(data_dir, password="pw", signer=lambda password, account: (CLI[0], {}), lister=lambda account: VAULTS)
+    hold.set()
+    assert by_phone["job"] != waiting["job"] and settle(by_phone["job"], "choose")["state"] == "choose"
