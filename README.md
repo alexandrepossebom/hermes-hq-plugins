@@ -261,12 +261,16 @@ it found on store pages as product cards in the Hermes HQ app (its `show_product
 price struck through), store and rating, and a tap opens the product's page with the bot's reasons, other stores'
 prices, **Buy** and **Notify Me**. Buy sends the bot a message: it takes the item to the last step of checkout in its
 browser and shows the order as a card (`order_card`) with the store, items, charges, total, **Cancel** and **Pay**.
-The bot is told never to press the store's final button before your Pay for that exact order; the add-on itself pays
-for nothing and only checks the cards (https links, prices as numbers, an old price above the price, the counts) and
-tells the bot in words what to fix. Notify Me asks the bot for a scheduled job that tells you when the item is back in
+From the moment the bot shows an order card until you tap Pay or Cancel on it, the bot cannot do anything in its
+browser in that chat: no clicking, typing, navigating or filling a card (the add-on refuses those tools; tools that
+only read the page, such as a screenshot, still work). A yes typed in words doesn't lift it; only the card's buttons
+do. After Pay it may place that order; after Cancel it is free again. The waiting orders are kept in
+`shopping-orders.json` in the add-on's data folder, so a restart doesn't lift the block, and a card nobody answers
+for a day expires. The add-on itself pays for nothing; it checks the cards (https links, prices as numbers, an old
+price above the price, the counts) and tells the bot in words what to fix. Notify Me asks the bot for a scheduled job that tells you when the item is back in
 stock or cheaper. Bots get the two tools only once an app that draws the cards has connected to this computer
-(`PUT /shopping/cards`; `shoppingCards` and `shoppingCardsShown` in the status), and only in the app's own chats;
-create `shopping.off` in the add-on's data folder to turn them off for every bot.
+(`PUT /shopping/cards`; `shoppingCards`, `shoppingCardsShown` and `shoppingPayBlock` in the status), and only in the
+app's own chats; create `shopping.off` in the add-on's data folder to turn them, and the block, off for every bot.
 
 Version 0.9.59 adds Allow in 1Password. Hermes unlocks 1Password with your master password and asks again after half
 an hour idle. Now the app's unlock sheet and Passwords page have an Allow in 1Password button: the 1Password app on

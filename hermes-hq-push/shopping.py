@@ -21,15 +21,18 @@ The tools show only once an app that draws the cards has said so on this compute
 bot while ``shopping.off`` exists there. Only in turns ``hermes serve`` runs: a turn of the messaging gateway has no app
 chat to show a card in.
 
-The orders this process took and the person's answers are kept in memory (a week at most, ``note_decision``) so a
-later version can refuse a store's pay step before the Pay; this one does not refuse anything yet. Nothing about a
-product or an order is logged.
+The pay block (``blocked_message``, the add-on's pre_tool_call): from a shown order card until the person taps Pay or
+Cancel on it, every tool that acts in a browser (click, type, navigate, run a script, fill a card) is refused in that
+chat; reading the page stays allowed. The orders are kept in ``shopping-orders.json`` in the add-on's data folder, so
+a restart doesn't lift a block. Nothing about a product is logged.
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
+import os
 import re
 import threading
 import time
@@ -91,7 +94,8 @@ PRODUCTS_SCHEMA = {
         "names, prices or links in your reply: end it with one short line (your pick and why, or a question). The "
         "user's taps arrive as messages: \"[Hermes HQ shopping <product id>: buy]\" (open that product's page in "
         "the browser, check the price and that it is in stock, choose the options it names, take it to the last "
-        "step of checkout, then call order_card and stop; never place the order yourself), \"[Hermes HQ shopping "
+        "step of checkout, then call order_card and stop; never place the order yourself: once the card is shown "
+        "your browser is locked in this chat until they tap Pay or Cancel), \"[Hermes HQ shopping "
         "<product id>: watch stock]\" or \"[... : watch price]\" (set up a scheduled job, with the "
         "product-price-monitor skill or your price watch job if you have one, that checks the page and messages "
         "them only when it is back in stock or below the price; then say in one line that the watch is set)."),
@@ -182,7 +186,8 @@ ORDER_SCHEMA = {
         "exactly as that page says will be charged (after shipping, tax and discounts), and only for something the "
         "user asked you to buy. This tool pays for nothing: it returns {order: \"waiting\", id} at once. Then end "
         "your reply with one short line saying the order is ready for their OK, and stop: no more tool calls, and "
-        "never press the store's final button. Place the order only after a message starting "
+        "never press the store's final button. From then until they tap Pay or Cancel, every browser action in this "
+        "chat is refused. Place the order only after a message starting "
         "\"[Hermes HQ order <id>: pay]\" arrives for this card's exact id: then check the checkout still shows the "
         "same total, place the order and say in a few words that it was placed. If the total is different by then, "
         "don't pay: call order_card again with the new total. On \"[Hermes HQ order <id>: cancel]\" do nothing more "
@@ -237,12 +242,12 @@ SHOWN_NOTE = (
 WAITING_NOTE = (
     "The user now sees this order as a card with Cancel and Pay. Nothing has been paid, and you must not pay yet. Say "
     "in one short line that the order is ready for their OK and end your reply now: no more tool calls, and don't "
-    "press the store's final button. Their answer arrives as \"[Hermes HQ order <id>: pay]\" (check the checkout "
+    "press the store's final button. Your browser is locked in this chat until they tap Pay or Cancel on the card. "
+    "Their answer arrives as \"[Hermes HQ order <id>: pay]\" (check the checkout "
     "still shows this total, place the order, say it was placed; if the total differs, don't pay: call order_card "
     "again) or \"[Hermes HQ order <id>: cancel]\" (don't place it; say nothing was charged).")
 
 _lock = threading.Lock()
-_orders: dict[str, dict] = {}     # id -> {session, total, currency, state: waiting|pay|cancel|replaced, at}
 _asks: dict[str, dict] = {}       # product id -> {session, ask: buy|watch stock|watch price, at}
 
 
@@ -271,8 +276,9 @@ def note_cards(data_dir: Path) -> None:
 def status(data_dir: Path) -> dict:
     """`shoppingCards` (0.9.60): show_products and order_card exist here (false while shopping.off turns them off).
     `shoppingCardsShown`: an app has said it draws the cards, so bots have the tools; an app that draws them and reads
-    false answers with PUT /shopping/cards."""
-    return {"shoppingCards": switched_on(data_dir), "shoppingCardsShown": cards_shown(data_dir)}
+    false answers with PUT /shopping/cards. `shoppingPayBlock`: browser actions are refused in a chat while its order
+    card waits for Pay or Cancel (blocked_message)."""
+    return {"shoppingCards": switched_on(data_dir), "shoppingCardsShown": cards_shown(data_dir), "shoppingPayBlock": True}
 
 
 # MARK: Ids (the app's ShoppingCards.productId / orderId make the same ones)
@@ -629,7 +635,7 @@ def check_order(args) -> tuple[list[str], str, list[str], dict]:
                               "the checkout page shows, and list every charge it adds (shipping, tax, fees; a discount "
                               "as a negative amount), or leave `charges` out.")
     new_id = order_id(store, total, currency, lines) if (not c.problems and store and total is not None) else ""
-    return c.problems, new_id, c.long, {"total": total, "currency": currency}
+    return c.problems, new_id, c.long, {"store": store, "total": total, "currency": currency}
 
 
 def _long_words(long: list[str]) -> str:
@@ -639,26 +645,119 @@ def _long_words(long: list[str]) -> str:
             ". Keep it shorter next time.")
 
 
-# MARK: What the person answered (kept for a later guard; nothing is refused on it yet)
+# MARK: The pay block: no browser action in a chat while its order card waits for Pay or Cancel
+#
+# The owner's rule: from the moment the bot shows an order card until the person taps Pay or Cancel on it, the bot
+# can't act in its browser in that chat (no click, typing, navigating or filling a card); it can still read the page.
+# After Pay it may place that order; after Cancel it is free again. A yes typed in words lifts nothing.
+#
+# Kept in a small JSON file in the add-on's data folder (STATE), so a restart of the gateway or of `hermes serve`
+# doesn't lift a block, and every process of this computer (serve, the messaging gateway) sees the same orders.
 
-def _prune(now: float) -> None:
-    for book in (_orders, _asks):
-        for key in [k for k, v in book.items() if now - v["at"] > TTL]:
-            del book[key]
-        while len(book) > KEEP:
-            del book[min(book, key=lambda k: book[k]["at"])]
+STATE = "shopping-orders.json"
+LAPSE = 24 * 3600.0          # a card nobody answered for a day lapses: the block lifts and it can't be paid any more
+CLOSED = ("pay", "cancel", "replaced", "lapsed")
+
+# The browser tools that only read. Every other tool whose name has a `browser_` part (at the start, or after a
+# server's prefix: mcp_playwright_browser_click) is an action and is refused while a card waits: a browser tool this
+# list doesn't know is refused too (fail closed), since a new acting tool must never slip through unnoticed.
+# Hermes's own browser today is browser_exec (Python over CDP), browser_cdp (raw CDP), browser_dialog and
+# browser_vault (fill, enter_code, save_login, unlock): each can act, so none is here; the names below are the
+# reading tools of Hermes's earlier browser toolset and of browser plugins (scrolling only moves the view).
+BROWSER_READERS = frozenset({
+    "browser_snapshot", "browser_screenshot", "browser_vision", "browser_get_images", "browser_get_text",
+    "browser_get_content", "browser_list_tabs", "browser_tabs", "browser_scroll",
+})
+# Tools without a `browser_` part that drive a page or pay all the same: the desktop app's in-app browser pane
+# (drive_preview; desktop_preview opens pages, its `read` only reads), the whole screen (computer_use, which can click
+# in any browser window), and the link-card-fill plugin's card staging (it makes a card the vault can type in).
+OTHER_ACTORS = frozenset({"drive_preview", "computer_use", "link_card_stage"})
+_BROWSER_PART = re.compile(r"(?:^|_)(browser_[a-z0-9_]+)$")
+
+BLOCKED = (
+    "Nothing was done. An order card for {store}, total {total}, is waiting for the user's answer, and nothing can "
+    "be done in the browser in this chat until they tap Pay or Cancel on that card. Don't try another way (no "
+    "terminal, no other browser, no script). Tell them in one short line that the order card is waiting for their "
+    "tap, and end your reply. If they asked for something different, ask them to tap Cancel on the card first.")
+LAPSED_NOTE = (
+    "[Hermes HQ app note, not from the person: the order card {order} expired (nobody answered it for a day), so this "
+    "Pay places nothing. Don't place the order. Go back to the checkout, and if they still want it, show a new card "
+    "with order_card.]")
+REPLACED_NOTE = (
+    "[Hermes HQ app note, not from the person: the order card {order} was replaced by a newer card, so this answer "
+    "doesn't count. Don't place the order; point them to the newest order card.]")
+
+_log = logging.getLogger("hermes-hq-push")
+_warned = False
 
 
-def remember_order(session_id: str, new_id: str, total: float, currency: str, now: float | None = None) -> None:
-    """A newer order card in the same chat replaces the one still waiting there (the app draws it so)."""
+def _path(data_dir: Path) -> Path:
+    return Path(data_dir) / STATE
+
+
+def _load(data_dir: Path) -> dict:
+    """The orders, by id. A missing file is no orders. A corrupt or unreadable one is no orders too, logged once: one
+    bad file must not lock the browser in every chat of every bot (the alternative, fail closed, would), and an order
+    lost that way only means a bot isn't stopped, which the order card's own teaching still covers."""
+    global _warned
+    try:
+        text = _path(data_dir).read_text()
+    except FileNotFoundError:
+        return {}
+    except OSError:
+        text = None
+    try:
+        state = json.loads(text) if text is not None else None
+        orders = state.get("orders") if isinstance(state, dict) else None
+        if isinstance(orders, dict):
+            return {k: v for k, v in orders.items() if isinstance(v, dict) and isinstance(k, str)}
+    except ValueError:
+        pass
+    if not _warned:
+        _warned = True
+        _log.warning("hermes-hq-push: %s can't be read; taken as no waiting orders", STATE)
+    return {}
+
+
+def _save(data_dir: Path, orders: dict) -> None:
+    path = _path(data_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps({"version": 1, "orders": orders}, indent=1))
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def _prune(orders: dict, now: float) -> bool:
+    """Waiting orders older than LAPSE lapse; anything older than TTL goes; at most KEEP. True when it changed."""
+    changed = False
+    for order in orders.values():
+        if order.get("state") == "waiting" and now - float(order.get("at") or 0) > LAPSE:
+            order["state"], order["settled"] = "lapsed", now
+            changed = True
+    for key in [k for k, v in orders.items() if now - float(v.get("settled") or v.get("at") or 0) > TTL]:
+        del orders[key]
+        changed = True
+    while len(orders) > KEEP:
+        del orders[min(orders, key=lambda k: float(orders[k].get("at") or 0))]
+        changed = True
+    return changed
+
+
+def remember_order(data_dir: Path, session_id: str, new_id: str, store: str, total: float, currency: str,
+                   now: float | None = None) -> None:
+    """A shown order card waits (and blocks). A newer card in the same chat replaces the one still waiting there."""
     now = time.time() if now is None else now
     session = str(session_id or "")
     with _lock:
-        for key, order in _orders.items():
-            if order["session"] == session and order["state"] == "waiting" and key != new_id:
-                order["state"] = "replaced"
-        _orders[new_id] = {"session": session, "total": total, "currency": currency, "state": "waiting", "at": now}
-        _prune(now)
+        orders = _load(data_dir)
+        for key, order in orders.items():
+            if order.get("session") == session and order.get("state") == "waiting" and key != new_id:
+                order["state"], order["settled"] = "replaced", now
+        orders[new_id] = {"session": session, "store": store, "total": total, "currency": currency,
+                          "state": "waiting", "at": now}
+        _prune(orders, now)
+        _save(data_dir, orders)
 
 
 def decision(user_message) -> tuple[str, str] | None:
@@ -670,32 +769,97 @@ def decision(user_message) -> tuple[str, str] | None:
     return (found.group(1), found.group(2)) if found else None
 
 
-def note_decision(user_message, session_id: str = "", now: float | None = None) -> None:
-    """pre_llm_call: the person tapped a card. Pay or Cancel settles that order; Buy or Notify Me is kept by product."""
+def note_decision(data_dir: Path, user_message, session_id: str = "", now: float | None = None) -> str | None:
+    """pre_llm_call: the person tapped a card. Pay or Cancel on the chat's waiting order settles it (and lifts the
+    block); an answer to an order that lapsed or was replaced settles nothing and returns a note for the bot. Any
+    other message, a typed "yes go ahead" included, changes nothing."""
     found = decision(user_message)
     if not found:
-        return
+        return None
     now = time.time() if now is None else now
     key, answer = found
-    with _lock:
-        if key.startswith("o-"):
-            order = _orders.get(key)
-            if order is not None:
-                order["state"] = answer
-                order["at"] = now
-            else:   # an order another process showed (a restart in between): known by its answer alone
-                _orders[key] = {"session": str(session_id or ""), "total": None, "currency": "", "state": answer,
-                                "at": now}
-        else:
+    if not key.startswith("o-"):
+        with _lock:
             _asks[key] = {"session": str(session_id or ""), "ask": answer, "at": now}
-        _prune(now)
-
-
-def order_state(order: str) -> str | None:
-    """waiting, pay, cancel or replaced; None for an order this process never saw."""
+            for old in [k for k, v in _asks.items() if now - v["at"] > TTL]:
+                del _asks[old]
+        return None
     with _lock:
-        found = _orders.get(order)
-        return found["state"] if found else None
+        orders = _load(data_dir)
+        changed = _prune(orders, now)
+        order = orders.get(key)
+        note = None
+        if order is not None and session_id and order.get("session") and order["session"] != str(session_id):
+            order = None    # another chat's order: an answer here doesn't settle it
+        if order is not None:
+            if order.get("state") == "waiting":
+                order["state"], order["settled"] = answer, now
+                changed = True
+            elif answer == "pay" and order.get("state") == "lapsed":
+                note = LAPSED_NOTE.format(order=key)
+            elif answer == "pay" and order.get("state") == "replaced":
+                note = REPLACED_NOTE.format(order=key)
+        if changed:
+            _save(data_dir, orders)
+    return note
+
+
+def order_state(data_dir: Path, order: str, now: float | None = None) -> str | None:
+    """waiting, pay, cancel, replaced or lapsed; None for an order this computer never saw."""
+    now = time.time() if now is None else now
+    with _lock:
+        orders = _load(data_dir)
+        _prune(orders, now)
+        found = orders.get(order)
+        return found.get("state") if found else None
+
+
+def waiting_order(data_dir: Path, session_id: str, now: float | None = None) -> tuple[str, dict] | None:
+    """(id, order) of the chat's order card that waits for Pay or Cancel, or None."""
+    now = time.time() if now is None else now
+    session = str(session_id or "")
+    if not session:
+        return None
+    with _lock:
+        orders = _load(data_dir)
+    _prune(orders, now)   # a lapse here only shapes this answer; the next write keeps it
+    found = [(k, v) for k, v in orders.items() if v.get("session") == session and v.get("state") == "waiting"]
+    return max(found, key=lambda kv: float(kv[1].get("at") or 0)) if found else None
+
+
+def acts_in_browser(tool_name, args=None) -> bool:
+    """Whether a tool acts in a browser (or pays): every `browser_` tool but the readers, the actors without the name,
+    and desktop_preview except its `read`."""
+    name = str(tool_name or "").strip().lower()
+    if name in OTHER_ACTORS:
+        return True
+    if name == "desktop_preview":
+        return not (isinstance(args, dict) and str(args.get("action") or "").strip().lower() == "read")
+    found = _BROWSER_PART.search(name)
+    return bool(found) and found.group(1) not in BROWSER_READERS
+
+
+def _money(total, currency: str) -> str:
+    try:
+        amount = f"{float(total):,.2f}"
+    except (TypeError, ValueError):
+        return "as shown on the card"
+    sign = {"USD": "$", "EUR": "€", "GBP": "£"}.get(currency or "USD")
+    return f"{sign}{amount}" if sign else f"{amount} {currency}"
+
+
+def blocked_message(data_dir: Path, tool_name, args, session_id="", now: float | None = None) -> str | None:
+    """pre_tool_call: the refusal for a browser action in a chat whose order card waits, else None. Off with the tools
+    (shopping.off). Only the chat with the waiting card: another chat of the same bot is free."""
+    if not acts_in_browser(tool_name, args):
+        return None
+    if not switched_on(data_dir):
+        return None
+    found = waiting_order(data_dir, str(session_id or ""), now)
+    if not found:
+        return None
+    _, order = found
+    return BLOCKED.format(store=order.get("store") or "the store", total=_money(order.get("total"), order.get("currency")))
 
 
 # MARK: The tools
@@ -707,11 +871,11 @@ def show(args, session_id: str = "") -> str:
     return _reply({"products": "shown", "id": ids[0], "ids": ids, "note": SHOWN_NOTE + _long_words(long)})
 
 
-def order(args, session_id: str = "") -> str:
+def order(args, session_id: str, data_dir: Path) -> str:
     problems, new_id, long, money = check_order(args)
     if problems:
         return _failed(problems)
-    remember_order(session_id, new_id, money["total"], money["currency"])
+    remember_order(data_dir, session_id, new_id, money["store"], money["total"], money["currency"])
     return _reply({"order": "waiting", "id": new_id, "note": WAITING_NOTE + _long_words(long)})
 
 
@@ -726,7 +890,7 @@ def register_tool(ctx, data_dir: Callable[[], Path], serves: Callable[[], bool])
         return show(args, session_id) if serves() else outside()
 
     def handle_order(args, session_id="", **kwargs):
-        return order(args, session_id) if serves() else outside()
+        return order(args, session_id, data_dir()) if serves() else outside()
 
     def on() -> bool:
         try:

@@ -265,8 +265,9 @@ def pre_llm_call(platform="", parent_session_id="", user_message=None, conversat
         drafts.note_decision(user_message, str(session_id or ""))
     except Exception:
         log.debug("hermes-hq-push: draft answer not noted")
-    try:  # [shopping] the person's Buy, Notify Me, Pay or Cancel on a shopping card (shopping.py)
-        shopping.note_decision(user_message, str(session_id or ""))
+    shopping_note = None
+    try:  # [shopping] the person's Pay or Cancel lifts the chat's pay block; Buy and Notify Me are noted (shopping.py)
+        shopping_note = shopping.note_decision(push.data_dir(), user_message, str(session_id or ""))
     except Exception:
         log.debug("hermes-hq-push: shopping answer not noted")
     # Only turns ``hermes serve`` runs: a card asked from a turn the messaging gateway runs in an app chat (another
@@ -274,7 +275,7 @@ def pre_llm_call(platform="", parent_session_id="", user_message=None, conversat
     # keeps the Tasks note out of cron runs and hand-offs: only a conversation with the user adds it.
     if not _serves_app_sessions():
         return None
-    notes = []
+    notes = [shopping_note] if shopping_note else []
     try:
         note = ask_cards.context_for(data_dir=push.data_dir(), platform=platform, parent_session_id=parent_session_id,
                                      user_message=user_message, conversation_history=conversation_history)
@@ -334,7 +335,8 @@ def _desktop_theme():
 def pre_tool_call(tool_name="", args=None, **kwargs):
     verdict = (_veto(tool_name, args) or _code_veto(tool_name, args, kwargs)
                or _ideas_veto(tool_name, kwargs.get("session_id"))
-               or _draft_veto(tool_name, args, kwargs.get("session_id")) or _job_clarify(tool_name))
+               or _draft_veto(tool_name, args, kwargs.get("session_id"))
+               or _pay_block(tool_name, args, kwargs.get("session_id")) or _job_clarify(tool_name))
     if verdict is None:
         _named_site(tool_name, args, kwargs.get("task_id"))
         _live_step(tool_name, args, kwargs)
@@ -361,6 +363,22 @@ def _job_clarify(tool_name):
     if not message:
         return None
     log.info("hermes-hq-push: clarify in a job's Bot Chat turn with the app out of reach: the bot asks in its reply")
+    return {"action": "block", "message": message}
+
+
+def _pay_block(tool_name, args, session_id):
+    """[shopping] A browser action in a chat whose order card waits for Pay or Cancel (shopping.blocked_message). In
+    every process: a job's hand-off the messaging gateway runs in that chat is held the same way."""
+    try:
+        if not shopping.acts_in_browser(tool_name, args):
+            return None
+        message = shopping.blocked_message(push.data_dir(), tool_name, args, session_id or "")
+    except Exception:
+        log.debug("hermes-hq-push: pay block check failed", exc_info=True)
+        return None
+    if not message:
+        return None
+    log.info("hermes-hq-push: %s held: an order card waits for Pay or Cancel", tool_name)
     return {"action": "block", "message": message}
 
 

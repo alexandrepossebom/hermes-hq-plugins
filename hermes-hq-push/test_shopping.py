@@ -38,13 +38,25 @@ ORDER = {"store": "Example Outfitters", "site": "https://example.com/checkout",
          "pay_with": "Visa ending 4242", "arrives": "Fri, Nov 20"}
 
 
+ROOT = {}
+
+
 @pytest.fixture(autouse=True)
-def fresh():
-    shopping._orders.clear()
+def fresh(tmp_path):
+    """Each test's orders file lives in its own folder (the add-on's data folder in Hermes)."""
+    ROOT["dir"] = tmp_path / "plugin-data"
+    ROOT["dir"].mkdir()
     shopping._asks.clear()
     yield
-    shopping._orders.clear()
     shopping._asks.clear()
+
+
+def root():
+    return ROOT["dir"]
+
+
+def orders():
+    return shopping._load(root())
 
 
 class Ctx:
@@ -66,7 +78,7 @@ def shown(*products, **extra):
 
 
 def ordered(session="s1", **changes):
-    return json.loads(shopping.order({**ORDER, **changes}, session))
+    return json.loads(shopping.order({**ORDER, **changes}, session, root()))
 
 
 def refusal(reply: dict) -> str:
@@ -199,7 +211,7 @@ def test_an_order_waits_and_is_kept():
     reply = ordered()
     assert reply == {"order": "waiting", "id": ORDER_ID, "note": shopping.WAITING_NOTE}
     assert "must not pay" in reply["note"]
-    assert shopping.order_state(ORDER_ID) == "waiting"
+    assert shopping.order_state(root(), ORDER_ID) == "waiting"
 
 
 @pytest.mark.parametrize("change, words", [
@@ -226,7 +238,7 @@ def test_an_order_waits_and_is_kept():
 def test_each_wrong_order_is_refused_in_words(change, words):
     error = refusal(ordered(**change))
     assert words in error, error
-    assert shopping._orders == {}
+    assert orders() == {}
 
 
 def test_the_sum_check_takes_a_line_amount_or_a_price_each_and_a_discount():
@@ -244,8 +256,8 @@ def test_a_newer_order_in_the_chat_replaces_the_waiting_one():
     first = ordered()["id"]
     second = ordered(total=150.0, charges=None)["id"]
     other_chat = ordered("s2", total=160.0, charges=None)["id"]
-    assert shopping.order_state(first) == "replaced"
-    assert shopping.order_state(second) == "waiting" and shopping.order_state(other_chat) == "waiting"
+    assert shopping.order_state(root(), first) == "replaced"
+    assert shopping.order_state(root(), second) == "waiting" and shopping.order_state(root(), other_chat) == "waiting"
 
 
 # MARK: The person's answers
@@ -266,23 +278,28 @@ def test_only_the_apps_own_first_line_is_an_answer():
 
 def test_pay_and_cancel_settle_the_order_and_buy_is_kept():
     ordered()
-    shopping.note_decision(f"[Hermes HQ order {ORDER_ID}: pay]\nPlace this order now.", "s1")
-    assert shopping.order_state(ORDER_ID) == "pay"
-    shopping.note_decision("[Hermes HQ order o-0000000a: cancel]\nDon't place this order.", "s1")
-    assert shopping.order_state("o-0000000a") == "cancel"      # one another process showed
-    shopping.note_decision(f"[Hermes HQ shopping {PRODUCT_ID}: buy]\nBuy this for me", "s1")
+    shopping.note_decision(root(), f"[Hermes HQ order {ORDER_ID}: pay]\nPlace this order now.", "s1")
+    assert shopping.order_state(root(), ORDER_ID) == "pay"
+    # An id this computer never showed settles nothing.
+    shopping.note_decision(root(), "[Hermes HQ order o-0000000a: cancel]\nDon't place this order.", "s1")
+    assert shopping.order_state(root(), "o-0000000a") is None
+    shopping.note_decision(root(), f"[Hermes HQ shopping {PRODUCT_ID}: buy]\nBuy this for me", "s1")
     assert shopping._asks[PRODUCT_ID]["ask"] == "buy"
-    shopping.note_decision("pay it", "s1")
-    assert shopping.order_state(ORDER_ID) == "pay"
+    shopping.note_decision(root(), "pay it", "s1")
+    assert shopping.order_state(root(), ORDER_ID) == "pay"
 
 
 def test_old_answers_are_forgotten():
-    shopping.remember_order("s1", "o-00000001", 1.0, "USD", now=0.0)
-    shopping.remember_order("s2", "o-00000002", 1.0, "USD", now=shopping.TTL + 1)
-    assert list(shopping._orders) == ["o-00000002"]
+    shopping.remember_order(root(), "s1", "o-00000001", "Example Outfitters", 1.0, "USD", now=0.0)
+    shopping.remember_order(root(), "s2", "o-00000002", "Example Outfitters", 1.0, "USD", now=shopping.TTL + 1)
+    # The first lapsed then (a late Pay still gets told it expired); a week after that it is gone.
+    assert orders()["o-00000001"]["state"] == "lapsed"
+    shopping.remember_order(root(), "s3", "o-00000003", "Example Outfitters", 1.0, "USD", now=2 * shopping.TTL + 2)
+    assert list(orders()) == ["o-00000002", "o-00000003"]
     for i in range(shopping.KEEP + 5):
-        shopping.remember_order(f"s{i}", f"o-{i:08x}", 1.0, "USD", now=shopping.TTL + 2 + i)
-    assert len(shopping._orders) == shopping.KEEP
+        shopping.remember_order(root(), f"s{i}", f"o-{i:08x}", "Example Outfitters", 1.0, "USD",
+                                now=2 * shopping.TTL + 3 + i)
+    assert len(orders()) == shopping.KEEP
 
 
 # MARK: Offered only when
@@ -296,11 +313,11 @@ def test_the_tools_show_only_once_an_app_draws_the_cards(tmp_path):
     assert [t["check_fn"]() for t in tools.values()] == [True, True]
     (tmp_path / shopping.SWITCH).touch()
     assert [t["check_fn"]() for t in tools.values()] == [False, False]
-    assert shopping.status(tmp_path) == {"shoppingCards": False, "shoppingCardsShown": True}
+    assert shopping.status(tmp_path) == {"shoppingCards": False, "shoppingCardsShown": True, "shoppingPayBlock": True}
 
 
 def test_status_offers_cards_before_any_app_asked(tmp_path):
-    assert shopping.status(tmp_path) == {"shoppingCards": True, "shoppingCardsShown": False}
+    assert shopping.status(tmp_path) == {"shoppingCards": True, "shoppingCardsShown": False, "shoppingPayBlock": True}
 
 
 def test_a_switch_that_cannot_be_read_keeps_the_tools_away():
@@ -314,14 +331,14 @@ def test_a_turn_outside_the_app_is_told_to_answer_in_its_reply(tmp_path):
     for name, args in (("show_products", {"products": [SHOE]}), ("order_card", ORDER)):
         reply = json.loads(tools[name]["handler"](args, session_id="s1", task_id="t"))
         assert reply["status"] == "failed" and "reply" in reply["error"]
-    assert shopping._orders == {}
+    assert orders() == {}
 
 
 def test_the_handlers_take_hermes_arguments(tmp_path):
     tools = registered(tmp_path)
     assert json.loads(tools["show_products"]["handler"]({"products": [SHOE]}, session_id="s1", task_id="t"))["id"] == PRODUCT_ID
     assert json.loads(tools["order_card"]["handler"](ORDER, session_id="s1", task_id="t"))["id"] == ORDER_ID
-    assert shopping._orders[ORDER_ID]["session"] == "s1"
+    assert shopping._load(tmp_path)[ORDER_ID]["session"] == "s1"
 
 
 def test_the_teaching_text_says_what_matters():
@@ -367,7 +384,7 @@ def test_the_route_turns_the_tools_on_and_the_status_says_so(client, tmp_path):
     assert test.put(f"{base}/shopping/cards").json() == {"ok": True}
     assert (tmp_path / "data" / shopping.CARDS).exists()
     after = test.get(f"{base}/status").json()
-    assert after["shoppingCards"] is True and after["shoppingCardsShown"] is True
+    assert after["shoppingCards"] is True and after["shoppingCardsShown"] is True and after["shoppingPayBlock"] is True
 
 
 def test_through_the_addon_the_way_hermes_calls_it(tmp_path, monkeypatch):
@@ -390,5 +407,146 @@ def test_through_the_addon_the_way_hermes_calls_it(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_INTERACTIVE", "1")
     monkeypatch.setitem(sys.modules, "tui_gateway.server", types.ModuleType("tui_gateway.server"))
     assert json.loads(tool["handler"](ORDER, session_id="chat-1"))["id"] == ORDER_ID
+    # The pay block, through the add-on's own hooks: a click waits for the card, a typed yes lifts nothing, Cancel does.
+    held = addon.pre_tool_call(tool_name="browser_exec", args={"code": "click('#place-order')"}, session_id="chat-1")
+    assert held["action"] == "block" and "Example Outfitters" in held["message"] and "$140.39" in held["message"]
+    assert addon.pre_tool_call(tool_name="browser_exec", args={"code": "x"}, session_id="chat-2") is None
+    assert addon.pre_tool_call(tool_name="web_search", args={"query": "x"}, session_id="chat-1") is None
+    addon.pre_llm_call(user_message="yes go ahead", session_id="chat-1")
+    assert addon.pre_tool_call(tool_name="browser_exec", args={"code": "x"}, session_id="chat-1")["action"] == "block"
     addon.pre_llm_call(user_message=f"[Hermes HQ order {ORDER_ID}: cancel]\nDon't place this order.", session_id="chat-1")
-    assert shopping.order_state(ORDER_ID) == "cancel"
+    assert shopping.order_state(tmp_path, ORDER_ID) == "cancel"
+    assert addon.pre_tool_call(tool_name="browser_exec", args={"code": "x"}, session_id="chat-1") is None
+
+
+# MARK: The pay block
+
+ACTORS = ["browser_exec", "browser_cdp", "browser_dialog", "browser_vault", "browser_ask_user",
+          "browser_navigate", "browser_click", "browser_type", "browser_press", "browser_back", "browser_console",
+          "browser_vault_fill", "browser_vault_save_login", "browser_select_option", "browser_upload_file",
+          "mcp_playwright_browser_click", "browser_x", "BROWSER_CLICK",
+          "drive_preview", "computer_use", "link_card_stage"]
+READERS = ["browser_snapshot", "browser_screenshot", "browser_vision", "browser_get_images", "browser_get_text",
+           "browser_get_content", "browser_list_tabs", "browser_tabs", "browser_scroll", "mcp_playwright_browser_snapshot"]
+OTHERS = ["web_search", "web_extract", "cronjob", "clarify", "terminal", "read_file", "link_card_cleanup",
+          "order_card", "show_products", "vision_analyze", "annotate_preview", "send_message"]
+
+
+def waits(session="s1"):
+    ordered(session)
+    return root()
+
+
+@pytest.mark.parametrize("tool", ACTORS)
+def test_each_acting_browser_tool_is_refused_while_the_card_waits(tool):
+    message = shopping.blocked_message(waits(), tool, {}, "s1")
+    assert message == shopping.BLOCKED.format(store="Example Outfitters", total="$140.39")
+    assert message.startswith("Nothing was done.") and "tap Pay or Cancel" in message
+
+
+@pytest.mark.parametrize("tool", READERS + OTHERS)
+def test_reading_and_every_other_tool_stay_allowed(tool):
+    assert shopping.blocked_message(waits(), tool, {}, "s1") is None
+
+
+def test_the_preview_pane_reads_but_doesnt_open_pages():
+    data = waits()
+    assert shopping.blocked_message(data, "desktop_preview", {"action": "read"}, "s1") is None
+    assert shopping.blocked_message(data, "desktop_preview", {"action": "open", "target": "https://example.com"}, "s1")
+    assert shopping.blocked_message(data, "desktop_preview", None, "s1")
+
+
+def test_nothing_is_blocked_before_a_card_or_in_another_chat():
+    assert shopping.blocked_message(root(), "browser_exec", {}, "s1") is None
+    waits("s1")
+    assert shopping.blocked_message(root(), "browser_exec", {}, "s2") is None
+    assert shopping.blocked_message(root(), "browser_exec", {}, "") is None
+
+
+def test_a_typed_yes_lifts_nothing():
+    data = waits()
+    for words in ("yes go ahead and buy it", "pay", "[Hermes HQ order: pay]", f"please [Hermes HQ order {ORDER_ID}: pay]"):
+        assert shopping.note_decision(data, words, "s1") is None
+        assert shopping.blocked_message(data, "browser_click", {}, "s1")
+
+
+def test_pay_on_the_card_lifts_it():
+    data = waits()
+    shopping.note_decision(data, f"[Hermes HQ order {ORDER_ID}: pay]\nPlace this order now.", "s1")
+    assert shopping.blocked_message(data, "browser_click", {}, "s1") is None
+
+
+def test_cancel_on_the_card_lifts_it():
+    data = waits()
+    shopping.note_decision(data, f"[Hermes HQ order {ORDER_ID}: cancel]\nDon't place this order.", "s1")
+    assert shopping.blocked_message(data, "browser_click", {}, "s1") is None
+
+
+def test_an_answer_for_another_id_or_chat_lifts_nothing():
+    data = waits()
+    shopping.note_decision(data, "[Hermes HQ order o-0123abcd: pay]", "s1")
+    shopping.note_decision(data, f"[Hermes HQ order {ORDER_ID}: pay]", "s2")
+    assert shopping.blocked_message(data, "browser_click", {}, "s1")
+    assert shopping.order_state(data, ORDER_ID) == "waiting"
+
+
+def test_a_newer_card_carries_the_block_and_the_old_ones_pay_doesnt_lift_it():
+    data = waits()
+    newer = ordered(total=150.0, charges=None)["id"]
+    assert shopping.blocked_message(data, "browser_click", {}, "s1") == shopping.BLOCKED.format(
+        store="Example Outfitters", total="$150.00")
+    note = shopping.note_decision(data, f"[Hermes HQ order {ORDER_ID}: pay]", "s1")
+    assert "replaced" in note and "Don't place the order" in note
+    assert shopping.blocked_message(data, "browser_click", {}, "s1")
+    shopping.note_decision(data, f"[Hermes HQ order {newer}: pay]", "s1")
+    assert shopping.blocked_message(data, "browser_click", {}, "s1") is None
+
+
+def test_a_restart_keeps_the_block():
+    data = waits()
+    # A new process: a fresh copy of the module, reading the same file.
+    spec = importlib.util.spec_from_file_location("hermes_hq_shopping_after_restart", HERE / "shopping.py")
+    again = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(again)
+    assert again.blocked_message(data, "browser_click", {}, "s1")
+    again.note_decision(data, f"[Hermes HQ order {ORDER_ID}: pay]", "s1")
+    assert shopping.blocked_message(data, "browser_click", {}, "s1") is None
+    state = json.loads((data / shopping.STATE).read_text())
+    assert state["version"] == 1 and state["orders"][ORDER_ID]["state"] == "pay"
+    assert state["orders"][ORDER_ID]["total"] == 140.39 and state["orders"][ORDER_ID]["store"] == "Example Outfitters"
+    assert oct((data / shopping.STATE).stat().st_mode & 0o777) == "0o600"
+    assert not list(data.glob("*.tmp"))
+
+
+def test_a_card_nobody_answers_for_a_day_lapses():
+    data = root()
+    shopping.remember_order(data, "s1", ORDER_ID, "Example Outfitters", 140.39, "USD", now=1000.0)
+    assert shopping.blocked_message(data, "browser_click", {}, "s1", now=1000.0 + shopping.LAPSE - 1)
+    later = 1000.0 + shopping.LAPSE + 1
+    assert shopping.blocked_message(data, "browser_click", {}, "s1", now=later) is None
+    note = shopping.note_decision(data, f"[Hermes HQ order {ORDER_ID}: pay]", "s1", now=later)
+    assert "expired" in note and "new card" in note
+    assert shopping.order_state(data, ORDER_ID, now=later) == "lapsed"
+
+
+@pytest.mark.parametrize("junk", ["{not json", "[]", '{"orders": []}', "\x00\xff"])
+def test_a_corrupt_file_locks_nothing(junk):
+    data = root()
+    (data / shopping.STATE).write_text(junk)
+    assert shopping.blocked_message(data, "browser_click", {}, "s1") is None
+    assert ordered()["order"] == "waiting"      # and the next card writes a good file
+    assert shopping.blocked_message(data, "browser_click", {}, "s1")
+
+
+def test_shopping_off_switches_the_block_off():
+    data = waits()
+    (data / shopping.SWITCH).touch()
+    assert shopping.blocked_message(data, "browser_click", {}, "s1") is None
+    (data / shopping.SWITCH).unlink()
+    assert shopping.blocked_message(data, "browser_click", {}, "s1")
+
+
+def test_the_teaching_text_says_the_browser_is_locked():
+    assert "locked" in shopping.PRODUCTS_SCHEMA["description"]
+    assert "every browser action in this chat is refused" in shopping.ORDER_SCHEMA["description"]
+    assert "locked" in shopping.WAITING_NOTE
