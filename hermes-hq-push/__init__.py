@@ -364,6 +364,18 @@ def _draft_veto(tool_name, args, session_id):
     return {"action": "block", "message": message}
 
 
+def transform_tool_result(tool_name="", result=None, task_id="", **kwargs):
+    """[0.9.62] A browser_vault call is over: a sign-in frame it used is let go, and "no code field" says the person
+    can't type into the page (gateway_logins.vault_result). Every other tool's result is left alone."""
+    if tool_name != "browser_vault":
+        return None
+    try:
+        return gateway_logins.vault_result(tool_name, result, task_id or "default")
+    except Exception:
+        log.debug("hermes-hq-push: vault result left as it was", exc_info=True)
+        return None
+
+
 def _named_site(tool_name, args, task_id):
     """[0.9.44] A login or code that names its site is asked for that site's tab only (gateway_logins.named_tab)."""
     try:
@@ -464,6 +476,12 @@ def _gateway_logins():
         log.info("hermes-hq-push: logins asked in gateway turns %s", gateway_logins.install_prompts(push.data_dir()))
     except Exception:
         log.debug("hermes-hq-push: logins asked in gateway turns not installed", exc_info=True)
+    try:  # [0.9.62] a sign-in that sits in a frame of an open tab (DoorDash's identity.doordash.com), for a saved
+        # login's fill too (not only a login or code the bot names, which installed the tab pick on first use)
+        log.info("hermes-hq-push: sign-in frames %s, named tabs %s", gateway_logins.install_frames(),
+                 gateway_logins.install_named_tab())
+    except Exception:
+        log.debug("hermes-hq-push: sign-in frames not installed", exc_info=True)
     try:  # [job-asks] the gateway's local chats; in the server it steps aside at each call (gateway_logins._serving)
         log.info("hermes-hq-push: questions in job turns %s", gateway_logins.install_job_asks(push.data_dir()))
     except Exception:
@@ -609,6 +627,7 @@ def register(ctx):
     ctx.register_hook("pre_llm_call", pre_llm_call)
     ctx.register_hook("post_llm_call", post_llm_call)
     ctx.register_hook("transform_llm_output", transform_llm_output)
+    ctx.register_hook("transform_tool_result", transform_tool_result)
     ctx.register_hook("on_session_end", on_session_end)
     _device_tools(ctx)
     _tasks_tools(ctx)
