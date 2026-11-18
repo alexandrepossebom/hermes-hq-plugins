@@ -92,6 +92,9 @@ _media_spec.loader.exec_module(cron_media)
 _access_spec = importlib.util.spec_from_file_location("hermes_hq_device_access", Path(__file__).with_name("device_access.py"))
 device_access = importlib.util.module_from_spec(_access_spec)
 _access_spec.loader.exec_module(device_access)
+_show_spec = importlib.util.spec_from_file_location("hermes_hq_push_show_first", Path(__file__).with_name("show_first.py"))
+show_first = importlib.util.module_from_spec(_show_spec)
+_show_spec.loader.exec_module(show_first)
 if "hermes_hq_drafts" in sys.modules:   # one copy for this process: the tool, the guard and the route share it
     drafts = sys.modules["hermes_hq_drafts"]
 else:
@@ -250,6 +253,10 @@ def on_human_input_resolved(**kwargs):
 
 def pre_llm_call(platform="", parent_session_id="", user_message=None, conversation_history=None, session_id="",
                  turn_id="", **kwargs):
+    try:  # [show-first] each turn starts with nothing made in it
+        show_first.note_turn(session_id)
+    except Exception:
+        pass
     try:  # [cron-media] every process: a Bot Chat job's hand-off can run in the messaging gateway too
         cron_media.note_turn(session_id, turn_id, user_message)
     except Exception:
@@ -322,11 +329,42 @@ def _desktop_theme():
 
 def pre_tool_call(tool_name="", args=None, **kwargs):
     verdict = (_veto(tool_name, args) or _ideas_veto(tool_name, kwargs.get("session_id"))
-               or _draft_veto(tool_name, args, kwargs.get("session_id")) or _job_clarify(tool_name))
+               or _draft_veto(tool_name, args, kwargs.get("session_id")) or _show_first(tool_name, args, kwargs)
+               or _job_clarify(tool_name))
     if verdict is None:
         _named_site(tool_name, args, kwargs.get("task_id"))
         _live_step(tool_name, args, kwargs)
     return verdict
+
+
+def _show_first(tool_name, args, kwargs):
+    """[show-first] A clarify while a picture the bot made this turn is still unseen is held once (show_first.py)."""
+    try:
+        verdict = show_first.check(tool_name, args, kwargs.get("session_id"))
+    except Exception:
+        log.debug("hermes-hq-push: show-first check failed", exc_info=True)
+        return None
+    if verdict:
+        log.info("hermes-hq-push: clarify held: the picture it asks about isn't in the chat yet")
+    return verdict
+
+
+def post_api_request(session_id="", assistant_message=None, **kwargs):
+    """[show-first] The bot's words with each model call: a MEDIA line shows what it made (show_first.note_text)."""
+    try:
+        show_first.note_text(session_id, getattr(assistant_message, "content", None))
+    except Exception:
+        log.debug("hermes-hq-push: show-first text not noted", exc_info=True)
+    return None
+
+
+def on_interim_message(session_id="", text="", **kwargs):
+    """[show-first] Words the bot sent mid-turn (show_first.note_text)."""
+    try:
+        show_first.note_text(session_id, text)
+    except Exception:
+        log.debug("hermes-hq-push: show-first interim not noted", exc_info=True)
+    return None
 
 
 def _job_clarify(tool_name):
@@ -607,6 +645,8 @@ def register(ctx):
     ctx.register_hook("on_human_input_request", on_human_input_request)
     ctx.register_hook("on_human_input_resolved", on_human_input_resolved)
     ctx.register_hook("pre_llm_call", pre_llm_call)
+    ctx.register_hook("post_api_request", post_api_request)
+    ctx.register_hook("on_interim_message", on_interim_message)
     ctx.register_hook("post_llm_call", post_llm_call)
     ctx.register_hook("transform_llm_output", transform_llm_output)
     ctx.register_hook("on_session_end", on_session_end)
