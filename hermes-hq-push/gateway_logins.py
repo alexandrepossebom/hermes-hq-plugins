@@ -309,13 +309,42 @@ SENT_CODE = ("Not asked yet. If the page says the code was emailed or texted and
              "uses the code saved in the password manager, or asks the person.")
 
 
+_site_match_module = None
+
+
+def _site_match():
+    """site_match.py beside this file (the add-on's folder is not a package Hermes imports by name)."""
+    global _site_match_module
+    if _site_match_module is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("hermes_hq_push_site_match_logins", Path(__file__).with_name("site_match.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _site_match_module = module
+    return _site_match_module
+
+
+def _code_site(args: dict) -> str:
+    """The site a code is for, one name however the bot says it (0.9.62): DoorDash's was asked as identity.doordash.com,
+    then www.doordash.com, and each was sent back to look in the mail again. A saved login's handle is its own."""
+    named = args.get("origin") or args.get("url")
+    origin = site_origin(named) if named else None
+    if origin is None:
+        return str(named or args.get("handle") or "").strip().lower()
+    from urllib.parse import urlsplit
+    host = urlsplit(origin).hostname or ""
+    try:
+        return _site_match().site(host) or host
+    except Exception:
+        return host
+
+
 def sent_code(tool_name: str, args, who: str, now: float | None = None) -> str | None:
     """The message a bot gets the first time it asks for a site's code in a turn's chat, else None."""
     if tool_name != "browser_vault" or not isinstance(args, dict) or str(args.get("action") or "") != "enter_code":
         return None
     now = time.time() if now is None else now
-    site = str(args.get("origin") or args.get("url") or args.get("handle") or "").strip().lower()
-    key = (str(who or ""), site)
+    key = (str(who or ""), _code_site(args))
     for old in [k for k, at in _code_asked.items() if now - at > CODE_LOOK]:
         _code_asked.pop(old, None)
     if key in _code_asked:
@@ -416,15 +445,30 @@ def named_tab(vault, original):
     email-first sign-in has no password field yet). None open: NamedSiteNotOpen, so nobody is asked. A page backend
     (the desktop's in-app browser, a plugin browser) is the bot's own page: it must already be on the named site."""
     def focus(task_id, origin, kind):
+        frame_done(task_id)   # [0.9.62] a frame kept by an earlier vault call never outlives it
         named = _take_named(task_id) if not origin and kind in ("login", "otp") else None
         if named is None:
-            return original(task_id, origin, kind)
+            focused = original(task_id, origin, kind)
+            if focused or not origin or kind not in ("login", "otp"):
+                return focused
+            # [0.9.62] a saved login's own site, in a frame of an open tab: that exact site only (its binding is exact)
+            framed = frame_focus(vault, task_id, origin, kind, same_site=False)
+            return framed[0] if framed is not None else None
         backend = getattr(vault, "_page_backend", None)
         if callable(backend) and backend(task_id) is not None:
             if vault._current_page_origin(task_id) == named:
                 return named
-        elif original(task_id, named, kind) or original(task_id, named, ""):
+        elif original(task_id, named, kind):
             return named
+        else:
+            framed = frame_focus(vault, task_id, named, kind)   # [0.9.62] the sign-in is a frame in an open tab
+            if framed is not None and framed[1]:
+                return framed[0]
+            if original(task_id, named, ""):
+                frame_done(task_id)
+                return named
+            if framed is not None:
+                return framed[0]
         what = "login" if kind == "login" else "code"
         raise NamedSiteNotOpen(f"Not asked: no browser tab is open on {named}, the site this {what} is for. Open its "
                                f"sign-in page, then call browser_vault again with origin set to that page's URL.")
@@ -433,6 +477,222 @@ def named_tab(vault, original):
     focus.__wrapped__ = original
     focus.__doc__ = original.__doc__
     return focus
+
+
+# MARK: A sign-in inside a frame (0.9.62)
+
+# Owner, 2026-11-18, at DoorDash's code: "It isnt here in the app". DoorDash's sign-in is a frame from
+# identity.doordash.com inside the www.doordash.com tab, and Hermes's vault reads and writes whole tabs only. Named
+# identity.doordash.com, the code was "no browser tab is open"; named www.doordash.com, "no code field"; the bot then
+# told the owner to type the code into a page he can't see from his phone. Chrome keeps a frame of the page's own
+# site in the page's process (no target of its own), so the frame is reached through the tab: a script world of its
+# own inside the frame, which shares the frame's page (its inputs, its origin) and none of its scripts. A frame from
+# another site has its own target and is reached directly. Which frame: one on the named site; failing that, one of
+# the same site (site_match: www. and identity. of doordash.com) holding the form asked for. The vault's own checks all
+# still run inside the frame: the origin it names to the person and binds a saved login to is the frame's, and its
+# fill re-checks that origin in the frame just before writing. The frame is the vault's page for that one call only.
+FRAME_MARK = "_hermes_hq_frame_eval"
+FRAME_TTL = 10 * 60.0   # a code or an unlock waits for the person up to 5 minutes (METHODS), a login 10
+_frames: dict[str, dict] = {}
+_frames_lock = threading.Lock()
+
+
+def _covers(named: str, origin: str) -> bool:
+    """``origin`` is another host of the named site (site_match.covers: same scheme and port, never shared hosting)."""
+    try:
+        return bool(_site_match().covers(named, origin))
+    except Exception:
+        return False
+
+
+def _frame_origin(frame: dict) -> str | None:
+    return site_origin(frame.get("securityOrigin") or frame.get("url"))
+
+
+def _frames_in(tree: dict, top_too: bool):
+    """Each frame of a ``Page.getFrameTree`` (the tab's own top frame only for a frame's own target)."""
+    stack = [(tree, True)]
+    while stack:
+        node, top = stack.pop()
+        stack.extend((child, False) for child in reversed(node.get("childFrames") or []))
+        if top_too or not top:
+            yield node.get("frame") or {}
+
+
+def frame_focus(vault, task_id, named: str, kind: str, *, same_site: bool = True):
+    """Point the vault's page at a frame on ``named`` in an open tab: ``(the frame's origin, holds the form)``, else
+    None. A frame on the named site wins; with ``same_site``, one of the same site counts when it holds the form."""
+    ensure = getattr(vault, "_ensure_supervisor", None)
+    if not callable(ensure) or install_frames() not in ("installed", "already"):
+        return None
+    try:   # anything amiss (an older vault, a browser gone mid-look) leaves the vault on whole tabs, as before
+        return _frame_scan(vault, ensure, task_id, named, kind, same_site)
+    except Exception:
+        log.debug("hermes-hq-push: sign-in frames not looked at", exc_info=True)
+        return None
+
+
+def _frame_scan(vault, ensure, task_id, named: str, kind: str, same_site: bool):
+    from tools.browser_supervisor import SUPERVISOR_REGISTRY
+
+    supervisor = ensure(task_id)
+    if supervisor is None:
+        return None
+    probe = (getattr(vault, "_TAB_PROBES", None) or {}).get(kind)
+    cap = SUPERVISOR_REGISTRY.capture(task_id)
+    best, attached, kept = None, [], None   # best: (rank, session, context, origin, holds the form)
+    try:
+        targets = cap.call("Target.getTargets")["result"]["targetInfos"]
+        for target in targets:
+            if target.get("type") not in ("page", "iframe") or not str(target.get("url") or "").startswith(("http://", "https://")):
+                continue
+            session = cap.call("Target.attachToTarget", {"targetId": target["targetId"], "flatten": True})["result"]["sessionId"]
+            attached.append(session)
+            try:
+                tree = cap.call("Page.getFrameTree", session_id=session)["result"]["frameTree"]
+            except RuntimeError:
+                continue
+            for frame in _frames_in(tree, top_too=target.get("type") == "iframe"):
+                origin = _frame_origin(frame)
+                if origin is None or (origin != named and not (same_site and probe and _covers(named, origin))):
+                    continue
+                try:   # a frame of another process says so here; it is reached from its own target instead
+                    context = cap.call("Page.createIsolatedWorld", {"frameId": frame["id"], "worldName": "hermes-hq-vault"},
+                                       session_id=session)["result"]["executionContextId"]
+                except RuntimeError:
+                    continue
+                holds = bool(probe) and bool(_evaluate(cap, session, context, probe).get("result"))
+                rank = (0 if holds else 2) + (0 if origin == named else 1)
+                if (holds or origin == named) and (best is None or rank < best[0]):
+                    best = (rank, session, context, origin, holds)
+            if best is not None and best[0] == 0:
+                break
+        if best is None:
+            return None
+        _, kept, context, origin, holds = best
+        with _frames_lock:
+            _frames[str(task_id or "default")] = {"supervisor": supervisor, "cap": cap, "session": kept,
+                                                  "context": context, "origin": origin, "at": time.monotonic()}
+    finally:
+        for session in attached:
+            if session != kept:
+                with _quiet():
+                    cap.call("Target.detachFromTarget", {"sessionId": session})
+    log.info("hermes-hq-push: the vault reads the sign-in frame of an open tab for this call")
+    return origin, holds
+
+
+def frame_done(task_id) -> None:
+    """The vault call that used a frame is over: its page is the tab's again."""
+    with _frames_lock:
+        kept = _frames.pop(str(task_id or "default"), None)
+    if kept is not None:
+        with _quiet():
+            kept["cap"].call("Target.detachFromTarget", {"sessionId": kept["session"]}, timeout=3.0)
+
+
+class _quiet:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, kind, exc, tb):
+        return kind is not None and issubclass(kind, Exception)
+
+
+def _evaluate(cap, session: str, context, expression: str, *, by_value: bool = True, await_promise: bool = True,
+              timeout: float = 10.0) -> dict:
+    """``Runtime.evaluate`` in the frame's world, answered the way the supervisor's ``evaluate_runtime`` answers."""
+    params = {"expression": expression, "returnByValue": by_value, "awaitPromise": await_promise, "userGesture": True}
+    if context is not None:
+        params["contextId"] = context
+    try:
+        reply = cap.call("Runtime.evaluate", params, session_id=session, timeout=timeout)
+    except Exception as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    payload = reply.get("result", {}) if isinstance(reply, dict) else {}
+    details = payload.get("exceptionDetails")
+    if details:
+        text = details.get("text") or "JavaScript exception"
+        description = (details.get("exception") or {}).get("description")
+        return {"ok": False, "error": f"{text}: {description}" if description else text}
+    value = payload.get("result", {})
+    kind = value.get("type", "undefined")
+    if "value" in value:
+        result = value["value"]
+    elif kind == "undefined":
+        result = None
+    else:
+        result = value.get("description") or value.get("unserializableValue")
+    return {"ok": True, "result": result, "result_type": kind}
+
+
+def _frame_of(supervisor):
+    with _frames_lock:
+        for task_id, kept in list(_frames.items()):
+            if kept["supervisor"] is not supervisor:
+                continue
+            if time.monotonic() - kept["at"] > FRAME_TTL or not kept["cap"].is_valid():
+                _frames.pop(task_id, None)
+                return None
+            return kept
+    return None
+
+
+def install_frames() -> str:
+    """Let Hermes's supervisor evaluate in a kept frame (frame_focus), once per process: "installed", "already" or
+    "absent" (a Hermes without the supervisor's capture seam: the vault stays on whole tabs, as before)."""
+    try:
+        from tools.browser_supervisor import SUPERVISOR_REGISTRY, CDPSupervisor
+    except ImportError:
+        return "absent"
+    original = getattr(CDPSupervisor, "evaluate_runtime", None)
+    if not callable(original) or not callable(getattr(SUPERVISOR_REGISTRY, "capture", None)):
+        return "absent"
+    if getattr(original, FRAME_MARK, False):
+        return "already"
+
+    def evaluate_runtime(self, expression, *, return_by_value=True, await_promise=True, timeout=10.0):
+        kept = _frame_of(self)
+        if kept is None:
+            return original(self, expression, return_by_value=return_by_value, await_promise=await_promise, timeout=timeout)
+        result = _evaluate(kept["cap"], kept["session"], kept["context"], expression, by_value=return_by_value,
+                           await_promise=await_promise, timeout=timeout)
+        if not result.get("ok") and "reference chain is too long" in str(result.get("error") or "").lower():
+            result = _evaluate(kept["cap"], kept["session"], kept["context"], expression, by_value=False,
+                               await_promise=await_promise, timeout=timeout)
+        return result
+
+    setattr(evaluate_runtime, FRAME_MARK, True)
+    evaluate_runtime.__wrapped__ = original
+    evaluate_runtime.__doc__ = original.__doc__
+    CDPSupervisor.evaluate_runtime = evaluate_runtime
+    return "installed"
+
+
+# The vault found no code box anywhere (not in the tab, not in its frames). Hermes says to tell the person to finish on
+# their device; a bot read that as "type it into the page", which the person can't see from the app.
+NO_CODE_FIELD = (" The person can't see or type into this browser from the Hermes HQ app, so never ask them to type "
+                 "a code into the page. If the page does show a code box, call browser_vault action=enter_code again "
+                 "with origin set to the site in the page's address (or its sign-in frame's); if that still fails, "
+                 "use browser_ask_user so they can take over the browser.")
+
+
+def vault_result(tool_name: str, result, task_id) -> str | None:
+    """transform_tool_result for browser_vault: the call's frame is released, and a no_code_field answer says the
+    person can't reach the page. None leaves the result as it is."""
+    if tool_name != "browser_vault":
+        return None
+    frame_done(task_id)
+    if not isinstance(result, str) or '"no_code_field"' not in result:
+        return None
+    try:
+        parsed = json.loads(result)
+    except ValueError:
+        return None
+    if not isinstance(parsed, dict) or parsed.get("error_type") != "no_code_field":
+        return None
+    parsed["error"] = str(parsed.get("error") or "") + NO_CODE_FIELD
+    return json.dumps(parsed)
 
 
 # MARK: The server's side

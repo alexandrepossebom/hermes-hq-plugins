@@ -256,6 +256,17 @@ made, its history) and what its bot writes with `tasks_update(page={summary, nex
 next, and parts such as options compared in a table, the numbers that matter, or what it found. The bot writes words,
 never HTML. The `task-page` skill (hermes-hq-push:task-page) tells bots what goes on it.
 
+Version 0.9.62 reaches a **sign-in inside a page**. Many sites show their sign-in as a frame from another of their
+addresses inside the page (DoorDash's comes from identity.doordash.com inside www.doordash.com), and Hermes's vault
+only read whole tabs: asked for that frame's code it said no tab was open, and asked for the page's it found no code
+box. Now a login or code the bot names goes into the frame of an open tab on that site, or, when the bot names the page,
+into a frame of the same site that holds the form (never another site's, and never shared hosting such as
+`*.github.io`). The card on your phone names the frame's own address, a saved login still fills only on the address it
+was saved for, and the fill re-checks that address inside the frame just before it writes. The frame is used for that
+one call only. Asking for a code also sends the bot to look in your mail once per site, however it names the site, and
+a "no code field" answer now tells the bot you can't type into its browser from the app, so it hands you the browser
+instead of asking you to type into a page you can't see.
+
 Version 0.9.60 adds **shopping cards**. Asked to find, compare or recommend something to buy, a bot shows the products
 it found on store pages as product cards in the Hermes HQ app (its `show_products` tool): photo, name, price (the old
 price struck through), store and rating, and a tap opens the product's page with the bot's reasons, other stores'
