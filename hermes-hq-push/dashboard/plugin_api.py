@@ -77,6 +77,13 @@ else:
     drafts = importlib.util.module_from_spec(_drafts_spec)
     sys.modules["hermes_hq_drafts"] = drafts
     _drafts_spec.loader.exec_module(drafts)
+if "hermes_hq_shopping" in sys.modules:
+    shopping = sys.modules["hermes_hq_shopping"]
+else:
+    _shopping_spec = importlib.util.spec_from_file_location("hermes_hq_shopping", Path(__file__).parents[1] / "shopping.py")
+    shopping = importlib.util.module_from_spec(_shopping_spec)
+    sys.modules["hermes_hq_shopping"] = shopping
+    _shopping_spec.loader.exec_module(shopping)
 
 if "hermes_hq_terminal" in sys.modules:
     terminal = sys.modules["hermes_hq_terminal"]
@@ -93,6 +100,18 @@ else:
     grok_live = importlib.util.module_from_spec(_grok_live_spec)
     sys.modules["hermes_hq_grok_live"] = grok_live
     _grok_live_spec.loader.exec_module(grok_live)
+
+if "hermes_hq_onepassword_allow" in sys.modules:
+    onepassword_allow = sys.modules["hermes_hq_onepassword_allow"]
+else:
+    _allow_spec = importlib.util.spec_from_file_location("hermes_hq_onepassword_allow", Path(__file__).parents[1] / "onepassword_allow.py")
+    onepassword_allow = importlib.util.module_from_spec(_allow_spec)
+    sys.modules["hermes_hq_onepassword_allow"] = onepassword_allow
+    _allow_spec.loader.exec_module(onepassword_allow)
+try:  # the server's own turns and its Passwords page read a key saved a moment ago
+    onepassword_allow.log.info("hermes-hq-push: allow in 1Password %s", onepassword_allow.install())
+except Exception:
+    onepassword_allow.log.debug("hermes-hq-push: allow in 1Password not installed", exc_info=True)
 
 if "hermes_hq_tasks" in sys.modules:
     tasks = sys.modules["hermes_hq_tasks"]
@@ -197,7 +216,9 @@ class ApprovalIn(BaseModel):
 def status():
     """The app probes this to offer push; a 404 means the plugin isn't installed or enabled."""
     return {**push.status_body(push.data_dir(), push.sender_from_env()), **terminal.status(push.data_dir()),
-            **tasks.status(), **drafts.status(push.data_dir()), **plugin_updates.status()}
+            **tasks.status(), **drafts.status(push.data_dir()), **shopping.status(push.data_dir()),
+            **plugin_updates.status(),
+            **onepassword_allow.status()}
 
 
 class ScanFindingIn(BaseModel):
@@ -243,10 +264,94 @@ def plugin_update_job(job: str):
         raise HTTPException(error.status_code, error.detail) from None
 
 
+# ---------------------------------------------------------------------------
+# Allow in 1Password (0.9.59, `onePasswordAllow` in status; onepassword_allow.py): the 1Password app on this computer
+# asks its person to allow it, they pick the vaults, and a read-only key for those vaults is saved for the bots. The
+# key itself never appears in an answer here.
+# ---------------------------------------------------------------------------
+
+class AllowStartIn(BaseModel):
+    account: str = Field(default="", max_length=64)
+    # From a phone: the 1Password account password, used once on this computer to sign in and make the key. Never
+    # logged or kept (onepassword_allow.sign_in).
+    password: str | None = Field(default=None, max_length=1024)
+
+
+class AllowFinishIn(BaseModel):
+    vaults: list[Annotated[str, Field(max_length=64)]] = Field(default_factory=list, max_length=60)
+    create: bool = False
+
+
+def _allow_call(call):
+    try:
+        return call()
+    except onepassword_allow.AllowError as error:
+        return JSONResponse(status_code=error.status_code, content={"ok": False, "detail": error.detail, "code": error.code})
+
+
+@router.get("/vault/onepassword")
+def onepassword_state(profile: str = ""):
+    return onepassword_allow.state(push.data_dir(), profile)
+
+
+@router.post("/vault/onepassword/allow")
+def onepassword_allow_start(body: AllowStartIn):
+    return _allow_call(lambda: onepassword_allow.start(push.data_dir(), body.account, password=body.password or None))
+
+
+@router.get("/vault/onepassword/allow/{job}")
+def onepassword_allow_job(job: str):
+    return _allow_call(lambda: onepassword_allow.job(job))
+
+
+@router.post("/vault/onepassword/allow/{job}")
+def onepassword_allow_finish(job: str, body: AllowFinishIn):
+    # Never ``move_private`` from here: the owner (2026-11-16) wants logins given one at a time, not a vault moved.
+    return _allow_call(lambda: onepassword_allow.finish(job, body.vaults, body.create))
+
+
+class MoveStartIn(BaseModel):
+    """One login out of the person's own vaults into the one the bots read, on their approval (0.9.59)."""
+    password: str = Field(max_length=1024)
+    origin: str = Field(max_length=2048)
+
+
+class MoveFinishIn(BaseModel):
+    item: str = Field(max_length=64)
+
+
+@router.post("/vault/onepassword/move")
+def onepassword_move_start(body: MoveStartIn):
+    return _allow_call(lambda: onepassword_allow.move_start(push.data_dir(), body.password, body.origin))
+
+
+@router.get("/vault/onepassword/move/{job}")
+def onepassword_move_job(job: str):
+    return _allow_call(lambda: onepassword_allow.job(job))
+
+
+@router.post("/vault/onepassword/move/{job}")
+def onepassword_move_finish(job: str, body: MoveFinishIn):
+    return _allow_call(lambda: onepassword_allow.move_finish(job, body.item))
+
+
+@router.delete("/vault/onepassword")
+def onepassword_disconnect():
+    return _allow_call(lambda: onepassword_allow.disconnect(push.data_dir()))
+
+
 @router.put("/drafts/cards")
 def draft_cards():
     """[drafts] An app that draws draft cards uses this computer: bots get draft_message from now on (drafts.py)."""
     drafts.note_cards(push.data_dir())
+    return {"ok": True}
+
+
+@router.put("/shopping/cards")
+def shopping_cards():
+    """[shopping] An app that draws product and order cards uses this computer: bots get show_products and
+    order_card from now on (shopping.py)."""
+    shopping.note_cards(push.data_dir())
     return {"ok": True}
 
 
