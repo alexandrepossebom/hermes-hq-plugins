@@ -116,9 +116,14 @@ def _read_private(path, limit):
 
 def load_config(data_dir):
     """The owner's choices in ``<plugin-data>/session-pr.json``. Anything malformed counts as unset."""
-    empty = {'public_repos': frozenset(), 'repos': ()}
     if not data_dir:
-        return empty
+        return {'public_repos': frozenset(), 'repos': (), 'by_hand': ()}
+    try:
+        linked = marks().repos(data_dir)       # the repositories linked from the app, per project
+    except Exception:
+        linked = ()
+    empty = {'public_repos': frozenset(r['public_repo'].lower() for r in linked if r['public_repo']),
+             'repos': linked, 'by_hand': ()}
     path = Path(data_dir) / CONFIG_NAME
     try:
         if path.is_symlink() or not path.is_file() or path.stat().st_size > 65536:
@@ -131,7 +136,10 @@ def load_config(data_dir):
     repos = raw.get('public_repos', [])
     if not isinstance(repos, list) or not all(_valid_repo(r) for r in repos):
         return empty
-    return {'public_repos': frozenset(r.lower() for r in repos), 'repos': _local().load_repos(raw.get('repos'))}
+    by_hand = _local().load_repos(raw.get('repos'))
+    paths = {r['path'] for r in linked}
+    return {'public_repos': frozenset(r.lower() for r in repos) | empty['public_repos'],
+            'repos': linked + tuple(r for r in by_hand if r['path'] not in paths), 'by_hand': by_hand}
 
 
 def owner_token_path(data_dir, subject):
@@ -180,6 +188,45 @@ def _sibling(name, file):
 
 def _local():
     return _sibling('hermes_hq_session_pr_local', 'session_pr_local.py')
+
+
+def marks():
+    """The owner's own marks and links (session_pr_marks)."""
+    return _sibling('hermes_hq_session_pr_marks', 'session_pr_marks.py')
+
+
+TIPS_NAME = 'session-pr-tips.json'     # the tip of each branch seen waiting: tells merged from given up later
+_tips = {}                              # data dir -> {"<repo path>\n<branch>": commit}
+
+
+def _tips_for(data_dir):
+    if not data_dir:
+        return None
+    with _lock:
+        if data_dir not in _tips:
+            try:
+                saved = json.loads((Path(data_dir) / TIPS_NAME).read_text())
+                _tips[data_dir] = {k: v for k, v in saved.items() if isinstance(k, str) and isinstance(v, str)} \
+                    if isinstance(saved, dict) else {}
+            except (OSError, ValueError, UnicodeDecodeError):
+                _tips[data_dir] = {}
+        return _tips[data_dir]
+
+
+def _save_tips(data_dir, tips, before):
+    if tips is None or dict(tips) == before:
+        return
+    with _lock:
+        for key in list(tips)[:-3000]:
+            del tips[key]
+        try:
+            path = Path(data_dir) / TIPS_NAME
+            temp = path.with_name(f'{path.name}.{os.getpid()}.tmp')
+            temp.write_text(json.dumps(tips))
+            os.chmod(temp, 0o600)
+            os.replace(temp, path)
+        except OSError:
+            pass
 
 
 def created_in(conn, session_id):
@@ -364,7 +411,15 @@ def _resolve_created(created, access=None):
     return newest
 
 
-def _resolve(created, work, access=None, repos=()):
+def _resolve(created, work, access=None, repos=(), tips=None, closed=False):
+    answer = _computed(created, work, access, repos, tips)
+    # The owner's own mark: a label over whatever isn't merged. Work that reached main says so itself.
+    if closed and answer.get('state') in ('none', 'draft', 'unknown', 'closed'):
+        answer = {**answer, 'state': 'closed', 'manual': True}
+    return answer
+
+
+def _computed(created, work, access=None, repos=(), tips=None):
     """Where a session's code changes stand, from the pull requests it opened and its own branches.
 
     Work still waiting comes first: a pull request waiting on GitHub, then a branch not merged yet
@@ -378,7 +433,7 @@ def _resolve(created, work, access=None, repos=()):
     if asked is not None and asked['state'] in ('draft', 'open'):
         return asked
     try:
-        local, unplaced = _local().local_state(work, repos) if work and repos else (None, 0)
+        local, unplaced = _local().local_state(work, repos, tips) if work and repos else (None, 0)
     except Exception:
         local, unplaced = None, 1
     if local is not None:
@@ -399,16 +454,23 @@ def _resolve(created, work, access=None, repos=()):
 
 
 def resolve_batch(items):
-    """*items*: ``{'profile', 'id', 'created', 'work', 'access', 'repos'}`` already authorized and read in one snapshot."""
+    """*items*: ``{'profile', 'id', 'created', 'work', 'access', 'repos', 'data_dir', 'closed'}`` already
+    authorized and read in one snapshot."""
     if len(items) > MAX_BATCH:
         raise ValueError('too many sessions')
+    data_dir = next((item.get('data_dir') for item in items if item.get('data_dir')), None)
+    tips = _tips_for(data_dir)
+    before = dict(tips) if tips is not None else None
 
     def one(item):
         try:
-            result = _resolve(item.get('created'), item.get('work', {}), item.get('access'), item.get('repos') or ())
+            result = _resolve(item.get('created'), item.get('work', {}), item.get('access'), item.get('repos') or (),
+                              tips, bool(item.get('closed')))
         except Exception:
             result = {'state': 'unknown'}
         return {'profile': item['profile'], 'id': item['id'], **result}
 
     with ThreadPoolExecutor(max_workers=4) as pool:
-        return list(pool.map(one, items))
+        out = list(pool.map(one, items))
+    _save_tips(data_dir, tips, before)
+    return out
