@@ -14,8 +14,10 @@ commit id that was checked letter by letter first.
 What it says, per branch:
 
 * ``draft``: the branch has commits that are not in main (work waiting to be merged).
-* ``open``: merged into main, and a ``published_marker`` says main's public copy doesn't have it yet.
-* ``merged``: in main (and public, where a marker is kept). A receipt file names the pull request.
+* ``merged``: in main. Where main is published elsewhere (a ``published_marker``) that step is not a
+  state of its own: the owner reads "merged into main" as merged (0.9.69 showed "open" until the
+  publisher ran, which read as a mistake). Once public, a receipt file names the pull request.
+* ``closed``: the branch was deleted with its commits in no branch and not in main (given up).
 """
 import json
 import os
@@ -276,7 +278,9 @@ def _git(path, *args):
     env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'HOME': os.environ.get('HOME', '/'),
            'GIT_OPTIONAL_LOCKS': '0', 'GIT_TERMINAL_PROMPT': '0', 'GIT_CONFIG_NOSYSTEM': '1', 'LC_ALL': 'C'}
     try:
-        done = subprocess.run([_git_binary, '-C', path, '--no-pager', *args], capture_output=True, text=True,
+        # A repository's own config must not make a read run a program of its choosing.
+        done = subprocess.run([_git_binary, '-C', path, '--no-pager', '-c', 'core.fsmonitor=false',
+                               '-c', 'core.hooksPath=/dev/null', *args], capture_output=True, text=True,
                               timeout=_GIT_TIMEOUT, env=env, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
         return None
@@ -352,10 +356,11 @@ def _merged_answer(repo, snap, commit, branch):
     copy has it yet, and which pull request carried it."""
     answer = {'state': 'merged', 'branch': branch}
     marker = snap['marker']
+    public = True
     if repo['published_marker'] and marker != snap['main']:
-        if marker is None or commit is None or _git(repo['path'], 'merge-base', '--is-ancestor', commit, marker) is None:
-            answer['state'] = 'open'
-    if answer['state'] == 'merged' and commit is not None and snap['receipts']:
+        public = marker is not None and commit is not None \
+            and _git(repo['path'], 'merge-base', '--is-ancestor', commit, marker) is not None
+    if public and commit is not None and snap['receipts']:
         landed = _landed(repo, snap, commit)
         receipt = snap['receipts'].get(landed[:8]) if landed else None
         if receipt:
@@ -377,9 +382,27 @@ def _draft(repo, branch):
 _NOTHING = {'state': 'nothing'}     # the branch is known here and holds no work of its own
 
 
-def _branch_answer(repo, snap, branch, shas):
-    """An answer, ``_NOTHING``, or None when this repository doesn't know the branch at all."""
+def _given_up(repo, snap, commit, branch):
+    """A commit whose branch is gone: merged if main has it, still waiting if another branch carries
+    it (a rename), else closed."""
     path = repo['path']
+    if _git(path, 'merge-base', '--is-ancestor', commit, snap['main']) is not None:
+        return _merged_answer(repo, snap, commit, branch)
+    if (_git(path, 'for-each-ref', '--count=1', '--format=%(refname)', '--contains', commit, 'refs/heads') or '').strip():
+        return _draft(repo, branch)
+    answer = {'state': 'closed', 'branch': branch}
+    if repo['public_repo']:
+        answer['repo'] = repo['public_repo']
+    return answer
+
+
+def _branch_answer(repo, snap, branch, shas, tips=None):
+    """An answer, ``_NOTHING``, or None when this repository doesn't know the branch at all.
+
+    *tips* remembers the tip of each branch seen waiting, so a branch deleted later can still be told
+    apart: merged, or given up."""
+    path = repo['path']
+    memory = f'{path}\n{branch}'
     tip = (_git(path, 'rev-parse', '--verify', '--quiet', f'refs/heads/{branch}^{{commit}}') or '').strip()
     if _SHA.fullmatch(tip):
         if _git(path, 'merge-base', '--is-ancestor', tip, snap['main']) is not None:
@@ -394,17 +417,19 @@ def _branch_answer(repo, snap, branch, shas):
         if ahead is None:
             return None
         if any(line.startswith('+') for line in ahead.splitlines()):
+            if tips is not None and tips.get(memory) != tip:
+                tips[memory] = tip
             return _draft(repo, branch)
         if not ahead.strip():
             return _NOTHING        # nothing of its own (a branch behind main)
         return _merged_answer(repo, snap, None, branch)      # every change is in main under another commit
     # The branch is gone (deleted after its merge, as many do). Its commits, or a merge that names it, say.
     known = [sha for sha in shas if _exists(path, sha)]
+    remembered = tips.get(memory) if tips is not None else None
+    if remembered and _SHA.fullmatch(remembered) and _exists(path, remembered):
+        known.append(remembered)
     if known:
-        newest = known[-1]
-        if _git(path, 'merge-base', '--is-ancestor', newest, snap['main']) is not None:
-            return _merged_answer(repo, snap, newest, branch)
-        return _NOTHING            # a commit on no branch any more: abandoned, not waiting
+        return _given_up(repo, snap, known[-1], branch)
     # A merge commit in main's history that names the branch ("Merge branch 'x'", "… into x").
     named = re.compile(r'(?<![A-Za-z0-9._/-])' + re.escape(branch) + r'(?![A-Za-z0-9_/-])')
     out = _git(path, 'log', '--merges', '--fixed-strings', f'--grep={branch}', '--max-count=20', '--format=%H %s', snap['main'])
@@ -419,10 +444,10 @@ def _exists(path, sha):
     return bool(_SHA.fullmatch(sha)) and _git(path, 'cat-file', '-e', sha + '^{commit}') is not None
 
 
-_RANK = {'draft': 3, 'open': 2, 'merged': 1}
+_RANK = {'draft': 3, 'merged': 2, 'closed': 1}
 
 
-def local_state(work, repos):
+def local_state(work, repos, tips=None):
     """``(answer, unplaced)`` for a session's own work in the owner's repositories. *answer* is None
     when none of it holds work; *unplaced* counts branches no listed repository knows (so "nothing"
     can't be said of them).
@@ -453,9 +478,10 @@ def local_state(work, repos):
                 elif not _plain_branch(branch):
                     cached = None
                 else:
-                    cached = _branch_answer(repo, snap, branch, shas)
-                # A draft or a missing branch can change without main moving (more commits, a new branch).
-                if cached is not None and cached['state'] != 'draft':
+                    cached = _branch_answer(repo, snap, branch, shas, tips)
+                # A draft, a given-up or a missing branch can change without main moving (more commits, a
+                # new branch, a deleted one).
+                if cached is not None and cached['state'] not in ('draft', 'closed'):
                     with _lock:
                         if len(_answer_cache) > 20000:
                             _answer_cache.clear()

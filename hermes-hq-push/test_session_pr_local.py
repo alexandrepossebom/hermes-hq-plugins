@@ -69,20 +69,21 @@ def test_a_branch_with_commits_of_its_own_is_waiting_then_merged(repo):
     assert state(branch('feat/a'), listed(repo)) == ('merged', 0)
 
 
-def test_merged_into_main_but_not_public_yet_is_open(repo):
-    marker = Path(git(repo, 'rev-parse', '--path-format=absolute', '--git-common-dir')) / 'published'
-    marker.write_text(git(repo, 'rev-parse', 'main') + '\n')
+def test_merged_into_main_is_merged_before_it_is_public_and_the_receipt_waits_for_public(repo):
+    common = Path(git(repo, 'rev-parse', '--path-format=absolute', '--git-common-dir'))
+    (common / 'published').write_text(git(repo, 'rev-parse', 'main') + '\n')
     git(repo, 'switch', '-q', '-c', 'feat/a')
     commit(repo, 'a')
     git(repo, 'switch', '-q', 'main')
     git(repo, 'merge', '-q', '--no-ff', '-m', "Merge branch 'feat/a'", 'feat/a')
-    repos = listed(repo, published_marker='published', public_repo='owner/app')
-    answer, _ = local.local_state(branch('feat/a'), repos)
-    assert answer == {'state': 'open', 'branch': 'feat/a', 'repo': 'owner/app'}
-    commit(repo, 'notes')                                    # main moves on; the marker still lags
-    assert state(branch('feat/a'), repos) == ('open', 0)
-    marker.write_text(git(repo, 'rev-parse', 'main') + '\n')  # the publisher caught up
-    assert state(branch('feat/a'), repos) == ('merged', 0)
+    landed = git(repo, 'rev-parse', 'main')
+    (common / 'receipts.jsonl').write_text(json.dumps({'commit': landed[:8], 'url': 'https://github.com/owner/app/pull/42'}) + '\n')
+    repos = listed(repo, published_marker='published', receipts='receipts.jsonl', public_repo='owner/app')
+    local._repo_cache.clear()
+    assert local.local_state(branch('feat/a'), repos)[0] == {'state': 'merged', 'branch': 'feat/a', 'repo': 'owner/app'}
+    (common / 'published').write_text(landed + '\n')         # the publisher caught up: the pull request is named
+    local._repo_cache.clear()
+    assert local.local_state(branch('feat/a'), repos)[0]['number'] == 42
 
 
 def test_a_receipt_names_the_pull_request(repo):
@@ -121,6 +122,45 @@ def test_a_deleted_branch_is_found_by_its_commit_or_by_the_merge_that_names_it(r
     assert state(branch('fix/gone'), listed(repo)) == ('merged', 0)      # no commit id known: the merge's words
     assert state(branch('fix/gon'), listed(repo)) == (None, 1)            # a different name is not it
     assert state(branch('fix/never-existed'), listed(repo)) == (None, 1)
+
+
+def test_a_deleted_unmerged_branch_is_closed_and_a_renamed_one_still_waits(repo):
+    git(repo, 'switch', '-q', '-c', 'fix/dropped')
+    sha = commit(repo, 'a')
+    git(repo, 'switch', '-q', '-c', 'fix/kept')              # the same commit lives on under another name
+    git(repo, 'switch', '-q', 'main')
+    git(repo, 'branch', '-q', '-D', 'fix/dropped')
+    assert state(branch('fix/dropped', sha[:7]), listed(repo)) == ('draft', 0)
+    git(repo, 'branch', '-q', '-D', 'fix/kept')
+    answer, _ = local.local_state(branch('fix/dropped', sha[:7]), listed(repo, public_repo='owner/app'))
+    assert answer == {'state': 'closed', 'branch': 'fix/dropped', 'repo': 'owner/app'}
+    # A merged branch outranks a given-up one: the chat's work did land.
+    git(repo, 'switch', '-q', '-c', 'feat/landed')
+    commit(repo, 'b')
+    git(repo, 'switch', '-q', 'main')
+    git(repo, 'merge', '-q', '--no-ff', '-m', "Merge branch 'feat/landed'", 'feat/landed')
+    work = {'branches': {'feat/landed': [], 'fix/dropped': [sha[:7]]}, 'commits': []}
+    assert state(work, listed(repo)) == ('merged', 0)
+
+
+def test_a_branch_seen_waiting_is_remembered_after_it_is_deleted(repo):
+    """Quiet commits leave no commit id in a chat's history; the tip seen while it waited tells later."""
+    tips = {}
+    git(repo, 'switch', '-q', '-c', 'feat/a')
+    commit(repo, 'a')
+    git(repo, 'switch', '-q', '-c', 'feat/b', 'main')
+    commit(repo, 'b')
+    git(repo, 'switch', '-q', 'main')
+    for name in ('feat/a', 'feat/b'):
+        assert local.local_state(branch(name), listed(repo), tips)[0]['state'] == 'draft'
+    assert len(tips) == 2
+    git(repo, 'merge', '-q', '--no-ff', '-m', 'Release 7', 'feat/a')      # the merge doesn't name the branch
+    git(repo, 'branch', '-q', '-D', 'feat/a'); git(repo, 'branch', '-q', '-D', 'feat/b')
+    local._repo_cache.clear()
+    assert local.local_state(branch('feat/a'), listed(repo), tips)[0]['state'] == 'merged'
+    assert local.local_state(branch('feat/b'), listed(repo), tips)[0]['state'] == 'closed'
+    local._repo_cache.clear()
+    assert local.local_state(branch('feat/b'), listed(repo)) == (None, 1)       # never seen: can't be told
 
 
 def test_squashed_work_counts_as_merged_and_waiting_work_wins(repo):

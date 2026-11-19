@@ -256,6 +256,19 @@ made, its history) and what its bot writes with `tasks_update(page={summary, nex
 next, and parts such as options compared in a table, the numbers that matter, or what it found. The bot writes words,
 never HTML. The `task-page` skill (hermes-hq-push:task-page) tells bots what goes on it.
 
+Version 0.9.70 lets you say two things from the app instead of a file. Mark as Closed on a chat in a coding project
+puts the closed mark on it until you reopen it (`PUT /sessions/pr-mark`, kept in `session-pr-marks.json`): a label
+only, nothing in any repository changes, and work that has since reached main shows as merged regardless. Repository…
+on a project links it to a git repository on this computer (`GET`/`PUT`/`DELETE /sessions/pr-repos`, kept in
+`session-pr-links.json`): the add-on asks git whether the folder is a repository, takes the repository a worktree
+belongs to, picks main (the remote's when this checkout's own is behind it), notices a publisher's
+`hq-public-published` marker, and otherwise reads the public repository from the `origin` remote. Linked
+repositories are read together with any listed by hand. A branch that was deleted with its commits in no other
+branch and not in main now shows as closed; the add-on remembers the tip of each branch it saw waiting
+(`session-pr-tips.json`), so this works for chats whose history holds no commit id. Only the owner may link or
+mark, and only their own chats. Work merged into main now shows merged at once; 0.9.69 showed an open mark until
+main's public copy had it, which read as a mistake (the open mark is a pull request open for review on GitHub).
+
 Version 0.9.69 makes those marks follow your own repositories, for the common case where no chat opens a pull
 request by hand: a chat works on a branch, the branch is merged into main, and main is published elsewhere. List the
 repositories in `plugin-data/hermes-hq-push/session-pr.json`:

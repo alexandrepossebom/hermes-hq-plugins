@@ -10,7 +10,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse
-from pydantic import BaseModel, Field, StrictStr
+from pydantic import BaseModel, Field, StrictBool, StrictStr
 
 if "hermes_hq_push_core" in sys.modules:
     push = sys.modules["hermes_hq_push_core"]
@@ -232,7 +232,9 @@ def status():
     return {**push.status_body(push.data_dir(), push.sender_from_env()), **terminal.status(push.data_dir()),
             **tasks.status(), **drafts.status(push.data_dir()), **shopping.status(push.data_dir()), **asks.status(push.data_dir()),
             **plugin_updates.status(),
-            **onepassword_allow.status(), "sessionPRStatus": session_pr_status.supported()}
+            **onepassword_allow.status(), "sessionPRStatus": session_pr_status.supported(),
+            # 0.9.70: the owner's "closed" mark on a chat, and repositories linked per project from the app.
+            "sessionPRMarks": session_pr_status.supported(), "sessionPRRepos": session_pr_status.supported()}
 
 
 class ScanFindingIn(BaseModel):
@@ -533,20 +535,22 @@ class SessionPRBatchIn(BaseModel):
     sessions: list[SessionPRIn] = Field(max_length=32)
 
 
-@router.post("/sessions/pr-status")
-def sessions_pr_status(body: SessionPRBatchIn, request: Request):
-    """Read-only; the synchronous route runs in FastAPI's worker pool, not its event loop.
+class SessionPRMarkIn(BaseModel):
+    profile: StrictStr = Field(max_length=64)
+    id: StrictStr = Field(max_length=256)
+    closed: StrictBool
 
-    Each profile is authorized and its history read on one read-only connection inside one read
-    transaction, so the rows that prove ownership are the rows the pull requests come from. GitHub
-    is asked (session_pr_status) only after every snapshot is closed. Every session the caller owns
-    gets an answer: `none` when it opened no pull request, `unknown` when that can't be told.
-    """
-    if not session_pr_status.supported():
-        raise HTTPException(501, "This Hermes can't report session pull requests")
-    rows = [{"profile": row.profile, "id": row.id} for row in body.sessions]
-    if any(not session_pr_status.valid_identity(row['profile'], row['id']) for row in rows):
-        raise HTTPException(422, "Invalid profile or session id")
+
+class SessionPRRepoIn(BaseModel):
+    project: StrictStr = Field(min_length=1, max_length=1024)
+    path: StrictStr = Field(min_length=1, max_length=1024)
+    public_repo: StrictStr | None = Field(default=None, max_length=141)
+
+
+def _pr_owned(request, rows, visit):
+    """Call ``visit(conn, profile, sid, actor)`` for each of *rows* the caller owns, and return what
+    it returned, in the rows' order. Each profile is judged and visited on one read-only connection
+    inside one read transaction, so the rows that prove ownership are the rows the visit reads."""
     import sqlite3
     from contextlib import closing
     from hermes_cli.web_server_sessions import _session_mutation_context
@@ -556,8 +560,6 @@ def sessions_pr_status(body: SessionPRBatchIn, request: Request):
     from hermes_state_local_migration import legacy_history_row
     from hermes_state_mutation_binding import BINDING_PREFIX, binding_names
 
-    data_dir = push.data_dir()
-    config = session_pr_status.load_config(data_dir)
     profiles = {}
     for index, row in enumerate(rows):
         profiles.setdefault(row['profile'], []).append((index, row['id']))
@@ -619,7 +621,6 @@ def sessions_pr_status(body: SessionPRBatchIn, request: Request):
         return _session_mutation_context(request, profile)
 
     found = []
-    access = {}
     for profile, wanted in profiles.items():
         # A denied or unavailable profile must not hide its readable neighbours.
         try:
@@ -652,25 +653,111 @@ def sessions_pr_status(body: SessionPRBatchIn, request: Request):
                             continue
                     except Exception:
                         continue
-                    try:
-                        created = session_pr_status.created_in(conn, sid)
-                    except Exception:
-                        created = None  # unreadable history is unknown, never "no pull request"
-                    try:
-                        work = session_pr_status.work_in(conn, sid) if config['repos'] else {}
-                    except Exception:
-                        work = None
-                    if actor.subject not in access:
-                        access[actor.subject] = session_pr_status.access_for(data_dir, actor.subject, config)
-                    found.append((index, {"profile": profile, "id": sid, "created": created, "work": work,
-                                          "access": access[actor.subject], "repos": config['repos']}))
+                    found.append((index, visit(conn, profile, sid, actor)))
             finally:
                 try:
                     conn.execute('ROLLBACK')
                 except Exception:
                     pass
     found.sort(key=lambda pair: pair[0])
-    return {"sessions": session_pr_status.resolve_batch([item for _, item in found])}
+    return [item for _, item in found]
+
+
+
+
+def _pr_owner(request):
+    """The machine's owner, or 401/403: these routes change what this computer's git is asked."""
+    from gateway.owner_identity import host_owner_subject
+    state = request.state
+    if (getattr(state, 'hosted_http_authenticated', None) is True
+            and getattr(state, 'native_http_principal', None) is None and getattr(state, 'session', None) is None):
+        return host_owner_subject()     # a plugin host: Hermes's own verdict on the sign-in (see _pr_owned)
+    from hermes_cli.web_server_sessions import _session_mutation_context
+    _, actor = _session_mutation_context(request, None)
+    if actor.subject != host_owner_subject():
+        raise HTTPException(403, "owner_only")
+    return actor.subject
+
+
+@router.post("/sessions/pr-status")
+def sessions_pr_status(body: SessionPRBatchIn, request: Request):
+    """Read-only; the synchronous route runs in FastAPI's worker pool, not its event loop.
+
+    GitHub and git are asked (session_pr_status) only after every snapshot is closed. Every session
+    the caller owns gets an answer: `none` when it made no branch and opened no pull request,
+    `unknown` when that can't be told. The owner's own "closed" mark is added last (`manual`).
+    """
+    if not session_pr_status.supported():
+        raise HTTPException(501, "This Hermes can't report session pull requests")
+    rows = [{"profile": row.profile, "id": row.id} for row in body.sessions]
+    if any(not session_pr_status.valid_identity(row['profile'], row['id']) for row in rows):
+        raise HTTPException(422, "Invalid profile or session id")
+    data_dir = push.data_dir()
+    config = session_pr_status.load_config(data_dir)
+    marks = session_pr_status.marks().closed(data_dir)
+    access = {}
+
+    def visit(conn, profile, sid, actor):
+        try:
+            created = session_pr_status.created_in(conn, sid)
+        except Exception:
+            created = None  # unreadable history is unknown, never "no pull request"
+        try:
+            work = session_pr_status.work_in(conn, sid) if config['repos'] else {}
+        except Exception:
+            work = None
+        if actor.subject not in access:
+            access[actor.subject] = session_pr_status.access_for(data_dir, actor.subject, config)
+        return {"profile": profile, "id": sid, "created": created, "work": work, "access": access[actor.subject],
+                "repos": config['repos'], "data_dir": data_dir, "closed": f"{profile}/{sid}" in marks}
+
+    return {"sessions": session_pr_status.resolve_batch(_pr_owned(request, rows, visit))}
+
+
+@router.put("/sessions/pr-mark")
+def sessions_pr_mark(body: SessionPRMarkIn, request: Request):
+    """The owner marks a chat's code changes closed (or takes the mark back). A label only: nothing
+    in any repository changes. 404 for a chat the caller doesn't own."""
+    if not session_pr_status.supported():
+        raise HTTPException(501, "This Hermes can't report session pull requests")
+    if not session_pr_status.valid_identity(body.profile, body.id):
+        raise HTTPException(422, "Invalid profile or session id")
+    if not _pr_owned(request, [{"profile": body.profile, "id": body.id}], lambda *_: True):
+        raise HTTPException(404, "not_found")
+    session_pr_status.marks().set_closed(push.data_dir(), body.profile, body.id, body.closed)
+    return {"ok": True, "closed": body.closed}
+
+
+@router.get("/sessions/pr-repos")
+def sessions_pr_repos(request: Request):
+    """The repositories chats' branches are looked for in: the ones linked from the app (with their
+    project) and the ones listed by hand in session-pr.json (no project)."""
+    if not session_pr_status.supported():
+        raise HTTPException(501, "This Hermes can't report session pull requests")
+    _pr_owner(request)
+    return {"repos": session_pr_status.marks().listed(push.data_dir(), session_pr_status.load_config(push.data_dir()))}
+
+
+@router.put("/sessions/pr-repos")
+def sessions_pr_repo_link(body: SessionPRRepoIn, request: Request):
+    """Link a project to a git repository on this computer (replaces the project's link)."""
+    if not session_pr_status.supported():
+        raise HTTPException(501, "This Hermes can't report session pull requests")
+    _pr_owner(request)
+    try:
+        repo = session_pr_status.marks().link(push.data_dir(), body.project, body.path, body.public_repo)
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from None
+    return {"repo": repo}
+
+
+@router.delete("/sessions/pr-repos")
+def sessions_pr_repo_unlink(project: str, request: Request):
+    if not session_pr_status.supported():
+        raise HTTPException(501, "This Hermes can't report session pull requests")
+    _pr_owner(request)
+    session_pr_status.marks().unlink(push.data_dir(), project)
+    return {"ok": True}
 
 
 @router.get("/serve/working")
