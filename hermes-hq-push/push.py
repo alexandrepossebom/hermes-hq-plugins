@@ -186,7 +186,7 @@ class Store:
                 device_id text not null, activity_id text not null, token text not null, profile text not null,
                 session text not null default '', started_at real not null, trail text not null default '{}',
                 registered_at real not null, primary key (device_id, activity_id))""")
-            # [viewing] 0.9.65: the chat a device has on screen, in front of its person, right now (one row per device).
+            # [viewing] 0.9.66: the chat a device has on screen, in front of its person, right now (one row per device).
             db.execute("""create table if not exists viewing (
                 device_id text primary key, session text not null, profile text not null, expires_at real not null)""")
             db.execute("create index if not exists live_session on live (session)")
@@ -531,7 +531,7 @@ def status_body(root: Path, sender) -> dict:
     screen (short_titles.py). `tasks` (0.9.32, added by dashboard/plugin_api.py from tasks.status): the shared
     Tasks list's routes (tasks.py); kind "task" (now in `kinds`) alerts when a bot sets a task `ready` or
     `needs_you`, carrying only its title and never its notes, steps or made items. `tileFit` (0.9.50): the
-    `viewing` (0.9.65): PUT /viewing/<device> says which chat a device has in front of its person; a reply written in
+    `viewing` (0.9.66): PUT /viewing/<device> says which chat a device has in front of its person; a reply written in
     that chat alerts no other device while it does (a tester: the iPhone buzzed for a reply being read on the Mac).
     dashboard-tile skill's template fits itself to its tile and its check draws the app's real windows (a tester's
     status boards came out cut off and crowded); the app can offer an update to a plugin without it."""
@@ -924,7 +924,7 @@ class DirectAPNs:
         return DeliveryError(code, f"APNs {code} {reason or (stderr or '').strip()[:120]}".strip(), transient)
 
 
-PLUGIN_VERSION = "0.9.65"   # keep in step with plugin.yaml (test_tasks.py: test_the_reported_version_is_the_manifests)
+PLUGIN_VERSION = "0.9.66"   # keep in step with plugin.yaml (test_tasks.py: test_the_reported_version_is_the_manifests)
 
 
 class Relay:

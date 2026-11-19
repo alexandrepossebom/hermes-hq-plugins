@@ -1,4 +1,4 @@
-"""[viewing] 0.9.65: a reply written in a chat that is on a screen in front of its person alerts no device.
+"""[viewing] 0.9.66: a reply written in a chat that is on a screen in front of its person alerts no device.
 
 A tester: "With a bot conversation open in Hermes HQ on Mac, a reply from the bot also triggers a new-message push
 notification on iPhone." Needs only Python: `python3 -m unittest test_viewing.py` from the plugin folder.

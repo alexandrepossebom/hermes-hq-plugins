@@ -390,7 +390,7 @@ def remove_device(device_id: str):
 
 
 # ---------------------------------------------------------------------------
-# [viewing] 0.9.65 (`viewing` in status): the chat a device has in front of its person; its replies alert nobody.
+# [viewing] 0.9.66 (`viewing` in status): the chat a device has in front of its person; its replies alert nobody.
 # ---------------------------------------------------------------------------
 
 class ViewingIn(BaseModel):
