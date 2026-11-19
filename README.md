@@ -256,6 +256,21 @@ made, its history) and what its bot writes with `tasks_update(page={summary, nex
 next, and parts such as options compared in a table, the numbers that matter, or what it found. The bot writes words,
 never HTML. The `task-page` skill (hermes-hq-push:task-page) tells bots what goes on it.
 
+Version 0.9.64 shows you the picture before the question. A bot that made a mock-up or screenshot for a choice and looked at it itself, then asked you to pick, used to put up the question card without ever posting the picture (the card can't show one), so you chose between pictures you hadn't seen. Now that question is held once, and the bot is told to post the picture (its `MEDIA:` lines) first and ask again. A picture you sent, an old file or a web image doesn't count, and a second try in the same turn always goes through (show_first.py).
+
+Version 0.9.63 adds **ask-to-act cards**. Before a bot does something for you (answers someone, replies in a thread, books, files or changes something) it asks with `ask_to_act`, and the app draws one card: who asked and their words, a link to the conversation, a button per choice, and the reply it would send for each choice with Send and Edit. Nothing is sent until you tap Send. It works when a scheduled job's report reaches the bot's chat too (asks.py).
+
+Version 0.9.62 reaches a **sign-in inside a page**. Many sites show their sign-in as a frame from another of their
+addresses inside the page (DoorDash's comes from identity.doordash.com inside www.doordash.com), and Hermes's vault
+only read whole tabs: asked for that frame's code it said no tab was open, and asked for the page's it found no code
+box. Now a login or code the bot names goes into the frame of an open tab on that site, or, when the bot names the page,
+into a frame of the same site that holds the form (never another site's, and never shared hosting such as
+`*.github.io`). The card on your phone names the frame's own address, a saved login still fills only on the address it
+was saved for, and the fill re-checks that address inside the frame just before it writes. The frame is used for that
+one call only. Asking for a code also sends the bot to look in your mail once per site, however it names the site, and
+a "no code field" answer now tells the bot you can't type into its browser from the app, so it hands you the browser
+instead of asking you to type into a page you can't see.
+
 Version 0.9.61 gives Dashboard tiles a new default look, Soft: a calm card in your own theme's colours, the heading
 in plain words, the numbers on small cards of their own, and a faint light in the corner only when a tile warns or is
 in trouble. A tile is drawn in it unless you ask a bot for another look (`app`, `midnight`, `terminal`, `vivid`).
@@ -283,6 +298,39 @@ In every other case the session shows unknown, and so does uncertain evidence or
 The status reports `sessionPRStatus: true` only on a Hermes runtime that has every session ownership API the
 endpoint uses; elsewhere the endpoint answers 501. The change takes effect when the serving process next loads
 the updated plugin, and the companion app must support the status display.
+
+Version 0.9.60 adds **shopping cards**. Asked to find, compare or recommend something to buy, a bot shows the products
+it found on store pages as product cards in the Hermes HQ app (its `show_products` tool): photo, name, price (the old
+price struck through), store and rating, and a tap opens the product's page with the bot's reasons, other stores'
+prices, **Buy** and **Notify Me**. Buy sends the bot a message: it takes the item to the last step of checkout in its
+browser and shows the order as a card (`order_card`) with the store, items, charges, total, **Cancel** and **Pay**.
+From the moment the bot shows an order card until you tap Pay or Cancel on it, the bot cannot do anything in its
+browser in that chat: no clicking, typing, navigating or filling a card (the add-on refuses those tools; tools that
+only read the page, such as a screenshot, still work). A yes typed in words doesn't lift it; only the card's buttons
+do. After Pay it may place that order; after Cancel it is free again. The waiting orders are kept in
+`shopping-orders.json` in the add-on's data folder, so a restart doesn't lift the block, and a card nobody answers
+for a day expires. The add-on itself pays for nothing; it checks the cards (https links, prices as numbers, an old
+price above the price, the counts) and tells the bot in words what to fix. Notify Me asks the bot for a scheduled job that tells you when the item is back in
+stock or cheaper. Bots get the two tools only once an app that draws the cards has connected to this computer
+(`PUT /shopping/cards`; `shoppingCards`, `shoppingCardsShown` and `shoppingPayBlock` in the status), and only in the
+app's own chats; create `shopping.off` in the add-on's data folder to turn them, and the block, off for every bot.
+
+Version 0.9.59 adds Allow in 1Password. Hermes unlocks 1Password with your master password and asks again after half
+an hour idle. Now the app's unlock sheet and Passwords page have an Allow in 1Password button: the 1Password app on
+Hermes's computer asks you to allow it (a click or Touch ID, no master password), you pick which vaults your bots may
+fill from, and the add-on makes a read-only key for those vaults with 1Password's own command-line tool
+(`op service-account create … --vault <id>:read_items`) and saves it in each bot's `.env` as
+`OP_SERVICE_ACCOUNT_TOKEN`, the name Hermes already reads. From then on 1Password is never locked for your bots.
+1Password never lets such a key read your Private vault, so move a login into one of the vaults you picked (the app can
+make one named Hermes). The key never leaves the computer and is not sent to the app; a bot that already has a key of
+its own keeps it; Disconnect in the app removes the key from the bots (cancel the key itself at 1Password.com ›
+Developer › Service Accounts). Needs 1Password 8 with Settings › Developer › Integrate with 1Password CLI turned on,
+and the `op` tool installed, on the computer running Hermes.
+
+0.9.59 also alerts your phone when a bot waits for a login, a one-time code or a password manager's unlock in a
+chat you don't have open. Hermes told plugins about approvals, questions and sudo passwords only, so those three
+waited unseen.
+
 
 Version 0.9.58 ties a plugin update you approve in the app to what the app showed you (the last open finding of the
 outside review). Hermes fetches the new version into a copy before it asks anything, and lists what that copy needs

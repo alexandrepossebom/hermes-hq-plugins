@@ -92,6 +92,9 @@ _media_spec.loader.exec_module(cron_media)
 _access_spec = importlib.util.spec_from_file_location("hermes_hq_device_access", Path(__file__).with_name("device_access.py"))
 device_access = importlib.util.module_from_spec(_access_spec)
 _access_spec.loader.exec_module(device_access)
+_show_spec = importlib.util.spec_from_file_location("hermes_hq_push_show_first", Path(__file__).with_name("show_first.py"))
+show_first = importlib.util.module_from_spec(_show_spec)
+_show_spec.loader.exec_module(show_first)
 if "hermes_hq_drafts" in sys.modules:   # one copy for this process: the tool, the guard and the route share it
     drafts = sys.modules["hermes_hq_drafts"]
 else:
@@ -99,6 +102,20 @@ else:
     drafts = importlib.util.module_from_spec(_drafts_spec)
     sys.modules["hermes_hq_drafts"] = drafts
     _drafts_spec.loader.exec_module(drafts)
+if "hermes_hq_asks" in sys.modules:   # one copy for this process: the tool and the route share it
+    asks = sys.modules["hermes_hq_asks"]
+else:
+    _asks_spec = importlib.util.spec_from_file_location("hermes_hq_asks", Path(__file__).with_name("asks.py"))
+    asks = importlib.util.module_from_spec(_asks_spec)
+    sys.modules["hermes_hq_asks"] = asks
+    _asks_spec.loader.exec_module(asks)
+if "hermes_hq_shopping" in sys.modules:   # one copy for this process: the tools, the answers and the route share it
+    shopping = sys.modules["hermes_hq_shopping"]
+else:
+    _shopping_spec = importlib.util.spec_from_file_location("hermes_hq_shopping", Path(__file__).with_name("shopping.py"))
+    shopping = importlib.util.module_from_spec(_shopping_spec)
+    sys.modules["hermes_hq_shopping"] = shopping
+    _shopping_spec.loader.exec_module(shopping)
 if "hermes_hq_tasks" in sys.modules:   # one copy for this process: ideas.py and the dashboard routes share it
     tasks = sys.modules["hermes_hq_tasks"]
 else:
@@ -250,6 +267,10 @@ def on_human_input_resolved(**kwargs):
 
 def pre_llm_call(platform="", parent_session_id="", user_message=None, conversation_history=None, session_id="",
                  turn_id="", **kwargs):
+    try:  # [show-first] each turn starts with nothing made in it
+        show_first.note_turn(session_id)
+    except Exception:
+        pass
     try:  # [cron-media] every process: a Bot Chat job's hand-off can run in the messaging gateway too
         cron_media.note_turn(session_id, turn_id, user_message)
     except Exception:
@@ -258,12 +279,29 @@ def pre_llm_call(platform="", parent_session_id="", user_message=None, conversat
         drafts.note_decision(user_message, str(session_id or ""))
     except Exception:
         log.debug("hermes-hq-push: draft answer not noted")
+    shopping_note = None
+    try:  # [shopping] the person's Pay or Cancel lifts the chat's pay block; Buy and Notify Me are noted (shopping.py)
+        shopping_note = shopping.note_decision(push.data_dir(), user_message, str(session_id or ""))
+    except Exception:
+        log.debug("hermes-hq-push: shopping answer not noted")
+    try:  # [asks] Send on an ask card's ready reply lets that reply out of the drafts guard (asks.py)
+        asks.note_answer(user_message)
+    except Exception:
+        log.debug("hermes-hq-push: ask answer not noted")
+    if not _serves_app_sessions():
+        # [asks] A job's report handed to a Bot Chat (a gateway turn): ask with the card, not in text.
+        try:
+            note = asks.job_note(user_message, data_dir=push.data_dir(), in_app_chat=_in_app_chat())
+            if note:
+                return {"context": note}
+        except Exception:
+            log.debug("hermes-hq-push: job ask note skipped", exc_info=True)
     # Only turns ``hermes serve`` runs: a card asked from a turn the messaging gateway runs in an app chat (another
     # bot's message, a job's hand-off) can't reach the app and comes back undelivered. [tasks] The same restriction
     # keeps the Tasks note out of cron runs and hand-offs: only a conversation with the user adds it.
     if not _serves_app_sessions():
         return None
-    notes = []
+    notes = [shopping_note] if shopping_note else []
     try:
         note = ask_cards.context_for(data_dir=push.data_dir(), platform=platform, parent_session_id=parent_session_id,
                                      user_message=user_message, conversation_history=conversation_history)
@@ -321,12 +359,45 @@ def _desktop_theme():
 
 
 def pre_tool_call(tool_name="", args=None, **kwargs):
-    verdict = (_veto(tool_name, args) or _ideas_veto(tool_name, kwargs.get("session_id"))
-               or _draft_veto(tool_name, args, kwargs.get("session_id")) or _job_clarify(tool_name))
+    verdict = (_veto(tool_name, args) or _code_veto(tool_name, args, kwargs)
+               or _ideas_veto(tool_name, kwargs.get("session_id"))
+               or _draft_veto(tool_name, args, kwargs.get("session_id"))
+               or _pay_block(tool_name, args, kwargs.get("session_id")) or _show_first(tool_name, args, kwargs)
+               or _job_clarify(tool_name))
     if verdict is None:
         _named_site(tool_name, args, kwargs.get("task_id"))
         _live_step(tool_name, args, kwargs)
     return verdict
+
+
+def _show_first(tool_name, args, kwargs):
+    """[show-first] A clarify while a picture the bot made this turn is still unseen is held once (show_first.py)."""
+    try:
+        verdict = show_first.check(tool_name, args, kwargs.get("session_id"))
+    except Exception:
+        log.debug("hermes-hq-push: show-first check failed", exc_info=True)
+        return None
+    if verdict:
+        log.info("hermes-hq-push: clarify held: the picture it asks about isn't in the chat yet")
+    return verdict
+
+
+def post_api_request(session_id="", assistant_message=None, **kwargs):
+    """[show-first] The bot's words with each model call: a MEDIA line shows what it made (show_first.note_text)."""
+    try:
+        show_first.note_text(session_id, getattr(assistant_message, "content", None))
+    except Exception:
+        log.debug("hermes-hq-push: show-first text not noted", exc_info=True)
+    return None
+
+
+def on_interim_message(session_id="", text="", **kwargs):
+    """[show-first] Words the bot sent mid-turn (show_first.note_text)."""
+    try:
+        show_first.note_text(session_id, text)
+    except Exception:
+        log.debug("hermes-hq-push: show-first interim not noted", exc_info=True)
+    return None
 
 
 def _job_clarify(tool_name):
@@ -352,6 +423,22 @@ def _job_clarify(tool_name):
     return {"action": "block", "message": message}
 
 
+def _pay_block(tool_name, args, session_id):
+    """[shopping] A browser action in a chat whose order card waits for Pay or Cancel (shopping.blocked_message). In
+    every process: a job's hand-off the messaging gateway runs in that chat is held the same way."""
+    try:
+        if not shopping.acts_in_browser(tool_name, args):
+            return None
+        message = shopping.blocked_message(push.data_dir(), tool_name, args, session_id or "")
+    except Exception:
+        log.debug("hermes-hq-push: pay block check failed", exc_info=True)
+        return None
+    if not message:
+        return None
+    log.info("hermes-hq-push: %s held: an order card waits for Pay or Cancel", tool_name)
+    return {"action": "block", "message": message}
+
+
 def _draft_veto(tool_name, args, session_id):
     """[drafts] A sending tool carrying the text of a draft the person hasn't approved (drafts.blocked_message)."""
     try:
@@ -362,6 +449,18 @@ def _draft_veto(tool_name, args, session_id):
         return None
     log.info("hermes-hq-push: %s held: it carries an unapproved draft", tool_name)
     return {"action": "block", "message": message}
+
+
+def transform_tool_result(tool_name="", result=None, task_id="", **kwargs):
+    """[0.9.62] A browser_vault call is over: a sign-in frame it used is let go, and "no code field" says the person
+    can't type into the page (gateway_logins.vault_result). Every other tool's result is left alone."""
+    if tool_name != "browser_vault":
+        return None
+    try:
+        return gateway_logins.vault_result(tool_name, result, task_id or "default")
+    except Exception:
+        log.debug("hermes-hq-push: vault result left as it was", exc_info=True)
+        return None
 
 
 def _named_site(tool_name, args, task_id):
@@ -409,6 +508,19 @@ def _veto(tool_name, args):
         return None
     if message:
         log.warning("hermes-hq-push: blocked a %s call that ran launchctl submit", tool_name)
+        return {"action": "block", "message": message}
+    return None
+
+
+def _code_veto(tool_name, args, kwargs):
+    """[0.9.59] The first ask for a site's code is sent back once so the bot looks for an emailed or texted code
+    itself (gateway_logins.sent_code). Never logs the call's arguments."""
+    try:
+        message = gateway_logins.sent_code(tool_name, args, kwargs.get("session_id") or kwargs.get("task_id") or "")
+    except Exception:
+        return None
+    if message:
+        log.info("hermes-hq-push: a code was asked for; the bot looks for a sent one first")
         return {"action": "block", "message": message}
     return None
 
@@ -464,10 +576,38 @@ def _gateway_logins():
         log.info("hermes-hq-push: logins asked in gateway turns %s", gateway_logins.install_prompts(push.data_dir()))
     except Exception:
         log.debug("hermes-hq-push: logins asked in gateway turns not installed", exc_info=True)
+    try:  # [0.9.62] a sign-in that sits in a frame of an open tab (DoorDash's identity.doordash.com), for a saved
+        # login's fill too (not only a login or code the bot names, which installed the tab pick on first use)
+        log.info("hermes-hq-push: sign-in frames %s, named tabs %s", gateway_logins.install_frames(),
+                 gateway_logins.install_named_tab())
+    except Exception:
+        log.debug("hermes-hq-push: sign-in frames not installed", exc_info=True)
+    try:  # [0.9.59] a login the person moved into the bots' vault instead of typing it
+        log.info("hermes-hq-push: moved logins %s", gateway_logins.install_moved())
+    except Exception:
+        log.debug("hermes-hq-push: moved logins not installed", exc_info=True)
     try:  # [job-asks] the gateway's local chats; in the server it steps aside at each call (gateway_logins._serving)
         log.info("hermes-hq-push: questions in job turns %s", gateway_logins.install_job_asks(push.data_dir()))
     except Exception:
         log.debug("hermes-hq-push: questions in job turns not installed", exc_info=True)
+    try:  # [0.9.59] a 1Password login fills on its whole site (www., account., ...), as 1Password does
+        spec = importlib.util.spec_from_file_location("hermes_hq_push_site_match", Path(__file__).with_name("site_match.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        log.info("hermes-hq-push: 1Password logins on their whole site %s", module.install())
+    except Exception:
+        log.debug("hermes-hq-push: 1Password logins on their whole site not installed", exc_info=True)
+
+
+def _onepassword_allow():
+    """[0.9.59] A 1Password key saved from the app works at once, in this process too (onepassword_allow.install)."""
+    try:
+        spec = importlib.util.spec_from_file_location("hermes_hq_push_onepassword_allow", Path(__file__).with_name("onepassword_allow.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        log.info("hermes-hq-push: allow in 1Password %s", module.install())
+    except Exception:
+        log.debug("hermes-hq-push: allow in 1Password not installed", exc_info=True)
 
 
 def _page_previews():
@@ -587,6 +727,31 @@ def _draft_tool(ctx):
         log.warning("hermes-hq-push: draft_message tool not registered", exc_info=True)
 
 
+def _in_app_chat() -> bool:
+    """[asks] This turn's chat is one the app shows: a `hermes serve` turn, or a turn the messaging gateway runs in
+    a local app chat (a job's report handed to a Bot Chat; gateway_logins.turn), whose calls the chat keeps."""
+    if _serves_app_sessions():
+        return True
+    try:
+        return gateway_logins.turn() is not None
+    except Exception:
+        return False
+
+
+def _ask_tool(ctx):
+    try:
+        asks.register_tool(ctx, push.data_dir, _in_app_chat)
+    except Exception:
+        log.warning("hermes-hq-push: ask_to_act tool not registered", exc_info=True)
+
+
+def _shopping_tools(ctx):
+    try:
+        shopping.register_tool(ctx, push.data_dir, _serves_app_sessions)
+    except Exception:
+        log.warning("hermes-hq-push: shopping tools not registered", exc_info=True)
+
+
 def _tasks_prep_job():
     """Startup safety net: reconcile this bot's "Task prep" job against its tasks.db right now, in case it fell
     out of sync (the job was removed by hand while prep tasks are still open, or vice versa)."""
@@ -607,12 +772,17 @@ def register(ctx):
     ctx.register_hook("on_human_input_request", on_human_input_request)
     ctx.register_hook("on_human_input_resolved", on_human_input_resolved)
     ctx.register_hook("pre_llm_call", pre_llm_call)
+    ctx.register_hook("post_api_request", post_api_request)
+    ctx.register_hook("on_interim_message", on_interim_message)
     ctx.register_hook("post_llm_call", post_llm_call)
     ctx.register_hook("transform_llm_output", transform_llm_output)
+    ctx.register_hook("transform_tool_result", transform_tool_result)
     ctx.register_hook("on_session_end", on_session_end)
     _device_tools(ctx)
     _tasks_tools(ctx)
     _draft_tool(ctx)
+    _shopping_tools(ctx)
+    _ask_tool(ctx)
     _dashboard_skill(ctx)
     _task_page_skill(ctx)
     _desktop_theme()
@@ -622,5 +792,6 @@ def register(ctx):
     _short_titles()
     _desktop_forward()
     _gateway_logins()
+    _onepassword_allow()
     _serve_warmup()
     _tasks_prep_job()
