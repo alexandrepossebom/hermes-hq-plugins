@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.testclient import TestClient
+import pytest
 from hermes_state import SessionDB
 
 
@@ -51,9 +52,13 @@ def test_standalone_owner_scoping(tmp_path, monkeypatch):
     api = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(api)
     monkeypatch.setattr(api, '_loop_watched', True)
-    seen = []
+    seen, read = [], []
     real_resolve_batch = api.session_pr_status.resolve_batch
-    monkeypatch.setattr(api.session_pr_status, 'resolve_batch', lambda rows: seen.append(rows) or rows)
+    real_evidence_in = api.session_pr_status.evidence_in
+    monkeypatch.setattr(api.session_pr_status, 'resolve_batch', lambda items: seen.append(
+        [{'profile': i['profile'], 'id': i['id']} for i in items]) or seen[-1])
+    # Authorization alone decides which sessions' evidence is read at all.
+    monkeypatch.setattr(api.session_pr_status, 'evidence_in', lambda conn, sid, roots: read.append(sid) or {})
 
     def login(request: Request, authorization: str = Header(default='')):
         if authorization != 'Bearer valid':
@@ -70,7 +75,9 @@ def test_standalone_owner_scoping(tmp_path, monkeypatch):
     assert response.status_code == 200
     assert response.json() == {'sessions': [rows[0], rows[-1]]}
     assert seen == [[rows[0], rows[-1]]]
+    assert read == ['owned', closed]
     monkeypatch.setattr(api.session_pr_status, 'resolve_batch', real_resolve_batch)
+    monkeypatch.setattr(api.session_pr_status, 'evidence_in', real_evidence_in)
     api.session_pr_status._cache.clear()
     assert client.post('/sessions/pr-status', json={'sessions': rows}, headers={'Authorization': 'Bearer valid'}).json() == {
         'sessions': [{'profile': 'default', 'id': 'owned', 'state': 'unknown'}]}
@@ -85,3 +92,55 @@ def test_standalone_owner_scoping(tmp_path, monkeypatch):
     other = FastAPI()
     other.include_router(api.router, dependencies=[Depends(native)])
     assert TestClient(other).post('/sessions/pr-status', json={'sessions': rows}).json() == {'sessions': []}
+
+
+def test_authorization_and_evidence_share_one_snapshot(tmp_path, monkeypatch):
+    """A write landing between the ownership check and the evidence read is invisible to both:
+    the session is judged and read as it was at one instant."""
+    from hermes_cli import profiles, web_server_cron
+    import hermes_state_local_migration as migration
+    import test_tasks
+
+    home = tmp_path / 'default'
+    home.mkdir()
+    db = SessionDB(db_path=home / 'state.db')
+    db.create_session('chat', source='tui', user_id='basic:alice')
+    db.append_message('chat', 'user', 'hello')
+    db.end_session('chat', end_reason='done')
+    db.close()
+    monkeypatch.setattr(profiles, 'get_profile_dir', lambda name: home)
+    monkeypatch.setattr(web_server_cron, '_cron_profile_home', lambda name: (name, home))
+    monkeypatch.setenv('HERMES_HQ_PUSH_DATA_DIR', str(tmp_path / 'data'))
+    monkeypatch.setenv('HERMES_HQ_PUSH_RELAY_URL', 'off')
+    monkeypatch.setattr(test_tasks.push, '_watcher_started', True)
+    spec = importlib.util.spec_from_file_location('snapshot_pr_api', Path(__file__).parent / 'dashboard/plugin_api.py')
+    api = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(api)
+    monkeypatch.setattr(api, '_loop_watched', True)
+    monkeypatch.setattr(api.session_pr_status, '_api', lambda *_: pytest.fail('asked GitHub'))
+    real_row = migration.legacy_history_row
+
+    def check_then_race(row):
+        # Another writer commits right after ownership was judged: coding evidence appears.
+        writer = SessionDB(db_path=home / 'state.db')
+        call = {'id': 'c1', 'type': 'function', 'function': {'name': 'terminal',
+                'arguments': json.dumps({'command': 'gh pr create'})}}
+        writer.append_message('chat', 'assistant', '', tool_calls=[call])
+        writer.append_message('chat', 'tool', json.dumps({'output': 'https://github.com/a/b/pull/7', 'exit_code': 0}),
+                              tool_call_id='c1', tool_name='terminal')
+        writer.close()
+        return real_row(row)
+    monkeypatch.setattr(migration, 'legacy_history_row', check_then_race)
+
+    def login(request: Request):
+        request.state.session = SimpleNamespace(user_id='alice', provider='basic', issuer='')
+    app = FastAPI()
+    app.state.auth_required = True
+    app.include_router(api.router, dependencies=[Depends(login)])
+    client = TestClient(app)
+    body = {'sessions': [{'profile': 'default', 'id': 'chat'}]}
+    assert client.post('/sessions/pr-status', json=body).json() == {'sessions': []}   # the judged snapshot: no coding
+    monkeypatch.setattr(migration, 'legacy_history_row', real_row)
+    assert client.post('/sessions/pr-status', json=body).json() == {'sessions': [
+        {'profile': 'default', 'id': 'chat', 'state': 'unknown', 'repo': 'a/b', 'number': 7,
+         'url': 'https://github.com/a/b/pull/7'}]}

@@ -121,11 +121,14 @@ def snapshot(tmp_path, profile, session, cwd, branch):
                    (str(cwd), str(cwd), branch, session))
 
 
-def test_snapshot_resolves_normal_edit_without_executing_git(tmp_path, history, monkeypatch):
+def test_snapshot_branch_without_reading_the_recorded_checkout(tmp_path, history, monkeypatch):
+    # The recorded cwd is history: its .git/config is never opened, so its remote is not evidence.
     repo = make_repo(tmp_path / 'repo', 'git@github.com:acme/app.git')
     history('one', 'x', name='write_file', args={'path': str(repo / 'src' / 'app.py')})
     snapshot(tmp_path, 'one', 'x', repo, 'feature/historical')
     monkeypatch.setattr(subprocess, 'run', lambda *a, **kw: pytest.fail('must not execute git'))
+    assert subject.evidence('one', 'x') == {'branch': 'feature/historical'}
+    history('one', 'x', f'git -C {repo} remote get-url origin', 'git@github.com:acme/app.git\n')
     assert subject.evidence('one', 'x') == {'repo': 'acme/app', 'branch': 'feature/historical'}
 
 
@@ -136,12 +139,14 @@ def test_recorded_git_workdir_and_worktree(tmp_path, history):
     worktree = tmp_path / 'worktree'
     subprocess.run(['git', '-C', str(repo), 'worktree', 'add', '-qb', 'feature/a', str(worktree)], check=True)
     history('one', 'x', f'git -C {worktree} commit -m x', '[feature/a abcdef0] x')
+    assert subject.evidence('one', 'x') == {'branch': 'feature/a'}
+    history('one', 'x', f'git -C {worktree} remote get-url origin', 'https://github.com/acme/app.git')
     assert subject.evidence('one', 'x') == {'repo': 'acme/app', 'branch': 'feature/a'}
     history('one', 'y', args={'command': 'git checkout -b feature/b', 'workdir': str(repo)})
-    assert subject.evidence('one', 'y') == {'repo': 'acme/app', 'branch': 'feature/b'}
+    assert subject.evidence('one', 'y') == {'branch': 'feature/b'}
     history('one', 'z', f'git -C {repo} checkout feature/existing', "Switched to branch 'feature/existing'")
     history('one', 'z', name='write_file', args={'path': str(repo / 'app.py')})
-    assert subject.evidence('one', 'z') == {'repo': 'acme/app', 'branch': 'feature/existing'}
+    assert subject.evidence('one', 'z') == {'branch': 'feature/existing'}
 
 
 def test_unrelated_repo_and_branch_never_join(tmp_path, history):
@@ -150,12 +155,17 @@ def test_unrelated_repo_and_branch_never_join(tmp_path, history):
     history('one', 'x', f'git -C {repo_a} remote get-url origin', 'https://github.com/acme/a.git')
     history('one', 'x', f'git -C {repo_b} commit -m x', '[feature/b abcdef0] x')
     assert subject.evidence('one', 'x') == {}
+    # A file written elsewhere names no repository (its checkout is never read): no repo is joined.
     history('one', 'y', name='write_file', args={'path': str(repo_b / 'src.py')})
     snapshot(tmp_path, 'one', 'y', repo_a, 'feature/a')
-    assert subject.evidence('one', 'y') == {}
+    assert 'repo' not in subject.evidence('one', 'y')
     history('one', 'z', name='patch', args={'patch': f'*** Begin Patch\n*** Update File: {repo_b}/app.py\n*** End Patch'})
     snapshot(tmp_path, 'one', 'z', repo_a, 'feature/a')
-    assert subject.evidence('one', 'z') == {}
+    assert 'repo' not in subject.evidence('one', 'z')
+    # Git work in another checkout than the branch's is a second identity.
+    history('one', 'w', f'git -C {repo_b} commit -m x', 'nothing to commit', exit_code=1)
+    snapshot(tmp_path, 'one', 'w', repo_a, 'feature/a')
+    assert subject.evidence('one', 'w') == {}
 
 
 def test_noncoding_snapshot_and_inaccessible_history(tmp_path, history):
@@ -181,3 +191,51 @@ def test_large_sessions_fail_closed_and_large_prose_is_not_fetched(tmp_path, his
         db.execute("INSERT INTO messages (session_id, role, content, timestamp) VALUES ('prose','user',?,0)",
                    ('x' * 1000000,))
     assert subject.evidence('one', 'prose') is None
+
+
+def test_no_path_from_history_is_dereferenced(tmp_path, history, monkeypatch):
+    """Every path a transcript or the session row records is compared as text; none is opened,
+    stat'ed, listed or resolved (a FIFO, a network mount or another user's checkout stays untouched)."""
+    trap = tmp_path / 'trap'
+    repo = make_repo(trap / 'repo', 'https://github.com/acme/secret.git')
+    (trap / 'wt').mkdir()
+    (trap / 'wt' / '.git').write_text(f'gitdir: {trap}/elsewhere\n')
+    history('one', 'x', f'cd {trap}/wt && git -C ../repo worktree add -b feature/t {trap}/wt2')
+    history('one', 'x', name='write_file', args={'path': str(trap / 'repo' / 'a.py')})
+    history('one', 'x', name='patch', args={'patch': f'*** Update File: {trap}/link/b.py'})
+    history('one', 'x', args={'command': 'git commit -m x', 'workdir': str(trap / 'repo')}, output='[feature/t 1234567] x')
+    history('one', 'x', 'git -C ~/repo commit -m y', '[feature/t 1234567] y')
+    snapshot(tmp_path, 'one', 'x', repo, 'feature/t')
+    monkeypatch.setenv('HERMES_HQ_PUBLIC_PR_RECEIPTS', '1')
+    db = sqlite3.connect((tmp_path / 'one' / 'state.db').as_uri() + '?mode=ro', uri=True, isolation_level=None)
+    db.execute('BEGIN')
+    touched = []
+    import builtins
+    import os
+    import os.path
+    def spy(name, real):
+        def wrapper(path, *args, **kwargs):
+            if str(trap) in os.fsdecode(path) if isinstance(path, (str, bytes, os.PathLike)) else False:
+                touched.append((name, str(path)))
+            return real(path, *args, **kwargs)
+        return wrapper
+    for module, name in [(os, 'open'), (os, 'stat'), (os, 'lstat'), (os, 'readlink'), (os, 'scandir'),
+                         (os, 'listdir'), (builtins, 'open'), (os.path, 'realpath'), (os.path, 'expanduser')]:
+        monkeypatch.setattr(module, name, spy(name, getattr(module, name)))
+    result = subject.evidence_from_conn(db, 'x', receipt_roots=())
+    monkeypatch.undo()
+    db.close()
+    assert touched == []
+    assert result == {'branch': 'feature/t'}
+
+
+def test_evidence_reads_the_callers_snapshot(tmp_path, history):
+    history('one', 'x', 'git status', 'On branch main')
+    db = sqlite3.connect((tmp_path / 'one' / 'state.db').as_uri() + '?mode=ro', uri=True, isolation_level=None)
+    db.execute('BEGIN')
+    db.execute('SELECT count(*) FROM sessions').fetchone()
+    history('one', 'x', 'gh pr create', 'https://github.com/a/b/pull/10')   # committed after the snapshot
+    assert subject.evidence_from_conn(db, 'x') is None
+    db.execute('ROLLBACK')
+    assert subject.evidence_from_conn(db, 'x') == {'repo': 'a/b', 'number': 10}
+    db.close()

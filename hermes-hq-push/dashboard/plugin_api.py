@@ -204,7 +204,8 @@ class ApprovalIn(BaseModel):
 def status():
     """The app probes this to offer push; a 404 means the plugin isn't installed or enabled."""
     return {**push.status_body(push.data_dir(), push.sender_from_env()), **terminal.status(push.data_dir()),
-            **tasks.status(), **drafts.status(push.data_dir()), **plugin_updates.status(), "sessionPRStatus": True}
+            **tasks.status(), **drafts.status(push.data_dir()), **plugin_updates.status(),
+            "sessionPRStatus": session_pr_status.supported()}
 
 
 class ScanFindingIn(BaseModel):
@@ -390,14 +391,19 @@ class SessionPRBatchIn(BaseModel):
 
 @router.post("/sessions/pr-status")
 def sessions_pr_status(body: SessionPRBatchIn, request: Request):
-    """Read-only; the synchronous route runs in FastAPI's worker pool, not its event loop."""
+    """Read-only; the synchronous route runs in FastAPI's worker pool, not its event loop.
+
+    Each profile is authorized and its evidence read on one read-only connection inside one read
+    transaction, so the rows that prove ownership are the rows the evidence comes from. GitHub is
+    asked (session_pr_status) only after every snapshot is closed.
+    """
+    if not session_pr_status.supported():
+        raise HTTPException(501, "This Hermes can't report session pull requests")
     rows = [{"profile": row.profile, "id": row.id} for row in body.sessions]
     if any(not session_pr_status.valid_identity(row['profile'], row['id']) for row in rows):
         raise HTTPException(422, "Invalid profile or session id")
-    # Resolve once per profile. A denied or unavailable row must not hide its
-    # readable neighbours, nor reach the evidence/GitHub resolver.
-    from contextlib import ExitStack
     import sqlite3
+    from contextlib import closing
     from hermes_cli.web_server_sessions import _session_mutation_context
     from hermes_cli.profiles import get_profile_dir
     from gateway.config import Platform
@@ -405,74 +411,102 @@ def sessions_pr_status(body: SessionPRBatchIn, request: Request):
     from hermes_state_local_migration import legacy_history_row
     from hermes_state_mutation_binding import BINDING_PREFIX, binding_names
 
-    readable = []
-    with ExitStack() as stack:
-        contexts = {}
-        for row in rows:
-            profile, sid = row['profile'], row['id']
-            if profile not in contexts:
-                try:
-                    authority, actor = _session_mutation_context(request, profile)
-                    home = Path(get_profile_dir(profile)).resolve()
-                    if Path(actor.profile_id).resolve() != home:
-                        raise ValueError('profile mismatch')
-                    native = getattr(request.state, 'native_http_principal', None)
-                    if native is not None and Path(native['profile_id']).resolve() != home:
-                        raise ValueError('native profile mismatch')
-                    if authority is not None and Path(authority.db.db_path).resolve() != home / 'state.db':
-                        raise ValueError('profile mismatch')
-                    # Never initialize or migrate the store while authorizing a read.
-                    conn = sqlite3.connect((home / 'state.db').as_uri() + '?mode=ro', uri=True)
-                    stack.callback(conn.close)
-                    conn.row_factory = sqlite3.Row
-                    contexts[profile] = (authority, actor, conn)
-                except Exception:
-                    contexts[profile] = None
-            context = contexts[profile]
-            if context is None:
-                continue
-            authority, actor, conn = context
+    data_dir = push.data_dir()
+    config = session_pr_status.load_config(data_dir)
+    profiles = {}
+    for index, row in enumerate(rows):
+        profiles.setdefault(row['profile'], []).append((index, row['id']))
+
+    def readable(conn, authority, actor, profile, sid):
+        """Whether *actor* owns *sid*, judged on *conn*'s snapshot (and the live authority)."""
+        stored = conn.execute('SELECT * FROM sessions WHERE id=?', (sid,)).fetchone()
+        stored = dict(stored) if stored is not None else None
+        live = authority.sessions.get(sid) if authority is not None else None
+        if live is not None:
+            from gateway.session_authorities import require_serving
+            from gateway.session_history_mount import is_history_mount
+            require_serving(authority)
+            source = live.source
+            if (is_history_mount(live) or source is None or source.platform != Platform.LOCAL
+                    or not source.user_id or not same_owner(source.user_id, actor.subject)):
+                return False
+            # The evidence comes from this snapshot's row: it must not name someone else.
+            if stored is not None and (stored.get('profile_name') not in (None, '', profile)
+                                       or (stored.get('user_id') and not same_owner(stored['user_id'], actor.subject))):
+                return False
+            return True
+        if stored is None:
+            return False
+        if (stored.get('profile_name') not in (None, '', profile) or not stored.get('user_id')
+                or not same_owner(stored['user_id'], actor.subject)):
+            return False
+        if any(stored.get(k) for k in ('session_key', 'chat_id', 'origin_json')):
+            # The closed local session may no longer be in memory. Only a validated
+            # local creation receipt for this exact physical transcript authorizes it.
+            from hermes_state_local import POLICY_PREFIX
+            from hermes_state_local_lineage import validate_local_lineage
+            raw = conn.execute('SELECT value FROM state_meta WHERE key=?',
+                               (POLICY_PREFIX + (stored.get('chat_id') or ''),)).fetchone()
+            receipt = json.loads(raw[0]) if raw else {}
+            if (receipt.get('profile_id') != actor.profile_id
+                    or receipt.get('session_id') != stored.get('chat_id')
+                    or not receipt.get('principal_id') or not same_owner(receipt['principal_id'], actor.subject)
+                    or receipt.get('route') != stored.get('session_key')
+                    or validate_local_lineage(conn, receipt) != sid):
+                return False
+        elif not legacy_history_row(stored):
+            return False
+        saved = conn.execute('SELECT value FROM state_meta WHERE key=?', (BINDING_PREFIX + sid,)).fetchone()
+        return saved is None or binding_names(saved[0], actor.subject)
+
+    found = []
+    access = {}
+    for profile, wanted in profiles.items():
+        # A denied or unavailable profile must not hide its readable neighbours.
+        try:
+            authority, actor = _session_mutation_context(request, profile)
+            home = Path(get_profile_dir(profile)).resolve()
+            if Path(actor.profile_id).resolve() != home:
+                raise ValueError('profile mismatch')
+            native = getattr(request.state, 'native_http_principal', None)
+            if native is not None and Path(native['profile_id']).resolve() != home:
+                raise ValueError('native profile mismatch')
+            if authority is not None and Path(authority.db.db_path).resolve() != home / 'state.db':
+                raise ValueError('profile mismatch')
+            # Never initialize or migrate the store while authorizing a read.
+            conn = sqlite3.connect((home / 'state.db').as_uri() + '?mode=ro', uri=True, timeout=0.5,
+                                   isolation_level=None)
+        except Exception:
+            continue
+        with closing(conn):
             try:
-                live = authority.sessions.get(sid) if authority is not None else None
-                if live is not None:
-                    from gateway.session_authorities import require_serving
-                    from gateway.session_history_mount import is_history_mount
-                    require_serving(authority)
-                    source = live.source
-                    if (is_history_mount(live) or source is None or source.platform != Platform.LOCAL
-                            or not source.user_id or not same_owner(source.user_id, actor.subject)):
-                        continue
-                else:
-                    stored = conn.execute('SELECT * FROM sessions WHERE id=?', (sid,)).fetchone()
-                    if stored is None:
-                        continue
-                    stored = dict(stored)
-                    if (stored.get('profile_name') not in (None, '', profile) or not stored.get('user_id')
-                            or not same_owner(stored['user_id'], actor.subject)):
-                        continue
-                    if any(stored.get(k) for k in ('session_key', 'chat_id', 'origin_json')):
-                        # The closed local session may no longer be in memory. Only a validated
-                        # local creation receipt for this exact physical transcript authorizes it.
-                        from hermes_state_local import POLICY_PREFIX
-                        from hermes_state_local_lineage import validate_local_lineage
-                        raw = conn.execute('SELECT value FROM state_meta WHERE key=?',
-                                           (POLICY_PREFIX + (stored.get('chat_id') or ''),)).fetchone()
-                        receipt = json.loads(raw[0]) if raw else {}
-                        if (receipt.get('profile_id') != actor.profile_id
-                                or receipt.get('session_id') != stored.get('chat_id')
-                                or not receipt.get('principal_id') or not same_owner(receipt['principal_id'], actor.subject)
-                                or receipt.get('route') != stored.get('session_key')
-                                or validate_local_lineage(conn, receipt) != sid):
-                            continue
-                    elif not legacy_history_row(stored):
-                        continue
-                    saved = conn.execute('SELECT value FROM state_meta WHERE key=?', (BINDING_PREFIX + sid,)).fetchone()
-                    if saved is not None and not binding_names(saved[0], actor.subject):
-                        continue
-                readable.append(row)
+                conn.row_factory = sqlite3.Row
+                conn.execute('BEGIN')
+                # The first read fixes the snapshot every later read in this transaction sees.
+                conn.execute('SELECT count(*) FROM sessions').fetchone()
             except Exception:
                 continue
-    return {"sessions": session_pr_status.resolve_batch(readable)}
+            try:
+                for index, sid in wanted:
+                    try:
+                        if not readable(conn, authority, actor, profile, sid):
+                            continue
+                        info = session_pr_status.evidence_in(conn, sid, config['receipt_roots'])
+                    except Exception:
+                        continue  # failed evidence collection does not establish coding
+                    if info is None:
+                        continue
+                    if actor.subject not in access:
+                        access[actor.subject] = session_pr_status.access_for(data_dir, actor.subject, config)
+                    found.append((index, {"profile": profile, "id": sid, "evidence": info,
+                                          "access": access[actor.subject]}))
+            finally:
+                try:
+                    conn.execute('ROLLBACK')
+                except Exception:
+                    pass
+    found.sort(key=lambda pair: pair[0])
+    return {"sessions": session_pr_status.resolve_batch([item for _, item in found])}
 
 
 @router.get("/serve/working")

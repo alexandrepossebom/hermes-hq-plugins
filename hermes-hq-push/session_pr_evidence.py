@@ -3,10 +3,16 @@
 Only structured tool calls and their paired results are considered. In particular,
 URLs in conversation, review output, and a checkout's *current* branch are not
 historical PR evidence. Conflicting identities fail closed instead of guessing.
+
+A transcript is data, never a pointer: no path recorded in history (a tool call's
+file, a ``cd``/``-C``/workdir, the session's recorded cwd or repo root) is opened,
+resolved, stat'ed or followed. Paths are compared as normalized text only. The one
+filesystem read is an owner-configured checkout root's own receipt file
+(``receipt_roots``), which comes from plugin configuration, not from history.
 """
-import configparser
 import json
 import os
+import posixpath
 import re
 import shlex
 import sqlite3
@@ -20,96 +26,117 @@ _REMOTE = re.compile(r'^(?:https://github\.com/|ssh://git@github\.com/|git@githu
 _CODE = re.compile(r'\.(?:py|js|jsx|ts|tsx|swift|go|rs|java|kt|c|cc|cpp|h|hpp|rb|php|html|css|sql|sh|yaml|yml|toml|json)$', re.I)
 _MAX_ROWS = 400
 _MAX_FIELD = 65536
+_RECEIPTS = 'hq-public-pr-receipts.jsonl'
+_RECEIPT_REPO = 'mrcharlesiv/hermes-hq-app'
+_MAX_RECEIPT_BYTES = 4_000_000
+_MAX_WORKTREES = 256
 
 
 def _path(value, base=None):
-    if not isinstance(value, str) or not value or '$' in value or '`' in value or '\x00' in value:
+    """Normalize a recorded path as text. Never touches the filesystem (no resolve, no ~user lookup)."""
+    if not isinstance(value, str) or not value or len(value) > 4096:
         return None
-    p = Path(value).expanduser()
-    if not p.is_absolute():
+    if any(c in value for c in '$`\x00\n\r') or value.startswith('~'):
+        return None
+    if not value.startswith('/'):
         if not base:
             return None
-        p = Path(base) / p
-    return str(p.resolve())
+        value = base.rstrip('/') + '/' + value
+    normal = posixpath.normpath(value)
+    if normal.startswith('//'):
+        normal = '/' + normal.lstrip('/')
+    return normal
 
 
-def _repository(path):
-    """Read only local git metadata; never run git, hooks, or transcript text."""
-    if not path:
+def _within(child, parent):
+    """Whether *child* is *parent* or lies below it, as text. A shallow parent (``/``, ``/tmp``)
+    is too broad to tie two unrelated checkouts together."""
+    if child is None or parent is None:
+        return False
+    if child == parent:
+        return True
+    return len([p for p in parent.split('/') if p]) >= 2 and child.startswith(parent.rstrip('/') + '/')
+
+
+def _canonical(path, aliases):
+    """Map a path inside a worktree this session added to the checkout it was added from."""
+    if path is None:
         return None
+    for target, source in aliases.items():
+        if source and _within(path, target):
+            return source + path[len(target):]
+    return path
+
+
+def _read_bounded(path, limit):
+    """Read a regular file under an owner-configured root, refusing symlinks and oversize files."""
+    flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0)
+    fd = os.open(path, flags)
     try:
-        start = Path(path)
-        for parent in (start, *start.parents):
-            dotgit = parent / '.git'
-            if dotgit.is_file():
-                text = dotgit.read_text()[:4096].strip()
-                if not text.startswith('gitdir: '):
-                    return None
-                resolved = _path(text[8:], str(parent))
-                if not resolved:
-                    return None
-                gitdir = Path(resolved)
-            elif dotgit.is_dir():
-                gitdir = dotgit
-            else:
+        info = os.fstat(fd)
+        import stat
+        if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+            raise OSError('not a bounded regular file')
+        with os.fdopen(fd, 'rb', closefd=False) as handle:
+            return handle.read(limit + 1).decode('utf-8')
+    finally:
+        os.close(fd)
+
+
+def _checkouts(root):
+    """The working trees of one configured main checkout: the root and its linked worktrees.
+
+    Reads only ``<root>/.git`` (which must be a real directory) and its ``worktrees/*/gitdir``
+    files; the worktree paths found there are compared as text, never opened.
+    """
+    gitdir = Path(root) / '.git'
+    if gitdir.is_symlink() or not gitdir.is_dir():
+        return None, set()
+    trees = {root}
+    worktrees = gitdir / 'worktrees'
+    if worktrees.is_dir() and not worktrees.is_symlink():
+        for index, entry in enumerate(sorted(worktrees.iterdir())):
+            if index >= _MAX_WORKTREES:
+                return None, set()
+            try:
+                text = _read_bounded(entry / 'gitdir', 4096).strip()
+            except (OSError, UnicodeDecodeError):
                 continue
-            common = gitdir / 'commondir'
-            if common.is_file():
-                resolved = _path(common.read_text()[:4096].strip(), str(gitdir))
-                if not resolved:
-                    return None
-                gitdir = Path(resolved)
-            config = configparser.RawConfigParser(strict=False, interpolation=None)
-            config.read(gitdir / 'config')
-            url = config.get('remote "origin"', 'url', fallback='').strip()
-            match = _REMOTE.fullmatch(url)
-            return match.group(1) if match else None
-    except (OSError, ValueError, TypeError, configparser.Error):
-        return None
-    return None
+            dotgit = _path(text)
+            if dotgit and dotgit.endswith('/.git'):
+                trees.add(dotgit[:-len('/.git')])
+    return gitdir, trees
 
 
-def _common_dir(path):
-    """Resolve git metadata without executing git, including linked worktrees."""
-    if not path:
-        return None
-    try:
-        start = Path(path)
-        for parent in (start, *start.parents):
-            dotgit = parent / '.git'
-            if dotgit.is_file():
-                text = dotgit.read_text()[:4096].strip()
-                if not text.startswith('gitdir: '): return None
-                resolved = _path(text[8:], str(parent))
-                if not resolved: return None
-                gitdir = Path(resolved)
-            elif dotgit.is_dir():
-                gitdir = dotgit.resolve()
-            else:
-                continue
-            common = gitdir / 'commondir'
-            return _path(common.read_text()[:4096].strip(), str(gitdir)) if common.is_file() else str(gitdir)
-    except (OSError, ValueError):
-        return None
-    return None
+def _local_receipts(roots, contexts, branch):
+    """Read explicitly enabled producer receipts from one configured checkout, rejecting conflicts.
 
-
-def _local_receipts(common, branch):
-    """Read explicitly enabled local producer receipts, rejecting conflicts."""
-    if os.environ.get('HERMES_HQ_PUBLIC_PR_RECEIPTS') != '1' or not common or not branch:
+    Every context must lie within the same configured checkout (its root or one of its linked
+    worktrees, compared as text); the session's own paths decide nothing about where to read.
+    """
+    if (os.environ.get('HERMES_HQ_PUBLIC_PR_RECEIPTS') != '1' or not roots or not branch
+            or not contexts or None in contexts):
         return set()
-    path = Path(common) / 'hq-public-pr-receipts.jsonl'
+    owners = set()
+    for root in roots:
+        try:
+            gitdir, trees = _checkouts(root)
+        except OSError:
+            continue
+        if gitdir is not None and all(any(_within(context, tree) for tree in trees) for context in contexts):
+            owners.add(gitdir)
+    if len(owners) != 1:
+        return set()
     try:
-        if path.is_symlink() or path.stat().st_size > 4_000_000:
-            return set()
-        entries = [json.loads(line) for line in path.read_text().splitlines()]
+        text = _read_bounded(next(iter(owners)) / _RECEIPTS, _MAX_RECEIPT_BYTES)
+        entries = [json.loads(line) for line in text.splitlines()]
         matches = set()
         for entry in entries:
             if not isinstance(entry, dict) or entry.get('version') != 1:
                 return set()
             if entry.get('branch') == branch:
                 match = _PR.fullmatch(entry.get('url', ''))
-                if not match or match.group(1) != 'mrcharlesiv/hermes-hq-app':
+                if not match or match.group(1) != _RECEIPT_REPO:
                     return set()
                 matches.add((match.group(1), int(match.group(2))))
         for repo, number in matches:
@@ -118,7 +145,7 @@ def _local_receipts(common, branch):
                    for entry in entries):
                 return set()
         return matches
-    except (OSError, ValueError, TypeError):
+    except (OSError, ValueError, TypeError, UnicodeDecodeError):
         return set()
 
 
@@ -233,11 +260,11 @@ def _gh_create(tokens):
     return tokens[1:i] + tokens[i + 2:]
 
 
-def evidence(profile: str, session_id: str) -> dict | None:
-    """Return coding evidence, {} if identity is uncertain, or None for noncoding.
+def evidence(profile: str, session_id: str, receipt_roots=()) -> dict | None:
+    """Open one profile's store read-only in a single snapshot and read a session's evidence.
 
-    Rows are queried read-only and isolated by both profile and session id. An
-    Inaccessible, truncated, or unsupported history is uncertain, not noncoding.
+    The HTTP route never uses this: it reads evidence on the same connection and snapshot it
+    authorized on (:func:`evidence_from_conn`). This wrapper exists for tools and tests.
     """
     profile = profile or 'default'
     if not isinstance(profile, str) or not _PROFILE.fullmatch(profile) or profile in ('.', '..') or not session_id:
@@ -247,17 +274,39 @@ def evidence(profile: str, session_id: str) -> dict | None:
         path = Path(get_profile_dir(profile)) / 'state.db'
         if not path.is_file():
             return None
-        with closing(sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=0.5)) as db:
-            snapshot = db.execute('SELECT cwd, git_branch, git_repo_root FROM sessions WHERE id = ?',
-                                  (session_id,)).fetchone()
-            if snapshot is None:
-                return None
-            rows = db.execute("SELECT role, substr(tool_calls,1,?), tool_call_id, CASE WHEN role='tool' THEN substr(content,1,?) END, "
-                              "length(tool_calls), CASE WHEN role='tool' THEN length(content) END FROM messages "
-                              "WHERE session_id = ? AND ((role = 'assistant' AND tool_calls IS NOT NULL) "
-                              "OR (role = 'tool' AND tool_name IN ('terminal','functions.terminal'))) ORDER BY id DESC LIMIT ?",
-                              (_MAX_FIELD, _MAX_FIELD, session_id, _MAX_ROWS + 1)).fetchall()
+        with closing(sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=0.5,
+                                     isolation_level=None)) as db:
+            db.execute('BEGIN')
+            try:
+                return evidence_from_conn(db, session_id, receipt_roots)
+            finally:
+                db.execute('ROLLBACK')
     except (sqlite3.Error, OSError, ValueError):
+        return None  # No evidence that this is even a coding session.
+
+
+def evidence_from_conn(db, session_id: str, receipt_roots=()) -> dict | None:
+    """Return coding evidence, {} if identity is uncertain, or None for noncoding.
+
+    *db* is the caller's read-only connection, inside the caller's read transaction, so the
+    rows read here are the same snapshot the caller authorized against. Rows are isolated by
+    session id. An inaccessible history is not coding; a truncated one is uncertain.
+    """
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    try:
+        snapshot = db.execute('SELECT cwd, git_branch, git_repo_root FROM sessions WHERE id = ?',
+                              (session_id,)).fetchone()
+        if snapshot is None:
+            return None
+        snapshot = tuple(snapshot)
+        rows = [tuple(row) for row in db.execute(
+            "SELECT role, substr(tool_calls,1,?), tool_call_id, CASE WHEN role='tool' THEN substr(content,1,?) END, "
+            "length(tool_calls), CASE WHEN role='tool' THEN length(content) END FROM messages "
+            "WHERE session_id = ? AND ((role = 'assistant' AND tool_calls IS NOT NULL) "
+            "OR (role = 'tool' AND tool_name IN ('terminal','functions.terminal'))) ORDER BY id DESC LIMIT ?",
+            (_MAX_FIELD, _MAX_FIELD, session_id, _MAX_ROWS + 1)).fetchall()]
+    except (sqlite3.Error, ValueError):
         return None  # No evidence that this is even a coding session.
 
     incomplete = len(rows) > _MAX_ROWS or any((a or 0) > _MAX_FIELD or (b or 0) > _MAX_FIELD
@@ -267,7 +316,7 @@ def evidence(profile: str, session_id: str) -> dict | None:
     pending = {}
     coding = False
     repos, branches, numbers = set(), set(), set()
-    repo_contexts, branch_contexts, coding_contexts = [], [], []
+    repo_contexts, branch_contexts, coding_contexts, git_contexts = [], [], [], []
     aliases = {}
     snapshot_cwd = _path(snapshot[2]) or _path(snapshot[0])
     for role, raw_calls, call_id, content, _, _ in rows:
@@ -319,6 +368,7 @@ def evidence(profile: str, session_id: str) -> dict | None:
                     if _coding_git(git):
                         coding = True
                         coding_contexts.append(_command_path(tokens, cwd))
+                        git_contexts.append(_command_path(tokens, cwd))
                     if op in ('commit', 'worktree', 'switch', 'checkout', 'remote', 'branch'):
                         relevant.append(('git', git, _command_path(tokens, cwd)))
                 elif (gh := _gh_create(tokens)) is not None:
@@ -373,8 +423,7 @@ def evidence(profile: str, session_id: str) -> dict | None:
                         i += 1
                 if positional and context:
                     target = _path(positional[0], cwd)
-                    target_repo, source_repo = _repository(target), _repository(context)
-                    if target and (not target_repo or not source_repo or target_repo.lower() == source_repo.lower()):
+                    if target and target != context:
                         aliases[target] = context
             elif cmd[0] in ('switch', 'checkout'):
                 branch = _branch(_option(cmd[1:], '-b', '-B', '-c', '-C'))
@@ -409,45 +458,36 @@ def evidence(profile: str, session_id: str) -> dict | None:
     if branch := _branch(snapshot[1]):
         branches.add(branch)
         branch_contexts.append((branch, snapshot_cwd))
-    for context in coding_contexts:
-        repo = _repository(context)
-        if repo:
-            repos.add(repo)
-            repo_contexts.append((repo, context))
-    for branch, context in branch_contexts:
-        repo = _repository(context)
-        if repo:
-            repos.add(repo)
-            repo_contexts.append((repo, context))
+    # No repository is inferred from a recorded path: that would mean opening a checkout the
+    # history names (its .git, config or commondir). A repository comes only from recorded
+    # command output (a PR URL, `remote get-url origin`) or an explicit `gh -R`.
     private_receipt = False
     if len(branches) == 1 and branch_contexts:
         contexts = [context for _, context in branch_contexts] + coding_contexts
-        common_dirs = {_common_dir(context) for context in contexts}
-        if len(common_dirs) == 1 and None not in common_dirs:
-            common = next(iter(common_dirs))
-            for repo, number in _local_receipts(common, next(iter(branches))):
-                private_receipt = True
-                repos.add(repo)
-                numbers.add(number)
-                repo_contexts.append((repo, branch_contexts[0][1]))
+        for repo, number in _local_receipts(tuple(receipt_roots or ()), contexts, next(iter(branches))):
+            private_receipt = True
+            repos.add(repo)
+            numbers.add(number)
+            repo_contexts.append((repo, branch_contexts[0][1]))
     if len(repos) > 1 or len(branches) > 1 or len(numbers) > 1:
         return {}
+
+    def related(a, b):
+        # Text only: the same place, one inside the other, or inside a worktree this session added.
+        if a is None or b is None:
+            return a == b
+        a, b = _canonical(a, aliases), _canonical(b, aliases)
+        return _within(a, b) or _within(b, a)
     if repos and branches:
-        def related(a, b):
-            if a is None or b is None:
-                return a == b
-            if a == b or aliases.get(a) == b or aliases.get(b) == a:
-                return True
-            ca, cb = _common_dir(a), _common_dir(b)
-            if ca and ca == cb:
-                return True
-            ra, rb = _repository(a), _repository(b)
-            return bool(ra and rb and ra.lower() == rb.lower())
         if not all(any(related(bctx, rctx) for _, rctx in repo_contexts)
                    for _, bctx in branch_contexts):
             return {}
-        if any(context and _repository(context) and not any(related(context, bctx)
-               for _, bctx in branch_contexts) for context in coding_contexts):
+    if branches:
+        # Git work (a commit, a new branch, a worktree) somewhere the branch was not is a
+        # second checkout; which one a PR belongs to is unknown. A file written elsewhere
+        # (a scratch script) is not.
+        if any(context and not any(related(context, bctx) for _, bctx in branch_contexts)
+               for context in git_contexts):
             return {}
     result = {}
     if repos:

@@ -262,11 +262,27 @@ in trouble. A tile is drawn in it unless you ask a bot for another look (`app`, 
 Tiles made before keep the look they have until they are changed or remade. (0.9.59 and 0.9.60 were not published.)
 
 Version 0.9.65 lets Hermes HQ show a coding session's pull request status. The plugin checks that the signed-in
-person owns the local session, reads structured tool-call evidence locally without running it, and asks GitHub for
-status using the computer's `gh` sign-in. GitHub receives the inferred repository and pull request number or branch;
-message text and local paths are not sent. Uncertain evidence or an unavailable GitHub answer is shown as unknown.
-The endpoint needs a Hermes runtime with the session ownership APIs; it takes effect when the serving process next
-loads the updated plugin. The companion app must support the status display.
+person owns the local session and reads structured tool-call evidence locally, without running it, on the same
+read-only snapshot of the session store it checked ownership on. A path recorded in history (a file a bot wrote,
+a `cd`, the session's folder) is compared as text and never opened, so the repository comes only from recorded
+command output such as a pull request link or `git remote get-url origin`.
+
+The computer's own GitHub sign-in (`gh`, `GH_TOKEN`) is never used, and a repository or branch that was only
+inferred from history is not sent to GitHub unless you allow it in `plugin-data/hermes-hq-push`:
+
+- `session-pr.json` with `"public_repos": ["owner/repo"]` declares repositories public. GitHub is then asked
+  without any sign-in, and only about a pull request number the session recorded. A branch name is never sent,
+  because it may exist only on this computer.
+- `session-pr-github/<sha256 of your sign-in subject>.token` holds a GitHub token of your own (mode 0600). GitHub
+  is then asked with that token, for your own sessions only. This is the only way a branch search, or a `none`
+  answer (no pull request yet), can happen.
+- `"receipt_roots": ["/path/to/checkout"]` in `session-pr.json`, together with `HERMES_HQ_PUBLIC_PR_RECEIPTS=1`,
+  lets a configured checkout's public-export receipts give the pull request number.
+
+In every other case the session shows unknown, and so does uncertain evidence or an unavailable GitHub answer.
+The status reports `sessionPRStatus: true` only on a Hermes runtime that has every session ownership API the
+endpoint uses; elsewhere the endpoint answers 501. The change takes effect when the serving process next loads
+the updated plugin, and the companion app must support the status display.
 
 Version 0.9.58 ties a plugin update you approve in the app to what the app showed you (the last open finding of the
 outside review). Hermes fetches the new version into a copy before it asks anything, and lists what that copy needs
