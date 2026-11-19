@@ -1,4 +1,4 @@
-"""Ask-to-act cards (``askCards`` in /status): before a bot does something for the person (answers a message for them,
+"""Ask-to-act cards (``actCards`` in /status; ``askCards`` is the older clarify note, ask_cards.py): before a bot does something for the person (answers a message for them,
 replies in a thread, books, files, changes something), it asks with ``ask_to_act`` and the Hermes HQ app draws the
 call as one card: where it came from (app, who, where, when), their words, the files they sent, a link to open the
 conversation, the question, a button per choice (Yes / No unless the bot names others, its pick first), "Something
@@ -158,9 +158,9 @@ def note_cards(data_dir: Path) -> None:
 
 
 def status(data_dir: Path) -> dict:
-    """`askCards`: ask_to_act exists here (false while asks.off turns it off). `askCardsShown`: an app has said it
+    """`actCards`: ask_to_act exists here (false while asks.off turns it off). `actCardsShown`: an app has said it
     draws the card, so bots have the tool; an app that draws it and reads false answers with PUT /asks/cards."""
-    return {"askCards": switched_on(data_dir), "askCardsShown": cards_shown(data_dir)}
+    return {"actCards": switched_on(data_dir), "actCardsShown": cards_shown(data_dir)}
 
 
 def _text(args, key: str) -> str:

@@ -57,12 +57,12 @@ def test_fixed_vector():
 def test_only_after_an_app_says_it_draws_the_card(tmp_path):
     tool = registered(tmp_path)
     assert tool["check_fn"]() is False
-    assert asks.status(tmp_path) == {"askCards": True, "askCardsShown": False}
+    assert asks.status(tmp_path) == {"actCards": True, "actCardsShown": False}
     asks.note_cards(tmp_path)
     assert tool["check_fn"]() is True
     (tmp_path / asks.SWITCH).touch()
     assert tool["check_fn"]() is False
-    assert asks.status(tmp_path)["askCards"] is False
+    assert asks.status(tmp_path)["actCards"] is False
 
 
 def test_a_gateway_turn_is_told_to_ask_in_text(tmp_path):
