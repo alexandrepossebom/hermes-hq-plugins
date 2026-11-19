@@ -751,7 +751,7 @@ PAGE = """<!doctype html><meta name=viewport content="width=device-width"><title
 <body style="margin:0;height:3000px"><button id=b style="position:absolute;left:0;top:0;width:400px;height:200px">Tap</button>
 <input id=i style="position:absolute;left:0;top:220px;width:400px;height:60px">
 <script>b.onclick=()=>{location.search='tapped'};i.onkeydown=e=>{if(e.key==='Enter')location.search='entered-'+i.value};
-let downAt=null;addEventListener('mousedown',e=>{downAt=e.clientX});addEventListener('mouseup',e=>{if(downAt!==null&&e.clientX-downAt>50&&e.buttons===0)location.search='dragged';downAt=null})</script>"""
+let downAt=null,held=0;addEventListener('mousedown',e=>{downAt=e.clientX;held=0});addEventListener('mousemove',e=>{if(downAt!==null&&e.buttons===1)held++});addEventListener('mouseup',e=>{if(downAt!==null&&e.clientX-downAt>50&&e.buttons===0)location.search='dragged-'+held;downAt=null})</script>"""
 
 FORM = """<!doctype html><title>Form</title><body style="margin:0;font:16px sans-serif">
 <input name=email autocomplete=username style="position:absolute;left:0;top:10px;width:300px;height:40px">
@@ -946,10 +946,12 @@ class LiveTests(unittest.TestCase):
             # A drag: press, move, let go, read back as the page's own mouse events.
             await ws.send(json.dumps({"type": "move", "x": 0.05, "y": 0.6, "epoch": epoch}))
             await ws.send(json.dumps({"type": "down", "x": 0.05, "y": 0.6, "epoch": epoch}))
-            for step in range(1, 4):
-                await ws.send(json.dumps({"type": "move", "x": 0.05 + step * 0.1, "y": 0.6, "epoch": epoch}))
+            # 3.12.0: sent in one burst, faster than the page takes them, and every sample still arrives (a drag used to
+            # keep only its newest point while the one before was being sent).
+            for step in range(1, 25):
+                await ws.send(json.dumps({"type": "move", "x": 0.05 + step * 0.0125, "y": 0.6, "epoch": epoch}))
             await ws.send(json.dumps({"type": "up", "x": 0.35, "y": 0.6, "epoch": epoch}))
-            await until(lambda m: m["type"] == "state" and any(t["url"].endswith("?dragged") for t in m["tabs"]))
+            await until(lambda m: m["type"] == "state" and any(t["url"].endswith("?dragged-24") for t in m["tabs"]))
             await ws.send(json.dumps({"type": "give"}))
             await until(lambda m: m["type"] == "state" and m["control"]["state"] == "bot")
             self.assertIsNone(self.spool.read(self.spool.folder("control") / f"{self.record['id']}.json"))

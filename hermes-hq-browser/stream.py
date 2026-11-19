@@ -70,6 +70,7 @@ STILL_HIDDEN = 0.5       # a background tab (Chrome paints only its front tab) i
 FOLLOW_SETTLE = 2.0      # after the view moves to another tab, another tab's new address waits this long to take it
 PHONE_SILENT = 12.0      # frames went out and the phone said nothing for this long: it is gone (a half-open socket)
 MAX_INBOX = 256          # phone input waiting for the page; merged typing and scrolling take one slot a burst
+DRAG_MOVES = 96          # a drag's pointer samples that may wait for the page; past that only the newest is kept
 MAX_TEXT = 4096
 MAX_WHEEL = 4000
 GRACE = 2.0              # a request waits at least this long for the bots' pause promises (agents publish each second)   # a held browser stays held this long after its viewer drops (switching apps for a code)
@@ -241,6 +242,8 @@ class Viewer:
         self.switched_at = 0.0  # when following last moved the view to another tab
         self.fronted = None     # (the tab brought forward for the person, the tab that was in front before) while held
         self.next_move = None   # the newest pointer move not yet sent to the page
+        self.dragging = False   # the viewer's button is down (as received, ahead of what the page has been sent)
+        self.drag_moves = 0     # a drag's own samples waiting in the inbox
         self.framed_at = 0.0    # when a frame last went to the phone
         self.stilled_at = 0.0   # when a fallback still was last taken
         self.checked_chrome = 0.0  # when a quiet Chrome was last asked whether it still answers
@@ -481,12 +484,21 @@ class Viewer:
         elif kind == "follow":
             self.follow = True
             self.changed = True
+        elif kind == "move" and self.dragging and self.drag_moves < DRAG_MOVES and self._queue({**message, "_held": True}, report=False):
+            # 3.12.0: with the button down every sample reaches the page, in order. A drag used to keep only its newest
+            # point while the one before was being sent, so a slider or a drawn line jumped ahead in steps (a tester
+            # measured one 70 px jump a drag); a page that falls DRAG_MOVES samples behind gets the newest only, as before.
+            self.drag_moves += 1
         elif kind == "move":
             fresh = self.next_move is None
             self.next_move = message  # a pointer only needs its newest position
             if fresh and not self._queue({"type": "move"}, report=False):
                 self.next_move = None
         elif kind in ("take", "give", "tap", "down", "up", "scroll", "text", "key", "go", "nav", "copy", "select_all", "answer"):
+            if kind == "down":
+                self.dragging, self.drag_moves = True, 0
+            elif kind in ("up", "tap", "take", "give"):
+                self.dragging = False
             self._queue(message)
         self.wake.set()
 
@@ -528,7 +540,10 @@ class Viewer:
             await self._lift()
             self._release()
             return
-        if kind == "move":
+        held = kind == "move" and message.get("_held") is True
+        if held:
+            self.drag_moves = max(0, self.drag_moves - 1)
+        elif kind == "move":
             message, self.next_move = self.next_move or message, None
         claim = self._control()
         if (not claim or claim.get("viewer") != self.viewer_id or claim.get("state") != "controlled"
@@ -600,8 +615,8 @@ class Viewer:
             text = found.get("text") if isinstance(found, dict) else None
             await self.send_text({"type": "copied", "text": text[:65536] if isinstance(text, str) else ""})
         typing_on = any(m.get("type") in ("text", "key") for m in self.inbox)
-        if kind == "move":
-            await self._sense(under=True)
+        if kind == "move" and not held:
+            await self._sense(under=True)   # a drag's samples don't each ask what is under them: "up" does
         elif kind in ("tap", "up", "go", "nav", "select_all"):
             await self._sense(under=kind in ("tap", "up"), focus=True)
         elif kind == "key" and message.get("key") in ("Enter", "Tab", "Escape") and not typing_on:
