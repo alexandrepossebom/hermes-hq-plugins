@@ -256,6 +256,12 @@ made, its history) and what its bot writes with `tasks_update(page={summary, nex
 next, and parts such as options compared in a table, the numbers that matter, or what it found. The bot writes words,
 never HTML. The `task-page` skill (hermes-hq-push:task-page) tells bots what goes on it.
 
+Version 0.9.71 answers a coding project's marks quickly on a busy computer. Each question to git is a process, and
+0.9.70 asked about six per chat every time (measured on a computer that was building: 10 seconds for 64 chats). What
+git said is now kept for as long as it stays true: a repository's branches and their tips are read in one question
+every 20 seconds, and nothing else is asked again until a branch or main moves (the same 64 chats: 0.04 seconds,
+two questions). The answers are the same.
+
 Version 0.9.70 lets you say two things from the app instead of a file. Mark as Closed on a chat in a coding project
 puts the closed mark on it until you reopen it (`PUT /sessions/pr-mark`, kept in `session-pr-marks.json`): a label
 only, nothing in any repository changes, and work that has since reached main shows as merged regardless. Repository…

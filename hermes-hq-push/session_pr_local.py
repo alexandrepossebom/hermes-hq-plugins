@@ -19,6 +19,7 @@ What it says, per branch:
   publisher ran, which read as a mistake). Once public, a receipt file names the pull request.
 * ``closed``: the branch was deleted with its commits in no branch and not in main (given up).
 """
+import hashlib
 import json
 import os
 import re
@@ -287,8 +288,36 @@ def _git(path, *args):
     return done.stdout if done.returncode == 0 else None
 
 
+# What git said is kept for as long as it stays true, because each question is a process started on a
+# computer that may be busy building (measured: 180 questions and 12 s for 32 chats under load). A
+# repository costs one question per TTL (its branches and their tips); everything else is asked once per
+# main commit, per branch tip or per commit, and a batch of chats whose branches didn't move asks nothing.
+_static = {}         # path -> its git folder
+_by_main = {}        # (path, main sha) -> main's own line; (path, main sha, 'merges') -> its merge commits
+_facts = {}          # (path, question, …) -> the answer, for questions whose answer can't change
+_MAX_FACTS = 50000
+
+
+def _fact(key, ask):
+    with _lock:
+        if key in _facts:
+            return _facts[key]
+    value = ask()
+    with _lock:
+        if len(_facts) > _MAX_FACTS:
+            _facts.clear()
+        _facts[key] = value
+    return value
+
+
+def _contains(path, commit, tip):
+    """Whether *tip*'s history holds *commit* (two commit ids: the answer never changes)."""
+    return _fact((path, 'in', commit, tip), lambda: _git(path, 'merge-base', '--is-ancestor', commit, tip) is not None)
+
+
 def _snapshot(repo):
-    """main, its own line of commits (newest first, with subjects), the marker and the receipts."""
+    """main, its own line of commits (newest first, with subjects), every branch's tip, the marker and
+    the receipts."""
     path = repo['path']
     now = time.monotonic()
     with _lock:
@@ -296,14 +325,39 @@ def _snapshot(repo):
         if kept and kept[0] > now:
             return kept[1]
     snap = None
-    common = (_git(path, 'rev-parse', '--path-format=absolute', '--git-common-dir') or '').strip()
-    main = (_git(path, 'rev-parse', '--verify', '--quiet', repo['main'] + '^{commit}') or '').strip()
+    common = _static.get(path)
+    if common is None:
+        common = (_git(path, 'rev-parse', '--path-format=absolute', '--git-common-dir') or '').strip()
+        if common:
+            _static[path] = common
+    listed = _git(path, 'for-each-ref', '--format=%(objectname) %(refname)', 'refs/heads', 'refs/remotes') if common else None
+    heads, remotes = {}, {}
+    for line in (listed or '').splitlines():
+        sha, _, ref = line.partition(' ')
+        if ref.startswith('refs/heads/'):
+            heads[ref[len('refs/heads/'):]] = sha
+        elif ref.startswith('refs/remotes/'):
+            remotes[ref[len('refs/remotes/'):]] = sha
+    main = heads.get(repo['main']) or remotes.get(repo['main']) or ''
+    if common and listed is not None and not main:      # a main named some other way (a tag, a full ref)
+        main = (_git(path, 'rev-parse', '--verify', '--quiet', repo['main'] + '^{commit}') or '').strip()
     if common and _SHA.fullmatch(main):
-        chain, subjects = [], {}
-        for line in (_git(path, 'log', '--first-parent', f'--max-count={_CHAIN}', '--format=%H %s', main) or '').splitlines():
-            sha, _, subject = line.partition(' ')
-            chain.append(sha)
-            subjects[sha] = subject
+        def line():
+            chain, subjects = [], {}
+            for row in (_git(path, 'log', '--first-parent', f'--max-count={_CHAIN}', '--format=%H %s', main) or '').splitlines():
+                sha, _, subject = row.partition(' ')
+                chain.append(sha)
+                subjects[sha] = subject
+            return chain, {sha: i for i, sha in enumerate(chain)}, subjects
+        with _lock:
+            for key in [k for k in _by_main if k[0] == path and k[1] != main]:
+                del _by_main[key]            # an older main's line is not asked about again
+            known = _by_main.get((path, main))
+        if known is None:
+            known = line()
+            with _lock:
+                _by_main[(path, main)] = known
+        chain, index, subjects = known
         marker = None
         if repo['published_marker']:
             try:
@@ -316,9 +370,9 @@ def _snapshot(repo):
             try:
                 file = Path(common) / repo['receipts']
                 if file.is_file() and not file.is_symlink() and file.stat().st_size <= 4_000_000:
-                    for line in file.read_text().splitlines():
+                    for row in file.read_text().splitlines():
                         try:
-                            entry = json.loads(line)
+                            entry = json.loads(row)
                         except ValueError:
                             continue
                         commit, url = (entry.get('commit'), entry.get('url')) if isinstance(entry, dict) else (None, None)
@@ -327,11 +381,34 @@ def _snapshot(repo):
                             receipts[commit[:8]] = (match.group(1), int(match.group(2)))
             except (OSError, UnicodeDecodeError):
                 receipts = {}
-        snap = {'main': main, 'chain': chain, 'index': {sha: i for i, sha in enumerate(chain)}, 'subjects': subjects,
-                'marker': marker, 'receipts': receipts}
+        snap = {'main': main, 'chain': chain, 'index': index, 'subjects': subjects, 'marker': marker,
+                'receipts': receipts, 'heads': heads,
+                # Every branch and its tip, in one word: an answer is good until this changes.
+                'refs': hashlib.sha1((listed or '').encode()).hexdigest()}
     with _lock:
         _repo_cache[path] = (now + TTL, snap)
     return snap
+
+
+def _merges(repo, snap):
+    """The merge commits in main's history, newest first, as ``(commit, subject)`` (asked once per main)."""
+    key = (repo['path'], snap['main'], 'merges')
+    with _lock:
+        known = _by_main.get(key)
+    if known is None:
+        out = _git(repo['path'], 'log', '--merges', '--max-count=20000', '--format=%H %s', snap['main']) or ''
+        known = [tuple(row.partition(' ')[::2]) for row in out.splitlines()]
+        with _lock:
+            _by_main[key] = known
+    return known
+
+
+def _merged_branches(repo, snap):
+    """The branches whose tip main already holds: one question for all of them, per main and set of tips."""
+    def ask():
+        out = _git(repo['path'], 'for-each-ref', '--merged', snap['main'], '--format=%(refname)', 'refs/heads')
+        return None if out is None else frozenset(ref[len('refs/heads/'):] for ref in out.splitlines())
+    return _fact((repo['path'], 'merged', snap['main'], snap['refs']), ask)
 
 
 def _landed(repo, snap, commit):
@@ -340,11 +417,11 @@ def _landed(repo, snap, commit):
     if commit in snap['index']:
         return commit
     low, high = 0, len(chain) - 1          # newest first: containing commits are a prefix
-    if high < 0 or _git(repo['path'], 'merge-base', '--is-ancestor', commit, chain[high]) is not None:
+    if high < 0 or _contains(repo['path'], commit, chain[high]):
         return None                         # older than the part of main that was read
     while low < high:
         middle = (low + high + 1) // 2
-        if _git(repo['path'], 'merge-base', '--is-ancestor', commit, chain[middle]) is not None:
+        if _contains(repo['path'], commit, chain[middle]):
             low = middle
         else:
             high = middle - 1
@@ -352,14 +429,13 @@ def _landed(repo, snap, commit):
 
 
 def _merged_answer(repo, snap, commit, branch):
-    """In main. *commit* (the branch's tip or a commit of it, when known) says whether main's public
-    copy has it yet, and which pull request carried it."""
+    """In main. *commit* (the branch's tip or a commit of it, when known) says which pull request
+    carried it, once main's public copy has it."""
     answer = {'state': 'merged', 'branch': branch}
     marker = snap['marker']
     public = True
     if repo['published_marker'] and marker != snap['main']:
-        public = marker is not None and commit is not None \
-            and _git(repo['path'], 'merge-base', '--is-ancestor', commit, marker) is not None
+        public = marker is not None and commit is not None and _contains(repo['path'], commit, marker)
     if public and commit is not None and snap['receipts']:
         landed = _landed(repo, snap, commit)
         receipt = snap['receipts'].get(landed[:8]) if landed else None
@@ -386,9 +462,11 @@ def _given_up(repo, snap, commit, branch):
     """A commit whose branch is gone: merged if main has it, still waiting if another branch carries
     it (a rename), else closed."""
     path = repo['path']
-    if _git(path, 'merge-base', '--is-ancestor', commit, snap['main']) is not None:
+    if _contains(path, commit, snap['main']):
         return _merged_answer(repo, snap, commit, branch)
-    if (_git(path, 'for-each-ref', '--count=1', '--format=%(refname)', '--contains', commit, 'refs/heads') or '').strip():
+    carried = _fact((path, 'carried', commit, snap['refs']), lambda: bool(
+        (_git(path, 'for-each-ref', '--count=1', '--format=%(refname)', '--contains', commit, 'refs/heads') or '').strip()))
+    if carried:
         return _draft(repo, branch)
     answer = {'state': 'closed', 'branch': branch}
     if repo['public_repo']:
@@ -403,17 +481,21 @@ def _branch_answer(repo, snap, branch, shas, tips=None):
     apart: merged, or given up."""
     path = repo['path']
     memory = f'{path}\n{branch}'
-    tip = (_git(path, 'rev-parse', '--verify', '--quiet', f'refs/heads/{branch}^{{commit}}') or '').strip()
+    tip = snap['heads'].get(branch, '')
     if _SHA.fullmatch(tip):
-        if _git(path, 'merge-base', '--is-ancestor', tip, snap['main']) is not None:
-            if tip in snap['index'] and not any(_exists(path, sha) for sha in shas):
+        merged = _merged_branches(repo, snap)
+        if merged is None:
+            return None
+        if branch in merged:
+            if tip in snap['index'] and not any(_exists(repo, snap, sha) for sha in shas):
                 # On main's own line: main was moved up to it (a fast-forward), or it never got a
                 # commit. Its own log says: the commit it was made from, and whether it moved since.
-                moves = (_git(path, 'reflog', 'show', '--format=%H', f'refs/heads/{branch}') or '').split()
+                moves = _fact((path, 'moves', branch, tip), lambda: (
+                    _git(path, 'reflog', 'show', '--format=%H', f'refs/heads/{branch}') or '').split())
                 if not moves or moves[-1] == tip:
                     return _NOTHING
             return _merged_answer(repo, snap, tip, branch)
-        ahead = _git(path, 'cherry', snap['main'], tip)
+        ahead = _fact((path, 'cherry', snap['main'], tip), lambda: _git(path, 'cherry', snap['main'], tip))
         if ahead is None:
             return None
         if any(line.startswith('+') for line in ahead.splitlines()):
@@ -424,24 +506,35 @@ def _branch_answer(repo, snap, branch, shas, tips=None):
             return _NOTHING        # nothing of its own (a branch behind main)
         return _merged_answer(repo, snap, None, branch)      # every change is in main under another commit
     # The branch is gone (deleted after its merge, as many do). Its commits, or a merge that names it, say.
-    known = [sha for sha in shas if _exists(path, sha)]
+    known = [sha for sha in shas if _exists(repo, snap, sha)]
     remembered = tips.get(memory) if tips is not None else None
-    if remembered and _SHA.fullmatch(remembered) and _exists(path, remembered):
+    if remembered and _SHA.fullmatch(remembered) and _exists(repo, snap, remembered):
         known.append(remembered)
     if known:
         return _given_up(repo, snap, known[-1], branch)
     # A merge commit in main's history that names the branch ("Merge branch 'x'", "… into x").
     named = re.compile(r'(?<![A-Za-z0-9._/-])' + re.escape(branch) + r'(?![A-Za-z0-9_/-])')
-    out = _git(path, 'log', '--merges', '--fixed-strings', f'--grep={branch}', '--max-count=20', '--format=%H %s', snap['main'])
-    for line in (out or '').splitlines():
-        sha, _, subject = line.partition(' ')
-        if subject.startswith('Merge') and named.search(subject):
+    for sha, subject in _merges(repo, snap):
+        if branch in subject and subject.startswith('Merge') and named.search(subject):
             return _merged_answer(repo, snap, sha, branch)
     return None
 
 
-def _exists(path, sha):
-    return bool(_SHA.fullmatch(sha)) and _git(path, 'cat-file', '-e', sha + '^{commit}') is not None
+def _exists(repo, snap, sha):
+    """Whether the repository has that commit. Yes is for good; no holds until a branch moves."""
+    if not _SHA.fullmatch(sha):
+        return False
+    path = repo['path']
+    with _lock:
+        if (path, 'has', sha) in _facts:
+            return True
+    def ask():
+        return _git(path, 'cat-file', '-e', sha + '^{commit}') is not None
+    if _fact((path, 'lacks', sha, snap['refs']), lambda: not ask()):
+        return False
+    with _lock:
+        _facts[(path, 'has', sha)] = True
+    return True
 
 
 _RANK = {'draft': 3, 'merged': 2, 'closed': 1}
@@ -463,29 +556,28 @@ def local_state(work, repos, tips=None):
     for branch, shas in items:
         placed = False
         for repo, snap in snaps:
-            key = (repo['path'], snap['main'], snap['marker'], len(snap['receipts']), branch, shas)
+            remembered = tips.get(f"{repo['path']}\n{branch}") if tips is not None and branch is not None else None
+            # Everything an answer rests on: main, the marker, every branch's tip, the receipts, the tip remembered.
+            key = (repo['path'], snap['main'], snap['marker'], snap['refs'], len(snap['receipts']), branch, shas, remembered)
             with _lock:
                 cached = _answer_cache.get(key, False)
             if cached is False:
                 if branch is None:
                     sha = shas[0]
                     cached = None
-                    if _exists(repo['path'], sha):
+                    if _exists(repo, snap, sha):
                         cached = _NOTHING
-                        if sha not in snap['index'] and _git(repo['path'], 'merge-base', '--is-ancestor', sha, snap['main']) is not None:
+                        if sha not in snap['index'] and _contains(repo['path'], sha, snap['main']):
                             cached = _merged_answer(repo, snap, sha, None)
                             cached.pop('branch', None)
                 elif not _plain_branch(branch):
                     cached = None
                 else:
                     cached = _branch_answer(repo, snap, branch, shas, tips)
-                # A draft, a given-up or a missing branch can change without main moving (more commits, a
-                # new branch, a deleted one).
-                if cached is not None and cached['state'] not in ('draft', 'closed'):
-                    with _lock:
-                        if len(_answer_cache) > 20000:
-                            _answer_cache.clear()
-                        _answer_cache[key] = cached
+                with _lock:
+                    if len(_answer_cache) > 20000:
+                        _answer_cache.clear()
+                    _answer_cache[key] = cached
             if cached is None:
                 continue
             placed = True
