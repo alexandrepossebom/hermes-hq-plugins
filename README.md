@@ -256,7 +256,7 @@ made, its history) and what its bot writes with `tasks_update(page={summary, nex
 next, and parts such as options compared in a table, the numbers that matter, or what it found. The bot writes words,
 never HTML. The `task-page` skill (hermes-hq-push:task-page) tells bots what goes on it.
 
-Version 0.9.68 makes those marks follow your own repositories, for the common case where no chat opens a pull
+Version 0.9.69 makes those marks follow your own repositories, for the common case where no chat opens a pull
 request by hand: a chat works on a branch, the branch is merged into main, and main is published elsewhere. List the
 repositories in `plugin-data/hermes-hq-push/session-pr.json`:
 
@@ -270,7 +270,8 @@ branch counts as a chat's own only when the chat, or a subagent it started, made
 history is run, and git is asked read-only, inside the listed repositories only. A pull request the chat opened itself
 with `gh pr create` still shows as GitHub has it, and comes first while it waits. A chat that made a branch none of
 the listed repositories knows shows unknown, not "no pull request". Running a script that publishes other chats'
-merged work no longer makes its pull requests the chat's own (0.9.67 did).
+merged work no longer makes its pull requests the chat's own (0.9.67 did). (0.9.68, Goals, is installed from another
+branch and not published here yet.)
 
 Version 0.9.67 lets Hermes HQ show what became of the pull requests a chat opened: none yet, draft, open, merged
 or closed. A pull request counts as a chat's own only when that chat (or a subagent it started) opened it and the
