@@ -604,12 +604,26 @@ def sessions_pr_status(body: SessionPRBatchIn, request: Request):
         saved = conn.execute('SELECT value FROM state_meta WHERE key=?', (BINDING_PREFIX + sid,)).fetchone()
         return saved is None or binding_names(saved[0], actor.subject)
 
+    def caller(profile):
+        state = request.state
+        if (getattr(state, 'hosted_http_authenticated', None) is True
+                and getattr(state, 'native_http_principal', None) is None and getattr(state, 'session', None) is None):
+            # Served in a plugin host: Hermes judged the sign-in on its own side of the private channel
+            # and sent only the verdict, no login. Hermes is single-user (gateway.owner_identity): an
+            # admitted caller is the machine's owner. There is no live authority here; the store decides.
+            from gateway.owner_identity import host_owner_subject
+            from gateway.session_contract import SessionActor
+            from hermes_cli.web_server_cron import _cron_profile_home
+            home = Path(_cron_profile_home(profile)[1]).resolve()
+            return None, SessionActor(host_owner_subject(), str(home), frozenset({'session:read'}), 'http')
+        return _session_mutation_context(request, profile)
+
     found = []
     access = {}
     for profile, wanted in profiles.items():
         # A denied or unavailable profile must not hide its readable neighbours.
         try:
-            authority, actor = _session_mutation_context(request, profile)
+            authority, actor = caller(profile)
             home = Path(get_profile_dir(profile)).resolve()
             if Path(actor.profile_id).resolve() != home:
                 raise ValueError('profile mismatch')

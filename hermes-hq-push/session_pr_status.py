@@ -53,6 +53,9 @@ _TOKEN = re.compile(r"[A-Za-z0-9_]{20,255}\Z")
 # Everything the route calls on the runtime. The app is told the endpoint exists only when all of it does.
 _RUNTIME = (
     ('hermes_cli.web_server_sessions', '_session_mutation_context'),
+    ('hermes_cli.web_server_cron', '_cron_profile_home'),
+    ('gateway.owner_identity', 'host_owner_subject'),
+    ('gateway.session_contract', 'SessionActor'),
     ('hermes_cli.profiles', 'get_profile_dir'),
     ('gateway.config', 'Platform'),
     ('gateway.owner_identity', 'same_owner'),

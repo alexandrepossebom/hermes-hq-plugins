@@ -146,3 +146,51 @@ def test_authorization_and_evidence_share_one_snapshot(tmp_path, monkeypatch):
     assert client.post('/sessions/pr-status', json=body).json() == {'sessions': [
         {'profile': 'default', 'id': 'chat', 'state': 'unknown', 'repo': 'a/b', 'number': 7,
          'url': 'https://github.com/a/b/pull/7'}]}
+
+
+def test_a_plugin_host_trusts_only_hermes_own_verdict(tmp_path, monkeypatch):
+    """In a plugin host no login reaches the route, only Hermes's verdict on it
+    (``hosted_http_authenticated``, set per request by ``with_hosted_admission``). Admitted: the
+    machine's owner, judged against the store. Not admitted: nothing, whatever the request claims."""
+    from hermes_cli import profiles, web_server_cron
+    from hermes_cli.plugin_host_http_auth import with_hosted_admission
+    from gateway.owner_identity import host_owner_subject
+    import test_tasks
+
+    home = tmp_path / 'default'
+    home.mkdir()
+    db = SessionDB(db_path=home / 'state.db')
+    for sid, user in [('mine', host_owner_subject()), ('login', 'basic:alice'), ('foreign', 'telegram:42'), ('unowned', None)]:
+        db.create_session(sid, source='desktop', user_id=user)
+        db.end_session(sid, end_reason='done')
+    call = {'id': 'c1', 'type': 'function', 'function': {'name': 'terminal',
+            'arguments': json.dumps({'command': 'gh pr create --draft --fill'})}}
+    db.append_message('mine', 'assistant', '', tool_calls=[call])
+    db.append_message('mine', 'tool', json.dumps({'output': 'https://github.com/a/b/pull/7', 'exit_code': 0}),
+                      tool_call_id='c1', tool_name='terminal')
+    db.close()
+    monkeypatch.setattr(profiles, 'get_profile_dir', lambda name: home)
+    monkeypatch.setattr(web_server_cron, '_cron_profile_home', lambda name: (name, home))
+    monkeypatch.setenv('HERMES_HQ_PUSH_DATA_DIR', str(tmp_path / 'data'))
+    monkeypatch.setenv('HERMES_HQ_PUSH_RELAY_URL', 'off')
+    monkeypatch.setattr(test_tasks.push, '_watcher_started', True)
+    spec = importlib.util.spec_from_file_location('hosted_pr_api', Path(__file__).parent / 'dashboard/plugin_api.py')
+    api = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(api)
+    monkeypatch.setattr(api, '_loop_watched', True)
+    monkeypatch.setattr(api.session_pr_status, '_api', lambda *_: pytest.fail('asked GitHub'))
+    api.session_pr_status._cache.clear()
+    app = FastAPI()                      # as the plugin host builds it: the bare router, no login state
+    app.include_router(api.router)
+    body = {'sessions': [{'profile': 'default', 'id': sid} for sid in ('mine', 'login', 'foreign', 'unowned', 'missing')]}
+    admitted = TestClient(with_hosted_admission(app, True)).post('/sessions/pr-status', json=body)
+    assert admitted.status_code == 200
+    assert admitted.json() == {'sessions': [
+        {'profile': 'default', 'id': 'mine', 'state': 'unknown', 'repo': 'a/b', 'number': 7,
+         'url': 'https://github.com/a/b/pull/7'},      # its repository isn't listed as public: not asked
+        {'profile': 'default', 'id': 'login', 'state': 'none'}]}
+    for verdict in (False, None, 'true', 1):
+        refused = TestClient(with_hosted_admission(app, verdict)).post(
+            '/sessions/pr-status', json=body, headers={'Authorization': 'Bearer anything', 'X-Hermes-Session-Token': 'x'})
+        assert refused.json() == {'sessions': []}
+    assert TestClient(app).post('/sessions/pr-status', json=body).json() == {'sessions': []}
