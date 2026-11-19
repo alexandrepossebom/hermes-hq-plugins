@@ -8,9 +8,9 @@ import sys
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, WebSocket
+from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictStr
 
 if "hermes_hq_push_core" in sys.modules:
     push = sys.modules["hermes_hq_push_core"]
@@ -40,6 +40,13 @@ else:
     session_working = importlib.util.module_from_spec(_working_spec)
     sys.modules["hermes_hq_session_working"] = session_working
     _working_spec.loader.exec_module(session_working)
+if "hermes_hq_session_pr_status" in sys.modules:
+    session_pr_status = sys.modules["hermes_hq_session_pr_status"]
+else:
+    _pr_spec = importlib.util.spec_from_file_location("hermes_hq_session_pr_status", Path(__file__).parents[1] / "session_pr_status.py")
+    session_pr_status = importlib.util.module_from_spec(_pr_spec)
+    sys.modules["hermes_hq_session_pr_status"] = session_pr_status
+    _pr_spec.loader.exec_module(session_pr_status)
 if "hermes_hq_serve_working" in sys.modules:
     serve_working = sys.modules["hermes_hq_serve_working"]
 else:
@@ -197,7 +204,7 @@ class ApprovalIn(BaseModel):
 def status():
     """The app probes this to offer push; a 404 means the plugin isn't installed or enabled."""
     return {**push.status_body(push.data_dir(), push.sender_from_env()), **terminal.status(push.data_dir()),
-            **tasks.status(), **drafts.status(push.data_dir()), **plugin_updates.status()}
+            **tasks.status(), **drafts.status(push.data_dir()), **plugin_updates.status(), "sessionPRStatus": True}
 
 
 class ScanFindingIn(BaseModel):
@@ -370,6 +377,102 @@ def sessions_working(profile: str = "", session: str = ""):
         return {"sessions": session_working.hermes_working(profile or None, session or None)}
     except Exception as error:
         raise HTTPException(503, f"couldn't read the ledger: {type(error).__name__}") from None
+
+
+class SessionPRIn(BaseModel):
+    profile: StrictStr = Field(max_length=64)
+    id: StrictStr = Field(max_length=256)
+
+
+class SessionPRBatchIn(BaseModel):
+    sessions: list[SessionPRIn] = Field(max_length=32)
+
+
+@router.post("/sessions/pr-status")
+def sessions_pr_status(body: SessionPRBatchIn, request: Request):
+    """Read-only; the synchronous route runs in FastAPI's worker pool, not its event loop."""
+    rows = [{"profile": row.profile, "id": row.id} for row in body.sessions]
+    if any(not session_pr_status.valid_identity(row['profile'], row['id']) for row in rows):
+        raise HTTPException(422, "Invalid profile or session id")
+    # Resolve once per profile. A denied or unavailable row must not hide its
+    # readable neighbours, nor reach the evidence/GitHub resolver.
+    from contextlib import ExitStack
+    import sqlite3
+    from hermes_cli.web_server_sessions import _session_mutation_context
+    from hermes_cli.profiles import get_profile_dir
+    from gateway.config import Platform
+    from gateway.owner_identity import same_owner
+    from hermes_state_local_migration import legacy_history_row
+    from hermes_state_mutation_binding import BINDING_PREFIX, binding_names
+
+    readable = []
+    with ExitStack() as stack:
+        contexts = {}
+        for row in rows:
+            profile, sid = row['profile'], row['id']
+            if profile not in contexts:
+                try:
+                    authority, actor = _session_mutation_context(request, profile)
+                    home = Path(get_profile_dir(profile)).resolve()
+                    if Path(actor.profile_id).resolve() != home:
+                        raise ValueError('profile mismatch')
+                    native = getattr(request.state, 'native_http_principal', None)
+                    if native is not None and Path(native['profile_id']).resolve() != home:
+                        raise ValueError('native profile mismatch')
+                    if authority is not None and Path(authority.db.db_path).resolve() != home / 'state.db':
+                        raise ValueError('profile mismatch')
+                    # Never initialize or migrate the store while authorizing a read.
+                    conn = sqlite3.connect((home / 'state.db').as_uri() + '?mode=ro', uri=True)
+                    stack.callback(conn.close)
+                    conn.row_factory = sqlite3.Row
+                    contexts[profile] = (authority, actor, conn)
+                except Exception:
+                    contexts[profile] = None
+            context = contexts[profile]
+            if context is None:
+                continue
+            authority, actor, conn = context
+            try:
+                live = authority.sessions.get(sid) if authority is not None else None
+                if live is not None:
+                    from gateway.session_authorities import require_serving
+                    from gateway.session_history_mount import is_history_mount
+                    require_serving(authority)
+                    source = live.source
+                    if (is_history_mount(live) or source is None or source.platform != Platform.LOCAL
+                            or not source.user_id or not same_owner(source.user_id, actor.subject)):
+                        continue
+                else:
+                    stored = conn.execute('SELECT * FROM sessions WHERE id=?', (sid,)).fetchone()
+                    if stored is None:
+                        continue
+                    stored = dict(stored)
+                    if (stored.get('profile_name') not in (None, '', profile) or not stored.get('user_id')
+                            or not same_owner(stored['user_id'], actor.subject)):
+                        continue
+                    if any(stored.get(k) for k in ('session_key', 'chat_id', 'origin_json')):
+                        # The closed local session may no longer be in memory. Only a validated
+                        # local creation receipt for this exact physical transcript authorizes it.
+                        from hermes_state_local import POLICY_PREFIX
+                        from hermes_state_local_lineage import validate_local_lineage
+                        raw = conn.execute('SELECT value FROM state_meta WHERE key=?',
+                                           (POLICY_PREFIX + (stored.get('chat_id') or ''),)).fetchone()
+                        receipt = json.loads(raw[0]) if raw else {}
+                        if (receipt.get('profile_id') != actor.profile_id
+                                or receipt.get('session_id') != stored.get('chat_id')
+                                or not receipt.get('principal_id') or not same_owner(receipt['principal_id'], actor.subject)
+                                or receipt.get('route') != stored.get('session_key')
+                                or validate_local_lineage(conn, receipt) != sid):
+                            continue
+                    elif not legacy_history_row(stored):
+                        continue
+                    saved = conn.execute('SELECT value FROM state_meta WHERE key=?', (BINDING_PREFIX + sid,)).fetchone()
+                    if saved is not None and not binding_names(saved[0], actor.subject):
+                        continue
+                readable.append(row)
+            except Exception:
+                continue
+    return {"sessions": session_pr_status.resolve_batch(readable)}
 
 
 @router.get("/serve/working")

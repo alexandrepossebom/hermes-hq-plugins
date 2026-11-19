@@ -261,6 +261,13 @@ in plain words, the numbers on small cards of their own, and a faint light in th
 in trouble. A tile is drawn in it unless you ask a bot for another look (`app`, `midnight`, `terminal`, `vivid`).
 Tiles made before keep the look they have until they are changed or remade. (0.9.59 and 0.9.60 were not published.)
 
+Version 0.9.65 lets Hermes HQ show a coding session's pull request status. The plugin checks that the signed-in
+person owns the local session, reads structured tool-call evidence locally without running it, and asks GitHub for
+status using the computer's `gh` sign-in. GitHub receives the inferred repository and pull request number or branch;
+message text and local paths are not sent. Uncertain evidence or an unavailable GitHub answer is shown as unknown.
+The endpoint needs a Hermes runtime with the session ownership APIs; it takes effect when the serving process next
+loads the updated plugin. The companion app must support the status display.
+
 Version 0.9.58 ties a plugin update you approve in the app to what the app showed you (the last open finding of the
 outside review). Hermes fetches the new version into a copy before it asks anything, and lists what that copy needs
 above each question. The add-on now says yes only when that list is exactly what you saw: the Python packages, the

@@ -467,9 +467,9 @@ BASE = "/api/plugins/hermes-hq-push"
 
 
 def test_status_says_terminal(client):
-    test, _, data = client
+    test, api, data = client
     body = test.get(f"{BASE}/status").json()
-    assert body["terminal"] is True and body["terminalOff"] is False and body["pluginVersion"] == "0.9.57"
+    assert body["terminal"] is True and body["terminalOff"] is False and body["pluginVersion"] == api.push.PLUGIN_VERSION
     data.mkdir(parents=True, exist_ok=True)
     (data / "terminal.off").write_text("")
     assert test.get(f"{BASE}/status").json()["terminalOff"] is True
