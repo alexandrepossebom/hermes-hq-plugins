@@ -422,9 +422,8 @@ def _resolve(created, work, access=None, repos=(), tips=None, closed=False):
 def _computed(created, work, access=None, repos=(), tips=None):
     """Where a session's code changes stand, from the pull requests it opened and its own branches.
 
-    Work still waiting comes first: a pull request waiting on GitHub, then a branch not merged yet
-    (``draft``), then work merged into main that its public copy doesn't have yet (``open``). Then
-    what is finished: merged or closed. No pull request and no branch of its own: ``none``.
+    Work still waiting comes first: a pull request waiting on GitHub (``draft`` or ``open``), then a
+    branch not merged yet (``draft``). Then what is finished: merged or closed. No pull request and no branch of its own: ``none``.
     Unreadable history is ``unknown``, never ``none``.
     """
     if created is None and work is None:

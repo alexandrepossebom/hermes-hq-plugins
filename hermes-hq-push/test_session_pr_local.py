@@ -69,20 +69,21 @@ def test_a_branch_with_commits_of_its_own_is_waiting_then_merged(repo):
     assert state(branch('feat/a'), listed(repo)) == ('merged', 0)
 
 
-def test_merged_into_main_but_not_public_yet_is_open(repo):
-    marker = Path(git(repo, 'rev-parse', '--path-format=absolute', '--git-common-dir')) / 'published'
-    marker.write_text(git(repo, 'rev-parse', 'main') + '\n')
+def test_merged_into_main_is_merged_before_it_is_public_and_the_receipt_waits_for_public(repo):
+    common = Path(git(repo, 'rev-parse', '--path-format=absolute', '--git-common-dir'))
+    (common / 'published').write_text(git(repo, 'rev-parse', 'main') + '\n')
     git(repo, 'switch', '-q', '-c', 'feat/a')
     commit(repo, 'a')
     git(repo, 'switch', '-q', 'main')
     git(repo, 'merge', '-q', '--no-ff', '-m', "Merge branch 'feat/a'", 'feat/a')
-    repos = listed(repo, published_marker='published', public_repo='owner/app')
-    answer, _ = local.local_state(branch('feat/a'), repos)
-    assert answer == {'state': 'open', 'branch': 'feat/a', 'repo': 'owner/app'}
-    commit(repo, 'notes')                                    # main moves on; the marker still lags
-    assert state(branch('feat/a'), repos) == ('open', 0)
-    marker.write_text(git(repo, 'rev-parse', 'main') + '\n')  # the publisher caught up
-    assert state(branch('feat/a'), repos) == ('merged', 0)
+    landed = git(repo, 'rev-parse', 'main')
+    (common / 'receipts.jsonl').write_text(json.dumps({'commit': landed[:8], 'url': 'https://github.com/owner/app/pull/42'}) + '\n')
+    repos = listed(repo, published_marker='published', receipts='receipts.jsonl', public_repo='owner/app')
+    local._repo_cache.clear()
+    assert local.local_state(branch('feat/a'), repos)[0] == {'state': 'merged', 'branch': 'feat/a', 'repo': 'owner/app'}
+    (common / 'published').write_text(landed + '\n')         # the publisher caught up: the pull request is named
+    local._repo_cache.clear()
+    assert local.local_state(branch('feat/a'), repos)[0]['number'] == 42
 
 
 def test_a_receipt_names_the_pull_request(repo):

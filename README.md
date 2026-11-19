@@ -266,7 +266,8 @@ belongs to, picks main (the remote's when this checkout's own is behind it), not
 repositories are read together with any listed by hand. A branch that was deleted with its commits in no other
 branch and not in main now shows as closed; the add-on remembers the tip of each branch it saw waiting
 (`session-pr-tips.json`), so this works for chats whose history holds no commit id. Only the owner may link or
-mark, and only their own chats.
+mark, and only their own chats. Work merged into main now shows merged at once; 0.9.69 showed an open mark until
+main's public copy had it, which read as a mistake (the open mark is a pull request open for review on GitHub).
 
 Version 0.9.69 makes those marks follow your own repositories, for the common case where no chat opens a pull
 request by hand: a chat works on a branch, the branch is merged into main, and main is published elsewhere. List the

@@ -14,8 +14,9 @@ commit id that was checked letter by letter first.
 What it says, per branch:
 
 * ``draft``: the branch has commits that are not in main (work waiting to be merged).
-* ``open``: merged into main, and a ``published_marker`` says main's public copy doesn't have it yet.
-* ``merged``: in main (and public, where a marker is kept). A receipt file names the pull request.
+* ``merged``: in main. Where main is published elsewhere (a ``published_marker``) that step is not a
+  state of its own: the owner reads "merged into main" as merged (0.9.69 showed "open" until the
+  publisher ran, which read as a mistake). Once public, a receipt file names the pull request.
 * ``closed``: the branch was deleted with its commits in no branch and not in main (given up).
 """
 import json
@@ -355,10 +356,11 @@ def _merged_answer(repo, snap, commit, branch):
     copy has it yet, and which pull request carried it."""
     answer = {'state': 'merged', 'branch': branch}
     marker = snap['marker']
+    public = True
     if repo['published_marker'] and marker != snap['main']:
-        if marker is None or commit is None or _git(repo['path'], 'merge-base', '--is-ancestor', commit, marker) is None:
-            answer['state'] = 'open'
-    if answer['state'] == 'merged' and commit is not None and snap['receipts']:
+        public = marker is not None and commit is not None \
+            and _git(repo['path'], 'merge-base', '--is-ancestor', commit, marker) is not None
+    if public and commit is not None and snap['receipts']:
         landed = _landed(repo, snap, commit)
         receipt = snap['receipts'].get(landed[:8]) if landed else None
         if receipt:
@@ -442,7 +444,7 @@ def _exists(path, sha):
     return bool(_SHA.fullmatch(sha)) and _git(path, 'cat-file', '-e', sha + '^{commit}') is not None
 
 
-_RANK = {'draft': 4, 'open': 3, 'merged': 2, 'closed': 1}
+_RANK = {'draft': 3, 'merged': 2, 'closed': 1}
 
 
 def local_state(work, repos, tips=None):
