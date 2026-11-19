@@ -186,6 +186,9 @@ class Store:
                 device_id text not null, activity_id text not null, token text not null, profile text not null,
                 session text not null default '', started_at real not null, trail text not null default '{}',
                 registered_at real not null, primary key (device_id, activity_id))""")
+            # [viewing] 0.9.65: the chat a device has on screen, in front of its person, right now (one row per device).
+            db.execute("""create table if not exists viewing (
+                device_id text primary key, session text not null, profile text not null, expires_at real not null)""")
             db.execute("create index if not exists live_session on live (session)")
             db.execute("create index if not exists live_profile on live (profile)")
 
@@ -206,7 +209,27 @@ class Store:
     def remove(self, device_id: str) -> bool:
         with self._db() as db:
             db.execute("delete from live where device_id = ?", (device_id,))
+            db.execute("delete from viewing where device_id = ?", (device_id,))
             return db.execute("delete from devices where device_id = ?", (device_id,)).rowcount > 0
+
+    # [viewing] Which chat each device shows its person right now. A row lives for the seconds its device asked for
+    # and is written again while the chat stays in front, so a device that sleeps, crashes or walks away stops
+    # counting by itself.
+
+    def set_viewing(self, device_id: str, session: str, profile: str, expires_at: float) -> None:
+        with closing(self._db()) as db, db:
+            db.execute("insert or replace into viewing (device_id, session, profile, expires_at) values (?,?,?,?)",
+                       (device_id, session, profile, expires_at))
+
+    def clear_viewing(self, device_id: str) -> bool:
+        with closing(self._db()) as db, db:
+            return db.execute("delete from viewing where device_id = ?", (device_id,)).rowcount > 0
+
+    def viewed(self, now: float) -> list[tuple]:
+        """(device_id, session, profile) for every chat on show now; rows past their time are dropped."""
+        with closing(self._db()) as db, db:
+            db.execute("delete from viewing where expires_at <= ?", (now,))
+            return db.execute("select device_id, session, profile from viewing").fetchall()
 
     def remove_token(self, token: str) -> None:
         with self._db() as db:
@@ -361,6 +384,31 @@ def check_activity_id(activity_id: str) -> None:
         raise RouteError(400, "Invalid activity id.")
 
 
+VIEWING_TTL = (5.0, 120.0)   # the shortest and longest a device may ask its row to live, in seconds
+
+
+def set_viewing(root: Path, device_id: str, session: str, profile: str, ttl=45, now: float | None = None) -> dict:
+    """PUT /viewing/<device>: this device has `session` (the chat's stored id) of bot `profile` on screen, in front of
+    its person, for the next `ttl` seconds; the app says so again while that stays true. Any signed-in device may say
+    it, registered for notifications or not (a Mac with notifications off still shows the chat). Nothing but the chat's
+    id and the bot's name is kept, and only until the row runs out."""
+    check_device_id(device_id)
+    if (not isinstance(session, str) or not re.fullmatch(r"[A-Za-z0-9_.:@-]{1,200}", session)
+            or not isinstance(profile, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", profile)
+            or isinstance(ttl, bool) or not isinstance(ttl, (int, float)) or not math.isfinite(ttl)):
+        raise RouteError(400, "Invalid viewing report.")
+    ttl = min(max(float(ttl), VIEWING_TTL[0]), VIEWING_TTL[1])
+    Store(root / "devices.db").set_viewing(device_id, session, profile, (time.time() if now is None else now) + ttl)
+    return {"ok": True, "ttl": ttl}
+
+
+def clear_viewing(root: Path, device_id: str) -> dict:
+    """DELETE /viewing/<device>: the chat left the screen, or the app left the front."""
+    check_device_id(device_id)
+    Store(root / "devices.db").clear_viewing(device_id)
+    return {"ok": True}
+
+
 def register_live(root: Path, device_id: str, activity_id: str, token: str, profile: str, session: str,
                   started_at, trail=None, sealed_only: bool = False, now: float | None = None) -> dict:
     """PUT /live/<device>/<activity>: a bot turn's card on a registered phone, and its push token. Replaces the row (a
@@ -483,12 +531,14 @@ def status_body(root: Path, sender) -> dict:
     screen (short_titles.py). `tasks` (0.9.32, added by dashboard/plugin_api.py from tasks.status): the shared
     Tasks list's routes (tasks.py); kind "task" (now in `kinds`) alerts when a bot sets a task `ready` or
     `needs_you`, carrying only its title and never its notes, steps or made items. `tileFit` (0.9.50): the
+    `viewing` (0.9.65): PUT /viewing/<device> says which chat a device has in front of its person; a reply written in
+    that chat alerts no other device while it does (a tester: the iPhone buzzed for a reply being read on the Mac).
     dashboard-tile skill's template fits itself to its tile and its check draws the app's real windows (a tester's
     status boards came out cut off and crowded); the app can offer an update to a plugin without it."""
     store = Store(root / "devices.db")
     return {"ok": True, "version": 6, "plugin": NAME, "pluginVersion": PLUGIN_VERSION,
             "delivery": type(sender).__name__ if sender else None,
-            "kinds": list(KINDS), "seal": SEALS, "replies": "watcher", "desktopThemes": True, "tileFit": True, "restartGuard": True, "perfLogs": True, "moments": True, "outside": True, "ownChats": True, "cronWorking": True, "passwordChats": True, "replyBack": True, "input": True, "sessionWorking": True, "quietStandIns": True, "desktopOpens": True, "askCards": True, "pagePreviews": True, "warmup": True, "desktopForward": True, "gatewayLogins": True, "namedSites": True, "deviceAccess": True, "serveWorking": True, "deviceAccessKinds": True, "deviceAccessHealthTypes": True, "liveSteps": True, "liveEnds": True, "liveQuick": True, "shortTitles": True, "dashboardTile": True, "devices": len(store.devices()),
+            "kinds": list(KINDS), "seal": SEALS, "replies": "watcher", "desktopThemes": True, "tileFit": True, "restartGuard": True, "perfLogs": True, "moments": True, "outside": True, "ownChats": True, "cronWorking": True, "passwordChats": True, "replyBack": True, "input": True, "sessionWorking": True, "quietStandIns": True, "desktopOpens": True, "askCards": True, "pagePreviews": True, "warmup": True, "desktopForward": True, "gatewayLogins": True, "namedSites": True, "deviceAccess": True, "serveWorking": True, "deviceAccessKinds": True, "deviceAccessHealthTypes": True, "liveSteps": True, "liveEnds": True, "liveQuick": True, "viewing": True, "shortTitles": True, "dashboardTile": True, "devices": len(store.devices()),
             "health": Health(store.path).summary(), "predecessor": quiet_predecessor()}
 
 
@@ -874,7 +924,7 @@ class DirectAPNs:
         return DeliveryError(code, f"APNs {code} {reason or (stderr or '').strip()[:120]}".strip(), transient)
 
 
-PLUGIN_VERSION = "0.9.64"   # keep in step with plugin.yaml (test_tasks.py: test_the_reported_version_is_the_manifests)
+PLUGIN_VERSION = "0.9.65"   # keep in step with plugin.yaml (test_tasks.py: test_the_reported_version_is_the_manifests)
 
 
 class Relay:
@@ -1442,6 +1492,7 @@ class Dispatcher:
         self.queue: queue.PriorityQueue = queue.PriorityQueue(maxsize=256)
         self.retries: list = []  # heap of (due, priority, seq, attempt, device_id, push); the delivery thread's alone
         self.last_turn: dict[str, float] = {}
+        self.lineage = None   # [viewing] made on first use
         self.thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self._seq = itertools.count()
@@ -1483,6 +1534,11 @@ class Dispatcher:
                 self.health.record("dropped:settled", "An approval was answered before its alert could be sent", len(self.retries) - len(kept))
                 self.retries = kept
                 heapq.heapify(self.retries)
+        if push.kind == "turnDone" and not only and not push.to and self.being_read(push):
+            # [viewing] The reply is on a screen in front of its person now: no device buzzes for it. Only replies:
+            # an approval, a question or a task still alerts everywhere, because a bot is waiting on it.
+            self.health.record("quiet:viewing", "A reply was already on screen on one of your devices, so no alert was sent")
+            return 0
         sent = 0
         for device in self.store.devices():
             if (device.topic != TOPIC or device.profile not in ("*", push.profile)
@@ -1494,6 +1550,25 @@ class Dispatcher:
                 continue
             sent += self._send(sender, device, push, attempt)
         return sent
+
+    def being_read(self, push: Push) -> bool:
+        """A device reports this reply's chat as on screen now. The chat may have changed id mid-turn (compression):
+        the id the device knows is then one of the new id's ancestors."""
+        if not push.session:
+            return False
+        try:
+            rows = [row for row in self.store.viewed(time.time()) if row[2] == push.profile]
+            if not rows:
+                return False
+            if any(row[1] == push.session for row in rows):
+                return True
+            if self.lineage is None:
+                self.lineage = Lineage()
+            _, ancestors = self.lineage.info(push.profile, push.session)
+            return any(row[1] in ancestors for row in rows)
+        except Exception as error:  # a check that can't be made never costs an alert
+            log.info(f"{NAME} viewing check failed (%s)", type(error).__name__)
+            return False
 
     def _send(self, sender, device: Device, push: Push, attempt: int) -> int:
         try:

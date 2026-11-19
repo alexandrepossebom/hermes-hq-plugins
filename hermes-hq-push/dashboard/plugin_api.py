@@ -390,6 +390,32 @@ def remove_device(device_id: str):
 
 
 # ---------------------------------------------------------------------------
+# [viewing] 0.9.65 (`viewing` in status): the chat a device has in front of its person; its replies alert nobody.
+# ---------------------------------------------------------------------------
+
+class ViewingIn(BaseModel):
+    session: str = Field(max_length=200)   # the chat's stored id
+    profile: str = Field(max_length=64)    # the bot
+    ttl: float = Field(default=45, allow_inf_nan=False)
+
+
+@router.put("/viewing/{device_id}")
+def set_viewing(device_id: str, body: ViewingIn):
+    try:
+        return push.set_viewing(push.data_dir(), device_id, body.session, body.profile, body.ttl)
+    except push.RouteError as error:
+        raise HTTPException(error.status_code, error.detail) from None
+
+
+@router.delete("/viewing/{device_id}")
+def clear_viewing(device_id: str):
+    try:
+        return push.clear_viewing(push.data_dir(), device_id)
+    except push.RouteError as error:
+        raise HTTPException(error.status_code, error.detail) from None
+
+
+# ---------------------------------------------------------------------------
 # Live Activities (0.9.22 `liveSteps` in status): a bot turn's Lock Screen card, whose steps are pushed (push.LiveFeed).
 # ---------------------------------------------------------------------------
 
