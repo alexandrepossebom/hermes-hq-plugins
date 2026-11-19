@@ -4,9 +4,10 @@ A pull request belongs to a session only when the session's own tool call opened
 result printed the link:
 
 * ``gh pr create``: the result of that very call holds a line that is only the pull request's link.
-* a publisher script (``public-prs.py``, not ``--dry-run``): once the session has run it, a result
-  line in the script's own shape, ``<8 hex>  <link>  <title>``, counts. The script is often run in
-  the background, so the line may arrive in a later result or in the completion notice.
+
+A script that publishes other chats' merged work as pull requests does not make them the pull
+requests of the chat that ran it: whose work a pull request carries is told from the commits
+(session_pr_local).
 
 A link the bot merely read, reviewed, listed or wrote in a message is never a pull request of the
 session. History is data: no command is evaluated and no path in it is opened.
@@ -17,10 +18,8 @@ import shlex
 import sqlite3
 
 _PR = re.compile(r'https://github\.com/([A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?/[A-Za-z0-9_.-]{1,100})/pull/([1-9][0-9]{0,8})/?')
-_PUBLISHED = re.compile(r'\s*[0-9a-f]{8}\s+' + _PR.pattern + r'\s+\S.*')
 _ENV = re.compile(r'[A-Za-z_][A-Za-z0-9_]*=')
 _TERMINAL = ('terminal', 'functions.terminal')
-_NOTICE = '[IMPORTANT: Background process'
 _MAX_FIELD = 400_000
 _MAX_ROWS = 2000
 MAX_CREATED = 6
@@ -61,11 +60,6 @@ def _opens(tokens):
     while i + 1 < len(tokens) and tokens[i] in ('-R', '--repo'):
         i += 2
     return tokens[i:i + 2] == ['pr', 'create'] and '--help' not in tokens and '--web' not in tokens
-
-
-def _publishes(tokens):
-    return any(t.endswith('public-prs.py') for t in tokens[:4]) and '--dry-run' not in tokens \
-        and tokens[0] not in ('cat', 'sed', 'grep', 'rg', 'head', 'tail', 'less', 'wc', 'ls', 'git', 'echo')
 
 
 def _texts(content):
@@ -144,13 +138,12 @@ def _scan(db, session_id):
     rows = db.execute(
         "SELECT id, role, tool_calls, tool_call_id, substr(content, 1, ?) FROM messages "
         "WHERE session_id = ? AND ("
-        " (role = 'assistant' AND tool_calls IS NOT NULL AND (tool_calls LIKE '%public-prs.py%'"
-        "   OR (tool_calls LIKE '%gh %' AND tool_calls LIKE '%pr%create%')))"
-        " OR (role IN ('tool', 'user') AND content LIKE '%github.com/%/pull/%')) ORDER BY id LIMIT ?",
+        " (role = 'assistant' AND tool_calls IS NOT NULL AND tool_calls LIKE '%gh %' AND tool_calls LIKE '%pr%create%')"
+        " OR (role = 'tool' AND content LIKE '%github.com/%/pull/%')) ORDER BY id LIMIT ?",
         (_MAX_FIELD, session_id, _MAX_ROWS + 1)).fetchall()
     if len(rows) > _MAX_ROWS:
         return None
-    opened, published, found = set(), False, []
+    opened, found = set(), []
     for row_id, role, raw_calls, call_id, content in rows:
         if role == 'assistant':
             try:
@@ -171,27 +164,12 @@ def _scan(db, session_id):
                 for tokens in _segments(command):
                     if _opens(tokens) and call.get('id'):
                         opened.add(call['id'])
-                    elif _publishes(tokens):
-                        published = True
             continue
-        if not isinstance(content, str):
+        if not isinstance(content, str) or call_id not in opened or _failed(content):
             continue
-        if role == 'user':
-            if not (published and content.startswith(_NOTICE)):
-                continue
-            texts = [content]
-        else:
-            texts = _texts(content)
-            if call_id in opened and not _failed(content):
-                for text in texts:
-                    for line in text.splitlines():
-                        match = _PR.fullmatch(line.strip())
-                        if match:
-                            found.append((row_id, (match.group(1), int(match.group(2)))))
-        if published:
-            for text in texts:
-                for line in text.splitlines():
-                    match = _PUBLISHED.fullmatch(line)
-                    if match:
-                        found.append((row_id, (match.group(1), int(match.group(2)))))
+        for text in _texts(content):
+            for line in text.splitlines():
+                match = _PR.fullmatch(line.strip())
+                if match:
+                    found.append((row_id, (match.group(1), int(match.group(2)))))
     return found

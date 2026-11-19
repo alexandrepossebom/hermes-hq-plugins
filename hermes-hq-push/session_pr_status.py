@@ -116,7 +116,7 @@ def _read_private(path, limit):
 
 def load_config(data_dir):
     """The owner's choices in ``<plugin-data>/session-pr.json``. Anything malformed counts as unset."""
-    empty = {'public_repos': frozenset()}
+    empty = {'public_repos': frozenset(), 'repos': ()}
     if not data_dir:
         return empty
     path = Path(data_dir) / CONFIG_NAME
@@ -131,7 +131,7 @@ def load_config(data_dir):
     repos = raw.get('public_repos', [])
     if not isinstance(repos, list) or not all(_valid_repo(r) for r in repos):
         return empty
-    return {'public_repos': frozenset(r.lower() for r in repos)}
+    return {'public_repos': frozenset(r.lower() for r in repos), 'repos': _local().load_repos(raw.get('repos'))}
 
 
 def owner_token_path(data_dir, subject):
@@ -165,19 +165,31 @@ def access_for(data_dir, subject, config=None):
     return Access(config['public_repos'], token, data_dir)
 
 
-def created_in(conn, session_id):
-    """The pull requests one session opened, read on the caller's connection and snapshot."""
-    # The reader is maintained separately; load it lazily so a missing reader fails closed.
-    name = 'hermes_hq_session_pr_created'
+def _sibling(name, file):
+    # The readers are maintained separately; load them lazily so a missing reader fails closed.
     module = sys.modules.get(name)
     if module is None:
-        spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name('session_pr_created.py'))
+        spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name(file))
         if spec is None or spec.loader is None:
             raise ImportError('session history reader unavailable')
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         sys.modules[name] = module
-    return module.created_from_conn(conn, session_id)
+    return module
+
+
+def _local():
+    return _sibling('hermes_hq_session_pr_local', 'session_pr_local.py')
+
+
+def created_in(conn, session_id):
+    """The pull requests one session opened, read on the caller's connection and snapshot."""
+    return _sibling('hermes_hq_session_pr_created', 'session_pr_created.py').created_from_conn(conn, session_id)
+
+
+def work_in(conn, session_id):
+    """The branches and commits one session made, read on the caller's connection and snapshot."""
+    return _local().work_from_conn(conn, session_id)
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -337,18 +349,13 @@ def _lookup(repo, number, access):
 
 
 def _resolve_created(created, access=None):
-    """One answer for a session from the pull requests it opened, oldest first.
+    """One answer from the pull requests a session opened itself, oldest first; None when it opened none.
 
-    None opened: ``none``. Otherwise the newest one still waiting (draft or open) if there is one,
-    else the newest one; a session with a draft open is not done because an older one merged.
+    The newest one still waiting (draft or open) if there is one, else the newest one.
     """
     access = access if access is not None else Access()
-    if created is None:
-        return {'state': 'unknown'}   # the history could not be read: not proof of no pull request
-    if not created:
-        return {'state': 'none'}
     newest = None
-    for repo, number in reversed(created):
+    for repo, number in reversed(created or ()):
         result = _lookup(repo, number, access)
         if result['state'] in ('draft', 'open'):
             return result
@@ -357,14 +364,48 @@ def _resolve_created(created, access=None):
     return newest
 
 
+def _resolve(created, work, access=None, repos=()):
+    """Where a session's code changes stand, from the pull requests it opened and its own branches.
+
+    Work still waiting comes first: a pull request waiting on GitHub, then a branch not merged yet
+    (``draft``), then work merged into main that its public copy doesn't have yet (``open``). Then
+    what is finished: merged or closed. No pull request and no branch of its own: ``none``.
+    Unreadable history is ``unknown``, never ``none``.
+    """
+    if created is None and work is None:
+        return {'state': 'unknown'}
+    asked = _resolve_created(created, access)
+    if asked is not None and asked['state'] in ('draft', 'open'):
+        return asked
+    try:
+        local, unplaced = _local().local_state(work, repos) if work and repos else (None, 0)
+    except Exception:
+        local, unplaced = None, 1
+    if local is not None:
+        local.pop('direct', None)
+        if local['state'] in ('draft', 'open'):
+            return local
+    if asked is not None and asked['state'] != 'unknown':
+        return asked
+    if local is not None:
+        return local
+    if asked is not None:
+        return asked
+    if created is None or work is None or unplaced:
+        # Half the history could not be read, or the chat made a branch no listed repository
+        # knows: not proof of nothing.
+        return {'state': 'unknown'}
+    return {'state': 'none'}
+
+
 def resolve_batch(items):
-    """*items*: ``{'profile', 'id', 'created', 'access'}`` already authorized and read in one snapshot."""
+    """*items*: ``{'profile', 'id', 'created', 'work', 'access', 'repos'}`` already authorized and read in one snapshot."""
     if len(items) > MAX_BATCH:
         raise ValueError('too many sessions')
 
     def one(item):
         try:
-            result = _resolve_created(item.get('created'), item.get('access'))
+            result = _resolve(item.get('created'), item.get('work', {}), item.get('access'), item.get('repos') or ())
         except Exception:
             result = {'state': 'unknown'}
         return {'profile': item['profile'], 'id': item['id'], **result}
