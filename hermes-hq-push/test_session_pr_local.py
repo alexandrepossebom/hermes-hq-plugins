@@ -21,9 +21,11 @@ ENV = {**os.environ, 'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@example.com'
 
 @pytest.fixture(autouse=True)
 def fresh():
-    local._repo_cache.clear(); local._answer_cache.clear()
+    for kept in (local._repo_cache, local._answer_cache, local._facts, local._by_main, local._static):
+        kept.clear()
     yield
-    local._repo_cache.clear(); local._answer_cache.clear()
+    for kept in (local._repo_cache, local._answer_cache, local._facts, local._by_main, local._static):
+        kept.clear()
 
 
 def git(repo, *args):
@@ -132,6 +134,7 @@ def test_a_deleted_unmerged_branch_is_closed_and_a_renamed_one_still_waits(repo)
     git(repo, 'branch', '-q', '-D', 'fix/dropped')
     assert state(branch('fix/dropped', sha[:7]), listed(repo)) == ('draft', 0)
     git(repo, 'branch', '-q', '-D', 'fix/kept')
+    local._repo_cache.clear()                                # the branches are read again every few seconds
     answer, _ = local.local_state(branch('fix/dropped', sha[:7]), listed(repo, public_repo='owner/app'))
     assert answer == {'state': 'closed', 'branch': 'fix/dropped', 'repo': 'owner/app'}
     # A merged branch outranks a given-up one: the chat's work did land.
@@ -279,3 +282,35 @@ def test_one_answer_from_pull_requests_and_branches(repo, monkeypatch):
     monkeypatch.setattr(status, '_api', lambda endpoint, access, tag=None: (waiting, None))
     assert status._resolve([('owner/app', 7)], branch('feat/a'), owner, repos)['number'] == 7
     status._cache.clear()
+
+
+def test_a_second_look_asks_git_nothing_until_a_branch_moves(repo, monkeypatch):
+    """Each question to git is a process started on a computer that may be busy: what it said is kept
+    for as long as it stays true."""
+    git(repo, 'switch', '-q', '-c', 'feat/waiting')
+    commit(repo, 'a')
+    git(repo, 'switch', '-q', '-c', 'feat/done', 'main')
+    commit(repo, 'b')
+    git(repo, 'switch', '-q', 'main')
+    git(repo, 'merge', '-q', '--no-ff', '-m', "Merge branch 'feat/done'", 'feat/done')
+    work = {'branches': {'feat/waiting': [], 'feat/done': [], 'feat/never-here': [], 'feat/idle': []}, 'commits': []}
+    git(repo, 'branch', 'feat/idle')
+    asked = []
+    real = local._git
+    monkeypatch.setattr(local, '_git', lambda path, *args: asked.append(args[0]) or real(path, *args))
+    repos, tips = listed(repo), {}
+    first = local.local_state(work, repos, tips)
+    assert first == ({'state': 'draft', 'branch': 'feat/waiting', 'direct': True}, 1)
+    assert len(asked) <= 12, asked                      # not a handful per branch
+    local.local_state(work, repos, tips)                # the waiting branch's tip is now remembered: asked once more
+    asked.clear()
+    assert local.local_state(work, repos, tips) == first
+    assert asked == []                                  # within the refs' few seconds: nothing
+    local._repo_cache.clear()
+    assert local.local_state(work, repos, tips) == first
+    assert asked == ['for-each-ref']                    # refs read again, nothing moved: one question
+    asked.clear()
+    git(repo, 'merge', '-q', '--no-ff', '-m', "Merge branch 'feat/waiting'", 'feat/waiting')
+    local._repo_cache.clear()
+    assert local.local_state(work, repos, tips)[0]['state'] == 'merged'    # main moved: asked again, and right
+    assert 0 < len(asked) <= 8, asked
