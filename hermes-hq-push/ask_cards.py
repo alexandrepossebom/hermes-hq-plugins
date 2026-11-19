@@ -20,7 +20,9 @@ NOTE = (
     MARK + " here a question asked with the `clarify` tool appears as a card they answer with one tap. When you "
     "need their answer before you can carry on (which of two things they meant, a choice that changes what you do "
     "next, a detail you can't look up), ask it with `clarify` instead of ending your reply with the question in text, "
-    "with the options in `choices`, your pick first. A closing offer after finished work "
+    "with the options in `choices`, your pick first. When the answer lets you act for them (reply to someone, book, "
+    "file, change something), ask with `ask_to_act` instead if you have it: it shows who asked and their words. "
+    "A closing offer after finished work "
     "(\"Want me to also…?\") stays a normal line at the end of your reply. Keep deciding low-stakes things yourself, "
     "and don't mention this note.]"
 )

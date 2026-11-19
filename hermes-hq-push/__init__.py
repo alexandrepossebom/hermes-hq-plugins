@@ -92,6 +92,9 @@ _media_spec.loader.exec_module(cron_media)
 _access_spec = importlib.util.spec_from_file_location("hermes_hq_device_access", Path(__file__).with_name("device_access.py"))
 device_access = importlib.util.module_from_spec(_access_spec)
 _access_spec.loader.exec_module(device_access)
+_show_spec = importlib.util.spec_from_file_location("hermes_hq_push_show_first", Path(__file__).with_name("show_first.py"))
+show_first = importlib.util.module_from_spec(_show_spec)
+_show_spec.loader.exec_module(show_first)
 if "hermes_hq_drafts" in sys.modules:   # one copy for this process: the tool, the guard and the route share it
     drafts = sys.modules["hermes_hq_drafts"]
 else:
@@ -99,6 +102,13 @@ else:
     drafts = importlib.util.module_from_spec(_drafts_spec)
     sys.modules["hermes_hq_drafts"] = drafts
     _drafts_spec.loader.exec_module(drafts)
+if "hermes_hq_asks" in sys.modules:   # one copy for this process: the tool and the route share it
+    asks = sys.modules["hermes_hq_asks"]
+else:
+    _asks_spec = importlib.util.spec_from_file_location("hermes_hq_asks", Path(__file__).with_name("asks.py"))
+    asks = importlib.util.module_from_spec(_asks_spec)
+    sys.modules["hermes_hq_asks"] = asks
+    _asks_spec.loader.exec_module(asks)
 if "hermes_hq_shopping" in sys.modules:   # one copy for this process: the tools, the answers and the route share it
     shopping = sys.modules["hermes_hq_shopping"]
 else:
@@ -257,6 +267,10 @@ def on_human_input_resolved(**kwargs):
 
 def pre_llm_call(platform="", parent_session_id="", user_message=None, conversation_history=None, session_id="",
                  turn_id="", **kwargs):
+    try:  # [show-first] each turn starts with nothing made in it
+        show_first.note_turn(session_id)
+    except Exception:
+        pass
     try:  # [cron-media] every process: a Bot Chat job's hand-off can run in the messaging gateway too
         cron_media.note_turn(session_id, turn_id, user_message)
     except Exception:
@@ -270,6 +284,18 @@ def pre_llm_call(platform="", parent_session_id="", user_message=None, conversat
         shopping_note = shopping.note_decision(push.data_dir(), user_message, str(session_id or ""))
     except Exception:
         log.debug("hermes-hq-push: shopping answer not noted")
+    try:  # [asks] Send on an ask card's ready reply lets that reply out of the drafts guard (asks.py)
+        asks.note_answer(user_message)
+    except Exception:
+        log.debug("hermes-hq-push: ask answer not noted")
+    if not _serves_app_sessions():
+        # [asks] A job's report handed to a Bot Chat (a gateway turn): ask with the card, not in text.
+        try:
+            note = asks.job_note(user_message, data_dir=push.data_dir(), in_app_chat=_in_app_chat())
+            if note:
+                return {"context": note}
+        except Exception:
+            log.debug("hermes-hq-push: job ask note skipped", exc_info=True)
     # Only turns ``hermes serve`` runs: a card asked from a turn the messaging gateway runs in an app chat (another
     # bot's message, a job's hand-off) can't reach the app and comes back undelivered. [tasks] The same restriction
     # keeps the Tasks note out of cron runs and hand-offs: only a conversation with the user adds it.
@@ -336,11 +362,42 @@ def pre_tool_call(tool_name="", args=None, **kwargs):
     verdict = (_veto(tool_name, args) or _code_veto(tool_name, args, kwargs)
                or _ideas_veto(tool_name, kwargs.get("session_id"))
                or _draft_veto(tool_name, args, kwargs.get("session_id"))
-               or _pay_block(tool_name, args, kwargs.get("session_id")) or _job_clarify(tool_name))
+               or _pay_block(tool_name, args, kwargs.get("session_id")) or _show_first(tool_name, args, kwargs)
+               or _job_clarify(tool_name))
     if verdict is None:
         _named_site(tool_name, args, kwargs.get("task_id"))
         _live_step(tool_name, args, kwargs)
     return verdict
+
+
+def _show_first(tool_name, args, kwargs):
+    """[show-first] A clarify while a picture the bot made this turn is still unseen is held once (show_first.py)."""
+    try:
+        verdict = show_first.check(tool_name, args, kwargs.get("session_id"))
+    except Exception:
+        log.debug("hermes-hq-push: show-first check failed", exc_info=True)
+        return None
+    if verdict:
+        log.info("hermes-hq-push: clarify held: the picture it asks about isn't in the chat yet")
+    return verdict
+
+
+def post_api_request(session_id="", assistant_message=None, **kwargs):
+    """[show-first] The bot's words with each model call: a MEDIA line shows what it made (show_first.note_text)."""
+    try:
+        show_first.note_text(session_id, getattr(assistant_message, "content", None))
+    except Exception:
+        log.debug("hermes-hq-push: show-first text not noted", exc_info=True)
+    return None
+
+
+def on_interim_message(session_id="", text="", **kwargs):
+    """[show-first] Words the bot sent mid-turn (show_first.note_text)."""
+    try:
+        show_first.note_text(session_id, text)
+    except Exception:
+        log.debug("hermes-hq-push: show-first interim not noted", exc_info=True)
+    return None
 
 
 def _job_clarify(tool_name):
@@ -670,6 +727,24 @@ def _draft_tool(ctx):
         log.warning("hermes-hq-push: draft_message tool not registered", exc_info=True)
 
 
+def _in_app_chat() -> bool:
+    """[asks] This turn's chat is one the app shows: a `hermes serve` turn, or a turn the messaging gateway runs in
+    a local app chat (a job's report handed to a Bot Chat; gateway_logins.turn), whose calls the chat keeps."""
+    if _serves_app_sessions():
+        return True
+    try:
+        return gateway_logins.turn() is not None
+    except Exception:
+        return False
+
+
+def _ask_tool(ctx):
+    try:
+        asks.register_tool(ctx, push.data_dir, _in_app_chat)
+    except Exception:
+        log.warning("hermes-hq-push: ask_to_act tool not registered", exc_info=True)
+
+
 def _shopping_tools(ctx):
     try:
         shopping.register_tool(ctx, push.data_dir, _serves_app_sessions)
@@ -697,6 +772,8 @@ def register(ctx):
     ctx.register_hook("on_human_input_request", on_human_input_request)
     ctx.register_hook("on_human_input_resolved", on_human_input_resolved)
     ctx.register_hook("pre_llm_call", pre_llm_call)
+    ctx.register_hook("post_api_request", post_api_request)
+    ctx.register_hook("on_interim_message", on_interim_message)
     ctx.register_hook("post_llm_call", post_llm_call)
     ctx.register_hook("transform_llm_output", transform_llm_output)
     ctx.register_hook("transform_tool_result", transform_tool_result)
@@ -705,6 +782,7 @@ def register(ctx):
     _tasks_tools(ctx)
     _draft_tool(ctx)
     _shopping_tools(ctx)
+    _ask_tool(ctx)
     _dashboard_skill(ctx)
     _task_page_skill(ctx)
     _desktop_theme()

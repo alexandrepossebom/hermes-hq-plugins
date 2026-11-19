@@ -77,6 +77,13 @@ else:
     drafts = importlib.util.module_from_spec(_drafts_spec)
     sys.modules["hermes_hq_drafts"] = drafts
     _drafts_spec.loader.exec_module(drafts)
+if "hermes_hq_asks" in sys.modules:   # one copy for this process: the tool and the route share it
+    asks = sys.modules["hermes_hq_asks"]
+else:
+    _asks_spec = importlib.util.spec_from_file_location("hermes_hq_asks", Path(__file__).parents[1] / "asks.py")
+    asks = importlib.util.module_from_spec(_asks_spec)
+    sys.modules["hermes_hq_asks"] = asks
+    _asks_spec.loader.exec_module(asks)
 if "hermes_hq_shopping" in sys.modules:
     shopping = sys.modules["hermes_hq_shopping"]
 else:
@@ -216,7 +223,7 @@ class ApprovalIn(BaseModel):
 def status():
     """The app probes this to offer push; a 404 means the plugin isn't installed or enabled."""
     return {**push.status_body(push.data_dir(), push.sender_from_env()), **terminal.status(push.data_dir()),
-            **tasks.status(), **drafts.status(push.data_dir()), **shopping.status(push.data_dir()),
+            **tasks.status(), **drafts.status(push.data_dir()), **shopping.status(push.data_dir()), **asks.status(push.data_dir()),
             **plugin_updates.status(),
             **onepassword_allow.status()}
 
@@ -352,6 +359,13 @@ def shopping_cards():
     """[shopping] An app that draws product and order cards uses this computer: bots get show_products and
     order_card from now on (shopping.py)."""
     shopping.note_cards(push.data_dir())
+    return {"ok": True}
+
+
+@router.put("/asks/cards")
+def ask_cards_shown():
+    """[asks] An app that draws ask-to-act cards uses this computer: bots get ask_to_act from now on (asks.py)."""
+    asks.note_cards(push.data_dir())
     return {"ok": True}
 
 
