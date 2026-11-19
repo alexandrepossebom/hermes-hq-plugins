@@ -218,9 +218,11 @@ def test_owner_token_must_be_private_and_owned(tmp_path):
 
 
 def test_config_public_repos(tmp_path):
-    assert status.load_config(tmp_path) == {'public_repos': frozenset()}
-    (tmp_path / status.CONFIG_NAME).write_text(json.dumps({'public_repos': ['Owner/Repo']}))
-    assert status.load_config(tmp_path) == {'public_repos': frozenset({'owner/repo'})}
+    assert status.load_config(tmp_path) == {'public_repos': frozenset(), 'repos': ()}
+    (tmp_path / status.CONFIG_NAME).write_text(json.dumps({'public_repos': ['Owner/Repo'], 'repos': [
+        {'path': '/work/app/', 'published_marker': 'hq-public-published', 'public_repo': 'owner/repo'}, {'path': 'relative'}]}))
+    assert status.load_config(tmp_path) == {'public_repos': frozenset({'owner/repo'}), 'repos': (
+        {'path': '/work/app', 'main': 'main', 'published_marker': 'hq-public-published', 'receipts': None, 'public_repo': 'owner/repo'},)}
     (tmp_path / status.CONFIG_NAME).write_text(json.dumps({'public_repos': ['../x']}))
     assert status.load_config(tmp_path)['public_repos'] == frozenset()
 

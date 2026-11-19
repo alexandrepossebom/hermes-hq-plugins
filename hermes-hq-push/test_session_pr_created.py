@@ -92,44 +92,11 @@ def test_links_in_conversation_are_never_evidence(db):
     assert created.created_from_conn(db, 's') == [('owner/app', 42)]
 
 
-def test_the_publisher_script_gives_each_line_it_printed(db):
-    run(db, 'cd ~/wt && python3 scripts/public-prs.py --dry-run', '1 private main commit(s) after 99089f3d.\n  8a62098a  Title')
+def test_running_a_publisher_does_not_make_its_pull_requests_the_chats(db):
+    """A script that publishes everyone's merged work prints many links: they are not this chat's."""
+    run(db, 'python3 scripts/public-prs.py', '  8a62098a  ' + APP + '343  The shelf folds\nDone: 1 pull request(s) published.')
+    say(db, 'user', '[IMPORTANT: Background process proc_1 completed normally (exit code 0).\nOutput:\n  1a2b3c4d  ' + APP + '348  Title')
     assert created.created_from_conn(db, 's') == []
-    run(db, 'cd ~/wt && /opt/homebrew/bin/python3 scripts/public-prs.py --checked-binaries 2>&1 | tail -15',
-        '2 private main commit(s) after 99089f3d.\n  8a62098a  ' + APP + '343  The shelf folds\n'
-        '  0b1c2d3e  ' + APP + '344  Another change\nDone: 2 pull request(s) published.')
-    assert created.created_from_conn(db, 's') == [('owner/app', 343), ('owner/app', 344)]
-
-
-def test_a_dry_run_or_reading_the_script_does_not_publish(db):
-    line = '  8a62098a  ' + APP + '343  The shelf folds'
-    run(db, 'python3 scripts/public-prs.py --dry-run', line)
-    run(db, 'sed -n 1,40p scripts/public-prs.py', line)
-    run(db, 'cat ~/logs/public-prs.log', line)          # another session's log, read here
-    run(db, 'git log --oneline -3 -- scripts/public-prs.py', line)
-    assert created.created_from_conn(db, 's') == []
-
-
-def test_a_background_publish_reports_later(db):
-    line = '  8a62098a  ' + APP + '348  Mac Sessions row\nDone: 1 pull request(s) published.'
-    say(db, 'user', '[IMPORTANT: Background process proc_1 completed normally (exit code 0).\nOutput:\n' + line)
-    assert created.created_from_conn(db, 's') == []     # nothing was published by this session yet
-    run(db, 'python3 scripts/public-prs.py > /tmp/p.log 2>&1; tail -6 /tmp/p.log', 'Background process started')
-    say(db, 'user', 'here is one: ' + line)             # a person's message is not the completion notice
-    assert created.created_from_conn(db, 's') == []
-    say(db, 'user', '[IMPORTANT: Background process proc_1 completed normally (exit code 0).\nOutput:\n' + line)
-    assert created.created_from_conn(db, 's') == [('owner/app', 348)]
-
-
-def test_a_waited_process_log_counts_after_publishing(db):
-    run(db, 'python3 scripts/public-prs.py', 'Background process started')
-    call = f'call-{next(_ids)}'
-    db.execute('INSERT INTO messages (session_id, role, content, tool_calls) VALUES (?, ?, ?, ?)',
-               ('s', 'assistant', '', json.dumps([{'id': call, 'function': {'name': 'tool_call', 'arguments': '{}'}}])))
-    db.execute('INSERT INTO messages (session_id, role, content, tool_call_id, tool_name) VALUES (?, ?, ?, ?, ?)',
-               ('s', 'tool', json.dumps({'status': 'exited', 'log': {'tail': '  1a2b3c4d  ' + APP + '77  Title'}}),
-                call, 'process_manage'))
-    assert created.created_from_conn(db, 's') == [('owner/app', 77)]
 
 
 def test_a_subagents_pull_request_is_its_parents_and_nobody_elses(db):
@@ -140,7 +107,7 @@ def test_a_subagents_pull_request_is_its_parents_and_nobody_elses(db):
     run(db, 'gh pr create --draft --fill', APP + '6', sid='grandchild')
     run(db, 'gh pr create --fill', APP + '90', sid='continued')
     run(db, 'gh pr create --fill', APP + '91', sid='other')
-    run(db, 'python3 scripts/public-prs.py', '  8a62098a  ' + APP + '345  Title')
+    run(db, 'gh pr create --fill', APP + '345')
     assert created.created_from_conn(db, 's') == [('owner/app', 6), ('owner/app', 345)]
     assert created.created_from_conn(db, 'child') == [('owner/app', 6)]
     assert created.created_from_conn(db, 'other') == [('owner/app', 91)]

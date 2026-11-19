@@ -656,10 +656,14 @@ def sessions_pr_status(body: SessionPRBatchIn, request: Request):
                         created = session_pr_status.created_in(conn, sid)
                     except Exception:
                         created = None  # unreadable history is unknown, never "no pull request"
+                    try:
+                        work = session_pr_status.work_in(conn, sid) if config['repos'] else {}
+                    except Exception:
+                        work = None
                     if actor.subject not in access:
                         access[actor.subject] = session_pr_status.access_for(data_dir, actor.subject, config)
-                    found.append((index, {"profile": profile, "id": sid, "created": created,
-                                          "access": access[actor.subject]}))
+                    found.append((index, {"profile": profile, "id": sid, "created": created, "work": work,
+                                          "access": access[actor.subject], "repos": config['repos']}))
             finally:
                 try:
                     conn.execute('ROLLBACK')
