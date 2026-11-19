@@ -256,6 +256,30 @@ made, its history) and what its bot writes with `tasks_update(page={summary, nex
 next, and parts such as options compared in a table, the numbers that matter, or what it found. The bot writes words,
 never HTML. The `task-page` skill (hermes-hq-push:task-page) tells bots what goes on it.
 
+Version 0.9.67 lets Hermes HQ show what became of the pull requests a chat opened: none yet, draft, open, merged
+or closed. A pull request counts as a chat's own only when that chat (or a subagent it started) opened it and the
+result of that very command printed the link: `gh pr create`, or a publisher script (`public-prs.py`, not
+`--dry-run`) printing its `<commit>  <link>  <title>` line. A link the bot only read, reviewed, listed or wrote in a
+message never counts, and nothing in the history is run or opened. The add-on first checks that the signed-in person
+owns the chat, on the same read-only snapshot of the session store it then reads. A chat with a draft or open pull
+request shows that one even when an older one of its has merged.
+
+The computer's own GitHub sign-in (`gh`, `GH_TOKEN`) is never used, and GitHub is asked about a pull request only
+when you allow it in `plugin-data/hermes-hq-push`:
+
+- `session-pr.json` with `"public_repos": ["owner/repo"]` declares repositories public. GitHub is then asked
+  without any sign-in, by pull request number. A merged answer is final and is remembered in
+  `session-pr-merged.json`, so it is asked once.
+- `session-pr-github/<sha256 of your sign-in subject>.token` holds a GitHub token of your own (mode 0600). GitHub
+  is then asked with that token, for your own chats only.
+
+A pull request in any other repository shows unknown, and so does a chat whose history can't be read. When GitHub
+doesn't answer (offline, or its hourly limit for requests without a sign-in), the last answer stays. A chat that
+opened no pull request shows none.
+The status reports `sessionPRStatus: true` only on a Hermes runtime that has every session ownership API the
+endpoint uses; elsewhere the endpoint answers 501. The change takes effect when the serving process next loads
+the updated plugin, and the companion app must support the status display.
+
 Version 0.9.66 keeps your other devices quiet about a reply you are already reading. The app on the device that has a chat in front of you tells the add-on so (the chat's id and the bot's name, nothing else), again every 20 seconds while that stays true; a reply written in that chat then alerts no device. Each report runs out after 45 seconds, so a device that sleeps or loses its link stops counting by itself, and a Mac nobody has touched for two minutes stops reporting. Approvals, questions and tasks still alert everywhere, because a bot is waiting on them. An app older than this change reports nothing and is alerted as before.
 
 Version 0.9.64 shows you the picture before the question. A bot that made a mock-up or screenshot for a choice and looked at it itself, then asked you to pick, used to put up the question card without ever posting the picture (the card can't show one), so you chose between pictures you hadn't seen. Now that question is held once, and the bot is told to post the picture (its `MEDIA:` lines) first and ask again. A picture you sent, an old file or a web image doesn't count, and a second try in the same turn always goes through (show_first.py).
@@ -309,6 +333,7 @@ and the `op` tool installed, on the computer running Hermes.
 0.9.59 also alerts your phone when a bot waits for a login, a one-time code or a password manager's unlock in a
 chat you don't have open. Hermes told plugins about approvals, questions and sudo passwords only, so those three
 waited unseen.
+
 
 Version 0.9.58 ties a plugin update you approve in the app to what the app showed you (the last open finding of the
 outside review). Hermes fetches the new version into a copy before it asks anything, and lists what that copy needs
