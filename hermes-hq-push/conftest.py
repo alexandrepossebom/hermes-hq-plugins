@@ -5,6 +5,10 @@ import tempfile
 from pathlib import Path
 
 os.environ["HERMES_HOME"] = tempfile.mkdtemp(prefix="hermes-hq-push-tests-")
+# A real 1Password key in the runner's own env (a Hermes background shell inherits the gateway's) would be frozen into
+# Hermes's launch-env snapshot by the first test that turns on multi-profile hosting, and test_onepassword_allow would
+# read it as an already-saved key. No test may see the computer's own key.
+os.environ.pop("OP_SERVICE_ACCOUNT_TOKEN", None)
 # Some Hermes calls import hermes_bootstrap, which (for a home that only borrows the checkout, as this one does)
 # builds a whole Python environment in that home and re-execs the test runner into it, without pytest. Inside Hermes
 # that boot has already happened; here it is turned off with Hermes's own switch (hermes_cli/venv_sync.prepare_launch).
