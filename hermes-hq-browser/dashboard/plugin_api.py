@@ -118,9 +118,11 @@ def _idle_for(profile) -> float:
         last = max(last, tracker.last_used(url))
     if fleet.on_demand():
         # A Chrome the bot just woke gets its whole idle window (its first call may not be published yet), and one nobody
-        # ever uses is still stopped: the clock counts from when it was started, not from never.
+        # ever uses is still stopped: the clock counts from when it was started, not from never. ``activity_at`` is the
+        # stamp a browser call writes before it runs, so a stop already in progress can see that call.
         try:
-            last = max(last, float(fleet.read_state(fleet.hermes_root(), profile).get("launched_at") or 0))
+            state = fleet.read_state(fleet.hermes_root(), profile)
+            last = max(last, float(state.get("launched_at") or 0), float(state.get("activity_at") or 0))
         except Exception:  # noqa: BLE001
             pass
     return now - last if last else float("inf")

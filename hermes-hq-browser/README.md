@@ -72,9 +72,12 @@ By default every bot's Chrome runs all the time, as above. On a computer with ma
 - **A bot's first browser call starts its Chrome.** The call waits for it (up to 15 seconds), as it already does when a
   bot browses before the dashboard has started its Chrome. Only that bot's Chrome starts.
 - **An unused Chrome stops** after `HERMES_HQ_BROWSER_IDLE_MINUTES` (default 15; `0` never stops one for being idle) and
-  goes back to `sleeping`. Sign-ins stay in the profile folder, and the pages the bot had open come back when its Chrome
-  does. Nothing is stopped while a browser call is running, a phone is watching it, a person holds or has asked for it,
-  or a `browser_ask_user` is waiting.
+  goes back to `sleeping`. The stop asks that Chrome to exit and write its profile, then signals it only if it is still
+  there, so sign-ins stay in the profile folder. The pages the bot had open come back when its Chrome does. Nothing is
+  stopped while a browser call is running, a phone is watching it, a person holds or has asked for it, or a
+  `browser_ask_user` is waiting. A call claims that bot's Chrome before it runs, and the stop looks again before it
+  ends the process, so the two can't cross. That claim lasts at least as long as a Chrome is given to start (about 30
+  seconds), so a shorter idle limit still cannot end a Chrome a call has only just claimed.
 - **A Chrome that exits or freezes isn't started again** until the bot browses; it sleeps instead.
 
 Limits: there is no cap on how many Chromes run at once (every bot that browses gets its own, and they stop as they go

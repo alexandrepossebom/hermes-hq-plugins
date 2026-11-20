@@ -13,8 +13,10 @@ a browser call when its Chrome is down, so a bot never waits on the dashboard.
   that exits, and ends and restarts one whose DevTools port stops answering (frozen).
 - **On demand (opt-in).** With ``HERMES_HQ_BROWSER_ON_DEMAND=1`` the supervisor still gives each bot its port, its
   ``browser.cdp_url`` and its profile folder, but starts no Chrome: a bot's Chrome starts when the bot browses (``ensure``)
-  and is stopped, status ``sleeping``, once nobody has used it for ``HERMES_HQ_BROWSER_IDLE_MINUTES`` (default 15). One
-  that exits or freezes is not restarted either; the bot's next browser call starts a fresh one.
+  and is stopped, status ``sleeping``, once nobody has used it for ``HERMES_HQ_BROWSER_IDLE_MINUTES`` (default 15). A
+  browser call stamps the bot's state under its lock before it runs, and the stop checks that stamp again under the
+  same lock, so a call and a stop can't cross. One that exits or freezes is not restarted either; the bot's next
+  browser call starts a fresh one.
 - **Bots that share a Chrome get one each.** A cloned bot copies its source's ``browser.cdp_url``; the bot whose
   Chrome it is keeps the port and the copy gets its own.
 - **Left alone:** ``use_real_profile``, a remote or fixed-id ``cdp_url``, Camofox, a profile that disabled the plugin,
@@ -715,6 +717,56 @@ def launch(home: Path, port: int, binary: str, window: str = "hidden", copied: b
     return child.pid
 
 
+def _still_running(pid: int) -> bool:
+    """True while ``pid`` is a live process. A zombie has already exited (and flushed), so it does not count."""
+    try:
+        import psutil
+        process = psutil.Process(pid)
+        return process.is_running() and process.status() != psutil.STATUS_ZOMBIE
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def close_politely(port: int) -> bool:
+    """Ask a Chrome that still answers to exit itself.
+
+    ``end`` only signals the process. On a busy machine that signal can land before Chrome has committed its
+    profile (cookies stay in an unflushed journal and the next start comes up signed out). A Chrome that is idle,
+    not frozen, can still take ``Browser.close`` and write the profile first. Any failure leaves ``end`` to do it.
+    """
+    try:
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(
+                f"{local_url(port)}/json/version", timeout=2) as response:  # noqa: S310 - loopback only
+            endpoint = json.loads(response.read(65536)).get("webSocketDebuggerUrl")
+        if not isinstance(endpoint, str) or not endpoint.startswith(("ws://127.0.0.1:", "ws://localhost:", "ws://[::1]:")):
+            return False
+        import asyncio
+        import websockets
+
+        async def once() -> None:
+            async with websockets.connect(endpoint, open_timeout=2, close_timeout=1, max_size=1 << 20,
+                                           proxy=None) as socket:
+                await socket.send(json.dumps({"id": 1, "method": "Browser.close"}))
+                try:
+                    await asyncio.wait_for(socket.recv(), 2)
+                except Exception:  # noqa: BLE001 - the process exiting closes the socket, which is success
+                    pass
+
+        asyncio.run(once())
+        return True
+    except Exception:  # noqa: BLE001 - a Chrome that will not close is ended by the caller
+        return False
+
+
+def end_politely(port: int, pid: int, folder: str) -> None:
+    """Ask Chrome to write its profile and exit, then signal it if it is still running."""
+    if close_politely(port):
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and _still_running(pid):
+            time.sleep(0.05)
+    end(pid, folder)
+
+
 def end(pid: int, folder: str) -> None:
     """End a Chrome this plugin runs for a bot (checked: its ``--user-data-dir`` is the bot's folder)."""
     try:
@@ -778,6 +830,45 @@ def start(root: Path, profile: str, home: Path, port: int, url: str, now: float 
         write_state(root, profile, state)
         log.info("hermes-hq-browser: started %s's Chrome on port %d", profile, port)
         return state
+
+
+def starting_grace(state: dict, now: float) -> bool:
+    """A Chrome this plugin has only just launched (its process may not be listed yet). Not ``port_taken``, not asleep."""
+    return state.get("status") == "starting" and now - float(state.get("launched_at") or 0) < START_GRACE
+
+
+def claim_window() -> float:
+    """How long a call's stamp keeps the Chrome.
+
+    At least ``START_GRACE``. A short idle limit must not expire the stamp before the dashboard has published the
+    call (its busy flag, a watch, a hold, an ask). Idle shutdown turned off (``IDLE_MINUTES=0``) does not pin a
+    Chrome forever: the stamp only covers that same gap, and an old unused Chrome can still be stopped.
+    """
+    limit = idle_limit()
+    if limit == float("inf"):
+        return START_GRACE
+    return max(limit, START_GRACE)
+
+
+def call_claimed(state: dict, now: float) -> bool:
+    """A browser call has stamped this bot (``note_call``) inside ``claim_window``."""
+    try:
+        at = float(state.get("activity_at") or 0)
+    except (TypeError, ValueError):
+        return False
+    return at > 0 and now - at < claim_window()
+
+
+def note_call(profile: str) -> None:
+    """A browser call is about to use this bot's Chrome (``agent._own_chrome_up``).
+
+    Written under the profile lock, which is the same lock an idle stop holds while it looks again and ends the
+    process. The stop therefore either sees the call and keeps the Chrome, or finishes before the call starts one.
+    """
+    root = hermes_root()
+    if not read_state(root, profile):
+        return
+    update_state(root, profile, {"activity_at": time.time()})
 
 
 def ensure(profile: str, home: Path, url: str) -> bool:
@@ -896,12 +987,15 @@ class Supervisor:
                 state = update_state(self.root, profile, {"status": status, "pid": mine[0] if mine else state.get("pid"),
                                                            "error": None})
             if status == "ready" and mine and on_demand() and self.unused(profile):
-                log.info("hermes-hq-browser: %s's Chrome has been idle; stopping it until the bot browses again", profile)
-                return self.sleep(profile, port, mine[0], folder)
+                return self.sleep(profile, port, mine[0], folder, now)
             if status == "ready" and mine and self.stale(profile, mine[0], port, now):
-                end(mine[0], folder)
+                with Locked(state_folder(self.root) / f"{profile}.lock"):
+                    fresh = read_state(self.root, profile)
+                    if call_claimed(fresh, time.time()) or starting_grace(fresh, time.time()):
+                        return {"profile": profile, "status": "ready", "port": port}
+                    end_politely(port, mine[0], folder)
                 if on_demand():  # an old Chrome nobody uses: the bot's next browser call starts a fresh one
-                    return self.sleep(profile, port)
+                    return self.sleep(profile, port, now=now)
                 result = start(self.root, profile, home, port, url, now)
                 return {"profile": profile, "status": result.get("status") or "starting", "port": port}
             return {"profile": profile, "status": status, "port": port}
@@ -917,15 +1011,20 @@ class Supervisor:
             end(mine[0], folder)
             self.misses[profile] = 0
         elif listening(port) and not answers(port, 1.0):
-            update_state(self.root, profile, {"status": "port_taken", "error": f"Something else is using port {port}."})
-            return {"profile": profile, "status": "port_taken", "port": port}
+            with Locked(state_folder(self.root) / f"{profile}.lock"):
+                fresh = read_state(self.root, profile)
+                if starting_grace(fresh, now):
+                    # This pass's process list was taken before the call's Chrome appeared. The port is its port.
+                    outcome = {"profile": profile, "status": "starting", "port": port}
+                else:
+                    fresh.update(status="port_taken", error=f"Something else is using port {port}.")
+                    write_state(self.root, profile, fresh)
+                    outcome = {"profile": profile, "status": "port_taken", "port": port, "error": fresh["error"]}
+            return outcome
         if on_demand():
             # Nothing is running and nothing is wanted yet: only a bot's browser call (``ensure``) starts this Chrome.
-            # One that call has only just launched isn't in this pass's process list: leave it be.
-            fresh = read_state(self.root, profile)
-            if fresh.get("status") == "starting" and now - float(fresh.get("launched_at") or 0) < START_GRACE:
-                return {"profile": profile, "status": "starting", "port": port}
-            return self.sleep(profile, port)
+            # ``sleep`` leaves a start that landed after this pass listed its processes.
+            return self.sleep(profile, port, now=now)
         if now < self.next_try.get(profile, 0):
             return {"profile": profile, "status": state.get("status") or "starting", "port": port, "error": state.get("error")}
         # Back off only from a Chrome that keeps quitting before it ever answers (a bad flag, a broken install); one
@@ -943,20 +1042,40 @@ class Supervisor:
         that clock, never."""
         if self.idle_for is None:
             return False
+        limit = idle_limit()
+        if limit == float("inf"):  # IDLE_MINUTES=0, and ``inf >= inf`` would otherwise count as unused
+            return False
         try:
-            return self.idle_for(profile) >= idle_limit()
+            return self.idle_for(profile) >= limit
         except Exception:  # noqa: BLE001
             return False
 
-    def sleep(self, profile: str, port: int, pid: int | None = None, folder: str | None = None) -> dict:
-        """On-demand mode: this bot's Chrome isn't running (``pid`` and ``folder``: end it first). The port, address and
-        profile folder stay as they are, so the bot's next browser call starts it again with its sign-ins."""
-        if pid and folder:
-            end(pid, folder)
-        self.misses[profile] = 0
-        if read_state(self.root, profile).get("status") != "sleeping":
-            update_state(self.root, profile, {"status": "sleeping", "pid": None, "error": None})
-        return {"profile": profile, "status": "sleeping", "port": port}
+    def sleep(self, profile: str, port: int, pid: int | None = None, folder: str | None = None,
+              now: float | None = None) -> dict:
+        """On-demand mode: this bot's Chrome isn't running (``pid`` and ``folder``: end it first, if it is still idle).
+
+        The port, address and profile folder stay as they are, so the bot's next browser call starts it again with its
+        sign-ins. Held under the profile lock together with the second idle check: ``note_call`` writes under that
+        same lock, so a call that has already started is not the one this stop ends."""
+        now = time.time() if now is None else now
+        with Locked(state_folder(self.root) / f"{profile}.lock"):
+            fresh = read_state(self.root, profile)
+            if pid and folder:
+                if call_claimed(fresh, now) or starting_grace(fresh, now) or not self.unused(profile):
+                    return {"profile": profile, "status": "ready", "port": port}
+                current = fresh.get("pid")
+                if current not in (None, pid) and fresh.get("status") in ("starting", "ready"):
+                    return {"profile": profile, "status": fresh.get("status") or "starting", "port": port}
+                log.info("hermes-hq-browser: %s's Chrome has been idle; stopping it until the bot browses again", profile)
+                end_politely(port, pid, folder)
+            elif fresh.get("status") in ("no_chrome", "port_taken"):
+                return {"profile": profile, "status": fresh["status"], "port": port, "error": fresh.get("error")}
+            elif starting_grace(fresh, now):
+                return {"profile": profile, "status": "starting", "port": port}
+            self.misses[profile] = 0
+            if fresh.get("status") != "sleeping" or fresh.get("pid") is not None:
+                write_state(self.root, profile, {**fresh, "status": "sleeping", "pid": None, "error": None})
+            return {"profile": profile, "status": "sleeping", "port": port}
 
     def leave_hosted(self, profile: str, home: Path, state: dict) -> dict:
         """A hosted Hermes: no Chrome for this bot. One this plugin started before it knew (and the ``cdp_url`` it wrote)
