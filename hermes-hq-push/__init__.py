@@ -50,7 +50,10 @@ due takes words ("today 17:00") and is said back. 0.9.38: every task has a Task 
 /tasks/{id}/page): one look for all, drawn from the task and what its bot writes with tasks_update(page=…), guided by
 skills/task-page (hermes-hq-push:task-page). 0.9.39: the Tasks page's Ideas tab (ideas.py): once the user turns it
 on, one bot's daily "Task ideas" job reads their recent chats and suggests a few tasks; pre_tool_call keeps that run
-to reading only, and nothing becomes a task until the user adds it.
+to reading only, and nothing becomes a task until the user adds it. 0.9.66: bots on a goal (goals.py): a goal's lead
+and helpers, the plan and the weekly check-in as offer cards, tools goals_list, goals_offer, goals_update and
+goals_next_review (toolset hq_goals), a note naming the person's goals, one "Goal check-in" job per lead bot (kept to
+research and drafts by pre_tool_call), and the Goal Page (GET /goals/{id}/page; skills/goal-page).
 """
 import importlib.util
 import logging
@@ -130,6 +133,13 @@ else:
     ideas = importlib.util.module_from_spec(_ideas_spec)
     sys.modules["hermes_hq_ideas"] = ideas
     _ideas_spec.loader.exec_module(ideas)
+if "hermes_hq_goals" in sys.modules:   # 0.9.66: one copy for this process: the tools, the note and the routes share it
+    goals = sys.modules["hermes_hq_goals"]
+else:
+    _goals_spec = importlib.util.spec_from_file_location("hermes_hq_goals", Path(__file__).with_name("goals.py"))
+    goals = importlib.util.module_from_spec(_goals_spec)
+    sys.modules["hermes_hq_goals"] = goals
+    _goals_spec.loader.exec_module(goals)
 
 log = logging.getLogger(push.NAME)
 _dispatcher = None
@@ -288,6 +298,10 @@ def pre_llm_call(platform="", parent_session_id="", user_message=None, conversat
         asks.note_answer(user_message)
     except Exception:
         log.debug("hermes-hq-push: ask answer not noted")
+    try:  # [goals] every process: whether the person is in this chat, so a bot's tasks offer there is a card at once
+        goals.note_turn(session_id, platform, user_message)
+    except Exception:
+        log.debug("hermes-hq-push: goals turn not noted")
     if not _serves_app_sessions():
         # [asks] A job's report handed to a Bot Chat (a gateway turn): ask with the card, not in text.
         try:
@@ -317,6 +331,14 @@ def pre_llm_call(platform="", parent_session_id="", user_message=None, conversat
             notes.append(note)
     except Exception:
         log.debug("hermes-hq-push: tasks note skipped", exc_info=True)
+    try:  # [goals] 0.9.66: the person's goals by name and why; in a goal's own chat, its brief and the lead's duties
+        note = goals.context_for(store=_tasks_store(), profile=_profile(), platform=platform,
+                                 parent_session_id=parent_session_id, user_message=user_message,
+                                 conversation_history=conversation_history, session_id=str(session_id or ""))
+        if note:
+            notes.append(note)
+    except Exception:
+        log.debug("hermes-hq-push: goals note skipped", exc_info=True)
     try:  # [tasks] 0.9.47: an answer in a task's own chat starts it moving again (after the note read its question)
         tasks.answer_started(_tasks_store(), str(session_id or ""), platform=platform, user_message=user_message)
     except Exception:
@@ -361,6 +383,7 @@ def _desktop_theme():
 def pre_tool_call(tool_name="", args=None, **kwargs):
     verdict = (_veto(tool_name, args) or _code_veto(tool_name, args, kwargs)
                or _ideas_veto(tool_name, kwargs.get("session_id"))
+               or _goals_veto(tool_name, kwargs.get("session_id"))
                or _draft_veto(tool_name, args, kwargs.get("session_id"))
                or _pay_block(tool_name, args, kwargs.get("session_id")) or _show_first(tool_name, args, kwargs)
                or _job_clarify(tool_name))
@@ -537,6 +560,19 @@ def _ideas_veto(tool_name, session_id):
     return None
 
 
+def _goals_veto(tool_name, session_id):
+    """[goals] 0.9.66: inside this bot's Goal check-in run, nothing is sent, booked, bought, paid, posted or deleted
+    (goals.guard, by the tool's name). Never logs the call's arguments."""
+    try:
+        message = goals.guard(tool_name, session_id, _tasks_store, _profile())
+    except Exception:
+        return None
+    if message:
+        log.info("hermes-hq-push: goal check-in run asked for %s; refused (research and drafts only)", tool_name)
+        return {"action": "block", "message": message}
+    return None
+
+
 def _restart_guard():
     try:
         from hermes_constants import get_default_hermes_root
@@ -653,6 +689,24 @@ def _task_page_skill(ctx):
         log.warning("hermes-hq-push: task page skill not offered", exc_info=True)
 
 
+# The Goal Page skill (skills/goal-page, 0.9.66): what a goal's lead writes in where it stands, a check-in and its
+# Goal Page. The page's look is the add-on's (goals.render_page fills in skills/goal-page/template.html).
+GOAL_PAGE_SKILL = Path(__file__).resolve().parent / "skills" / "goal-page" / "SKILL.md"
+
+
+def _goal_page_skill(ctx):
+    if not hasattr(ctx, "register_skill"):
+        log.info("hermes-hq-push: goal page skill not offered (this Hermes has no plugin skills)")
+        return
+    try:
+        ctx.register_skill("goal-page", GOAL_PAGE_SKILL,
+                           "Lead a goal in the Hermes HQ app: what goes in where it stands, in a weekly check-in and on "
+                           "its Goal Page, written with goals_update and goals_offer.")
+        log.info("hermes-hq-push: goal page skill offered")
+    except Exception:
+        log.warning("hermes-hq-push: goal page skill not offered", exc_info=True)
+
+
 def _short_titles():
     try:
         log.info("hermes-hq-push: short chat names %s", short_titles.install())
@@ -718,6 +772,18 @@ def _tasks_tools(ctx):
         ideas.register_tool(ctx, _tasks_store, _profile)
     except Exception:
         log.warning("hermes-hq-push: task ideas tool not registered", exc_info=True)
+    try:
+        goals.register_tools(ctx, _tasks_store, _profile, _goals_notify)
+    except Exception:
+        log.warning("hermes-hq-push: goals tools not registered", exc_info=True)
+
+
+def _goals_notify(goal: dict, offer: dict, profile: str) -> None:
+    """[goals] A lead offered its weekly check-in: one push to the person's devices, sealed like any other ("<Bot>:
+    check-in for <goal>"). Only the goal's title travels, and it is never logged."""
+    _dispatcher_for().submit(push.Push(kind="task", profile=profile, request="goal:" + (goal.get("id") or ""),
+                                       sender=_sender(profile), text=(goal.get("title") or "")[:200], about="checkin"))
+    log.info("hermes-hq-push: goal check-in push sent")
 
 
 def _draft_tool(ctx):
@@ -763,6 +829,10 @@ def _tasks_prep_job():
         ideas.reconcile_job(_tasks_store(), _profile())
     except Exception:
         log.debug("hermes-hq-push: task ideas job not reconciled at load", exc_info=True)
+    try:   # [goals] 0.9.66: and its "Goal check-in": armed while it leads a goal with a check-in, else gone
+        goals.reconcile_checkin_job(_tasks_store(), _profile())
+    except Exception:
+        log.debug("hermes-hq-push: goal check-in job not reconciled at load", exc_info=True)
 
 
 def register(ctx):
@@ -785,6 +855,7 @@ def register(ctx):
     _ask_tool(ctx)
     _dashboard_skill(ctx)
     _task_page_skill(ctx)
+    _goal_page_skill(ctx)
     _desktop_theme()
     _restart_guard()
     _own_chats()

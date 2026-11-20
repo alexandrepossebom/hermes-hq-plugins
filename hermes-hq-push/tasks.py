@@ -71,8 +71,10 @@ _UNSET = object()  # tasks_update left `due` out (None clears it)
 # The list answer's shape: raise it when the answer gains a field. An app polling `?since=<rev>` hears "unchanged" until
 # the rev moves, so it would keep an answer from before the field (0.9.40: after an update to 0.9.39 the app never saw
 # `ideas` and kept asking for the update). A new shape moves the rev once, and every app reads the whole list again.
-LIST_SHAPE = "6"   # 2: `ideas` (0.9.39). 3: each task's `page` (0.9.43). 4: `next_check`, `choices` (0.9.47).
+LIST_SHAPE = "8"   # 2: `ideas` (0.9.39). 3: each task's `page` (0.9.43). 4: `next_check`, `choices` (0.9.47).
                    # 5: `priority`, `tags`, `alert`, `starts` (0.9.53). 6: `lists`, `offers`, a task's `offer` (0.9.55)
+                   # 7: `goals`, a task's `goal` and `milestone` (0.9.65)
+                   # 8: a goal's lead, helpers, check-in and the rest of goals.py's fields, goal offers (0.9.66)
 # 0.9.47, owner 2026-11-09 ("no friction, it just works"): the bot's own next look at a task (a real run, not a
 # promise in a sentence), and up to 3 one-tap answers when it asks the person something.
 CHOICES_CAP = 3
@@ -103,7 +105,10 @@ START_NOW_TTL = 2 * 3600  # a "start now" the prep job hasn't reached in two hou
 # chats is theirs to choose); "ideas_bot" runs it daily at "ideas_at" and offers at most "ideas_max" ideas a day.
 DEFAULT_SETTINGS = {"enabled": True, "capture": "ask", "prep_per_day": 6, "quiet_start": "22:00", "quiet_end": "08:00",
                     "prep_every_hours": 3, "group": "smart", "sort": "smart",
-                    "ideas": False, "ideas_bot": "default", "ideas_at": "07:30", "ideas_max": 3}
+                    "ideas": False, "ideas_bot": "default", "ideas_at": "07:30", "ideas_max": 3,
+                    "goals": True}
+# "goals" (0.9.66, goals.py): False hides every goals tool, drops the goals note and every Goal check-in job (as
+# "enabled" does for all of Tasks). The goals themselves are kept.
 IDEAS_MAX = 5
 _PROFILE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 GROUPS = ("smart", "sections")
@@ -118,7 +123,7 @@ SECTION_NAME_MAX = 60
 LIST_COLORS = ("blue", "green", "orange", "red", "purple", "pink", "teal", "yellow", "gray")
 LIST_ADDS = ("auto", "ask")   # what the list's bot does with a new task for it: add it, or offer it first
 _ICON_NAME = re.compile(r"^[a-z0-9.]{1,40}$")   # an SF Symbol's name
-OFFERS_CAP = 40          # kept offers, newest last (answered ones stay so the same list isn't offered twice)
+OFFERS_CAP = 60          # kept offers (0.9.66: goal offers share the list, so 40 became 60), newest last (answered ones stay so the same list isn't offered twice)
 OFFER_TASKS_CAP = 20
 OFFER_WHY_MAX = 160
 FROM_MAX = {"app": 40, "who": 80, "at": 40, "ref": 300, "link": 2000}
@@ -127,7 +132,31 @@ EDIT_KEYS = ("title", "notes", "due", "repeat", "steps", "who", "bot", "priority
 
 COLUMNS = ("id", "rev", "title", "notes", "who", "bot", "status", "status_note", "due", "repeat", "prep",
            "steps", "made", "source", "created_at", "updated_at", "done_at", "created_by", "log", "section", "position",
-           "watch", "chat", "page_at", "next_check", "choices", "priority", "tags", "alert", "starts", "edited", "offer")
+           "watch", "chat", "page_at", "next_check", "choices", "priority", "tags", "alert", "starts", "edited", "offer",
+           "goal", "milestone")
+
+# 0.9.65, owner 2026-11-18 ("on top of the tasks section, what if we had an area for goals … things that I want to
+# achieve over time"): a goal is a finish line, an optional day, a one-line why, milestones, and ordinary tasks under
+# them (a task's ``goal`` and ``milestone``). Kept beside the list (table ``goals``) under the list's own rev, so the
+# app's one poll hears of a goal's change. No bot touches a goal in this version: no tool reads or writes one.
+GOAL_STATUSES = ("active", "paused", "achieved", "let_go")
+GOALS_CAP = 200
+GOAL_WHY_MAX = 300
+MILESTONES_CAP = 30
+MILESTONE_TITLE_MAX = 120
+UNIT_MAX = 20
+MEASURE_HISTORY_CAP = 60
+GOAL_KEYS = ("id", "rev", "title", "why", "status", "status_at", "color", "due", "position", "measure", "milestones",
+             "created_at", "updated_at", "log",
+             # 0.9.66 (goals.py): the bots on a goal, its check-in, where it stands, its chat and page, its stall answer
+             "lead", "helpers", "adds", "review", "known_to_all", "stands", "checkin", "chat", "page_at", "kept_at",
+             "offer")
+# 0.9.66, owner 2026-11-18 ("whatever bots I add to it can work to help me achieve that goal"): one lead per goal, up
+# to five helpers, and the person's rule for what they add (goals.py holds the bots' side).
+HELPERS_CAP = 5
+GOAL_ADDS = ("ask", "auto")
+DEFAULT_REVIEW = {"day": 0, "time": "08:00"}   # Monday 08:00: a goal's check-in when a lead is first given
+SOURCE_WHAT_MAX = 80
 
 
 class TaskError(ValueError):
@@ -523,7 +552,138 @@ def same_task(a: str, b: str) -> bool:
     return wa == wb or len(wa & wb) / len(wa | wb) >= 0.75
 
 
-def compact(task: dict, sections: dict | None = None, page: dict | None = None) -> dict:
+def _number(value) -> float | None:
+    """A finite number (never a bool), or ``None``."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if number != number or number in (float("inf"), float("-inf")):
+        return None
+    return int(number) if number == int(number) and abs(number) < 1e15 else number
+
+
+def _clean_milestones(value, old=(), now: str = "") -> list[dict]:
+    """A goal's milestones in order. One with a known id keeps its ``done_at``; one without an id gets one; ticking
+    one stamps ``done_at`` and unticking clears it."""
+    was = {m["id"]: m for m in old or () if isinstance(m, dict) and m.get("id")}
+    out, seen = [], set()
+    for item in (value if isinstance(value, list) else [])[:MILESTONES_CAP]:
+        if not isinstance(item, dict):
+            continue
+        title = _text(item.get("title"), MILESTONE_TITLE_MAX)
+        mid = _text(item.get("id"), 64) or new_id()
+        if not title or mid in seen:
+            continue
+        seen.add(mid)
+        before = was.get(mid) or {}
+        done = bool(item["done"]) if "done" in item else bool(before.get("done"))
+        done_at = (before.get("done_at") if before.get("done") else None) or now if done else None
+        due = _clean_start(item["due"]) if "due" in item else before.get("due")
+        out.append({"id": mid, "title": title, "due": due or None, "done": done, "done_at": done_at})
+    return out
+
+
+def _clean_source(value):
+    """Who reads a goal's number (0.9.66): "you", or one bot and what it reads (``{bot, what}``); ``None`` for
+    anything else."""
+    if value == "you":
+        return "you"
+    if isinstance(value, dict):
+        bot = _text(value.get("bot"), 64)
+        if bot and _PROFILE_NAME.match(bot):
+            return {"bot": bot, "what": _text(value.get("what"), SOURCE_WHAT_MAX)}
+    return None
+
+
+def _clean_measure(given, old: dict | None, now: str) -> dict | None:
+    """A goal's number: where it started, where it is going and where it is. ``now`` moving stamps ``at`` and adds to
+    ``history``. Its ``source`` is the person ("you") or one bot that reads it (0.9.66); a new source clears
+    ``checked_at``, the time that bot last looked."""
+    if not isinstance(given, dict):
+        return None
+    old = old if isinstance(old, dict) else {}
+
+    def pick(key, fallback):
+        number = _number(given.get(key)) if key in given else None
+        return number if number is not None else fallback
+
+    start = pick("start", old.get("start", 0))
+    target = pick("target", old.get("target"))
+    if target is None or target == start:
+        raise TaskError(400, "A goal's number needs a target that differs from where it starts.")
+    current = pick("now", old.get("now", start))
+    unit = _text(given["unit"], UNIT_MAX) if "unit" in given else old.get("unit", "")
+    history = [h for h in old.get("history") or [] if isinstance(h, dict)]
+    at = old.get("at") or now
+    if not old or current != old.get("now"):
+        at = now
+        history.append({"at": now, "value": current})
+    source, checked = old.get("source") or "you", old.get("checked_at")
+    if "source" in given and given["source"] is not None:
+        source = _clean_source(given["source"])
+        if source is None:
+            raise TaskError(400, "A number's source is \"you\" or {bot, what}: the bot that reads it and what it reads.")
+        if source != (old.get("source") or "you"):
+            checked = None
+    return {"unit": unit, "start": start, "target": target, "now": current, "at": at, "source": source,
+            "checked_at": checked, "history": history[-MEASURE_HISTORY_CAP:]}
+
+
+def _row_to_goal(row) -> dict:
+    goal_id, rev, position, body = row
+    try:
+        goal = json.loads(body)
+    except ValueError:
+        goal = {}
+    goal = goal if isinstance(goal, dict) else {}
+    out = {"id": goal_id, "rev": int(rev), "title": goal.get("title") or "", "why": goal.get("why") or "",
+           "status": goal.get("status") if goal.get("status") in GOAL_STATUSES else "active",
+           "status_at": goal.get("status_at") or goal.get("created_at") or "",
+           "color": goal.get("color") if goal.get("color") in LIST_COLORS else LIST_COLORS[0],
+           "due": goal.get("due") or None, "position": float(position or 0),
+           "measure": goal.get("measure") if isinstance(goal.get("measure"), dict) else None,
+           "milestones": goal.get("milestones") if isinstance(goal.get("milestones"), list) else [],
+           "created_at": goal.get("created_at") or "", "updated_at": goal.get("updated_at") or "",
+           "log": goal.get("log") if isinstance(goal.get("log"), list) else []}
+    # 0.9.66: a goal saved by 0.9.65 has none of these, and reads with the defaults.
+    if out["measure"] is not None:
+        out["measure"] = {**out["measure"], "source": _clean_source(out["measure"].get("source")) or "you",
+                          "checked_at": out["measure"].get("checked_at") or None}
+    lead = goal.get("lead")
+    out["lead"] = lead if isinstance(lead, str) and _PROFILE_NAME.match(lead) else None
+    out["helpers"] = _clean_helpers(goal.get("helpers"), out["lead"])
+    out["adds"] = goal.get("adds") if goal.get("adds") in GOAL_ADDS else "ask"
+    out["review"] = _clean_review(goal.get("review"))
+    out["known_to_all"] = goal.get("known_to_all") is not False
+    for key in ("stands", "checkin", "offer"):
+        out[key] = goal.get(key) if isinstance(goal.get(key), dict) and goal.get(key) else None
+    out["chat"] = _clean_chat(goal.get("chat"))
+    out["page_at"] = goal.get("page_at") if isinstance(goal.get("page_at"), str) else ""
+    out["kept_at"] = goal.get("kept_at") or None
+    return out
+
+
+def _clean_helpers(value, lead) -> list[str]:
+    """A goal's helpers: bots' profile names, each once, never the lead, five at most."""
+    out = []
+    for item in value if isinstance(value, list) else []:
+        name = item if isinstance(item, str) and _PROFILE_NAME.match(item) else None
+        if name and name != lead and name not in out:
+            out.append(name)
+    return out[:HELPERS_CAP]
+
+
+def _clean_review(value) -> dict | None:
+    """A goal's weekly check-in: ``{day: 0-6 (0 = Monday), time: "08:00"}``, or ``None`` (off)."""
+    if not isinstance(value, dict):
+        return None
+    day, at = value.get("day"), _hhmm(value.get("time"))
+    if isinstance(day, bool) or not isinstance(day, int) or not 0 <= day <= 6 or at is None:
+        return None
+    return {"day": day, "time": at}
+
+
+def compact(task: dict, sections: dict | None = None, page: dict | None = None, goals: dict | None = None) -> dict:
     """A task trimmed for ``tasks_list``: the fields a bot needs to talk about it, nothing it doesn't (long
     notes clipped, empty fields left out) — this rides the model's context on every call."""
     out = {"id": task["id"], "title": task["title"], "who": task["who"], "bot": task["bot"],
@@ -548,6 +708,8 @@ def compact(task: dict, sections: dict | None = None, page: dict | None = None) 
         out["tags"] = task["tags"]
     if task.get("starts"):
         out["starts"] = task["starts"]
+    if task.get("goal") and goals and task["goal"] in goals:
+        out["goal"] = goals[task["goal"]]   # the goal's name: what this task is for
     found = (task.get("source") or {}).get("from") if isinstance(task.get("source"), dict) else None
     if found:
         out["source"] = {k: found[k] for k in ("app", "who", "at", "ref") if found.get(k)}
@@ -583,6 +745,8 @@ def _row_to_task(row) -> dict:
     task["alert"] = _clean_alert(task.get("alert"))
     task["starts"] = task.get("starts") or None
     task["edited"] = bool(task.get("edited"))
+    task["goal"] = task.get("goal") or None
+    task["milestone"] = (task.get("milestone") or None) if task["goal"] else None
     for key in ("steps", "made", "source", "log", "chat", "choices", "tags"):
         task[key] = json.loads(task[key] or ("{}" if key in ("source", "chat") else "[]"))
     try:
@@ -737,6 +901,9 @@ class Store:
                     help text not null default '', state text not null default 'new', task_id text,
                     decided_at text);
                 create index if not exists task_ideas_state on task_ideas (state, created_at);
+                create table if not exists goals (
+                    id text primary key, rev integer not null, position real not null default 0,
+                    body text not null default '{}');
             """)
             # 0.9.53: from this moment a bot's own task runs without the prep flag (``_open_prep``). Tasks nobody
             # has touched since stay as they were: installing the update must not start a pile of old ones.
@@ -769,6 +936,10 @@ class Store:
                 db.execute("alter table tasks add column edited integer not null default 0")
             if "offer" not in have:
                 db.execute("alter table tasks add column offer text not null default ''")
+            if "goal" not in have:   # 0.9.65: the goal a task is for, and its milestone there
+                db.execute("alter table tasks add column goal text")
+            if "milestone" not in have:
+                db.execute("alter table tasks add column milestone text")
             if "position" not in have:
                 db.execute("alter table tasks add column position real")
                 for task_id, made in db.execute("select id, created_at from tasks").fetchall():
@@ -887,9 +1058,12 @@ class Store:
         # files and links (POST /tasks/{id}/attach): the app shows those rows only then.
         # lists, offers (0.9.55): a list carries its colour, icon, bot and rules, and a bot's offers of a list or a
         # batch of tasks wait here for the person's tap (POST /tasks/offers/{id}).
+        # goals (0.9.65): every goal, by position. The key being here says this add-on keeps goals.
+        # goal_bots (0.9.66, goals.py): a goal's lead and helpers, its check-in and Goal Page; goal offers in `offers`.
         return {"rev": current, "tasks": listed, "settings": self.get_settings(),
                 "sections": self.get_sections(), "pages": True, "ideas": self.new_ideas_count(),
-                "fields": True, "files": True, "lists": True, "offers": self.shown_offers()}
+                "fields": True, "files": True, "lists": True, "offers": self.shown_offers(),
+                "goals": self.list_goals(), "goal_bots": True}
 
     def new_ideas_count(self) -> int:
         """New ideas still fresh (ideas.py: one nobody acts on fades after FRESH_DAYS); 0 while Ideas is off."""
@@ -924,6 +1098,11 @@ class Store:
     def enabled(self) -> bool:
         """Tasks is on (Settings › Tasks in the app); off hides the tools, the note and the prep jobs."""
         return self.get_settings().get("enabled", True) is not False
+
+    def goals_on(self) -> bool:
+        """Tasks is on and so is its Goals (0.9.66): off hides the goals tools, the note and the check-in jobs."""
+        settings = self.get_settings()
+        return settings.get("enabled", True) is not False and settings.get("goals", True) is not False
 
     def bots_with_tasks(self) -> list[str]:
         with closing(self._db()) as db:
@@ -1012,11 +1191,12 @@ class Store:
             "next_check": "", "choices": "[]",
             "priority": _clean_priority(fields.get("priority")), "tags": json.dumps(_clean_tags(fields.get("tags"))),
             "alert": _clean_alert(fields.get("alert")), "starts": _clean_start(fields.get("starts")),
-            "edited": 0, "offer": "",
+            "edited": 0, "offer": "", "goal": None, "milestone": None,
         }
         section_by_id = bool(fields.get("_section_by_id"))
 
         def insert(db):
+            row["goal"], row["milestone"] = self._goal_place(db, fields.get("goal"), fields.get("milestone"))
             row["section"] = self._section_id(db, fields.get("section"), by_id=section_by_id)
             if row["section"] is None and created_by != "you" and who != "bot" and "section" not in fields:
                 row["section"] = self._kept_list(db, created_by)   # a list's bot files its tasks there
@@ -1044,6 +1224,210 @@ class Store:
             db.execute("delete from task_pages where id=?", (task_id,))
             self._bump_rev(db)
         self._drop_files(task_id)
+        return {"ok": True}
+
+    # ---- goals (0.9.65) ------------------------------------------------------------------------------------------
+
+    @staticmethod
+    def _read_goal(db, goal_id) -> dict | None:
+        row = db.execute("select id, rev, position, body from goals where id=?", (str(goal_id or ""),)).fetchone()
+        return _row_to_goal(row) if row else None
+
+    def _goal_place(self, db, goal, milestone) -> tuple[str | None, str | None]:
+        """A task's place under a goal: the goal's id (an unknown one is refused) and one of that goal's milestones
+        (anything else is no milestone). No goal means no milestone."""
+        goal_id = _text(goal, 64) if isinstance(goal, str) else ""
+        if not goal_id:
+            return None, None
+        found = self._read_goal(db, goal_id)
+        if found is None:
+            raise TaskError(400, "No such goal.")
+        wanted = _text(milestone, 64) if isinstance(milestone, str) else ""
+        return goal_id, (wanted if any(m["id"] == wanted for m in found["milestones"]) else None)
+
+    @staticmethod
+    def _save_goal(db, goal: dict, insert: bool = False) -> None:
+        body = json.dumps({k: goal[k] for k in GOAL_KEYS if k not in ("id", "rev", "position")}, ensure_ascii=False)
+        if insert:
+            db.execute("insert into goals (id, rev, position, body) values (?, ?, ?, ?)",
+                       (goal["id"], goal["rev"], goal["position"], body))
+        else:
+            db.execute("update goals set rev=?, position=?, body=? where id=?",
+                       (goal["rev"], goal["position"], body, goal["id"]))
+
+    def list_goals(self) -> list[dict]:
+        with closing(self._db()) as db:
+            rows = db.execute("select id, rev, position, body from goals order by position, id").fetchall()
+        return [_row_to_goal(r) for r in rows]
+
+    def get_goal(self, goal_id: str) -> dict | None:
+        with closing(self._db()) as db:
+            return self._read_goal(db, goal_id)
+
+    def goal_names(self) -> dict:
+        return {g["id"]: g["title"] for g in self.list_goals()}
+
+    def create_goal(self, fields: dict, by: str = "you") -> dict:
+        """``POST /goals``. A colour left out is the first one no active goal uses."""
+        with closing(self._write_db()) as db, db:
+            goal = self._new_goal(db, fields, by)
+            self._bump_rev(db)
+        return goal
+
+    def _new_goal(self, db, fields: dict, by: str = "you") -> dict:
+        """A new goal saved inside ``db``'s transaction (``create_goal``, and goals.py accepting a bot's offer of one).
+        ``lead`` (0.9.66) starts its check-in on Monday 08:00, as setting one later does."""
+        title = _text(fields.get("title"), TITLE_MAX)
+        if not title:
+            raise TaskError(400, "A goal needs a name.")
+        now = _iso(self.clock)
+        if db.execute("select count(*) from goals").fetchone()[0] >= GOALS_CAP:
+            raise TaskError(400, "That is as many goals as this list keeps. Delete one first.")
+        color = fields.get("color")
+        if color not in LIST_COLORS:
+            rows = db.execute("select id, rev, position, body from goals").fetchall()
+            used = {g["color"] for g in map(_row_to_goal, rows) if g["status"] == "active"}
+            color = next((c for c in LIST_COLORS if c not in used), LIST_COLORS[0])
+        position = fields.get("position")
+        lead = fields.get("lead") if isinstance(fields.get("lead"), str) and _PROFILE_NAME.match(fields["lead"]) else None
+        goal = {"id": new_id(), "rev": 1, "title": title, "why": _text(fields.get("why"), GOAL_WHY_MAX),
+                "status": "active", "status_at": now, "color": color, "due": _clean_start(fields.get("due")),
+                "position": float(position) if _number(position) is not None else self.clock(),
+                "measure": _clean_measure(fields.get("measure"), None, now) if fields.get("measure") else None,
+                "milestones": _clean_milestones(fields.get("milestones"), now=now),
+                "created_at": now, "updated_at": now, "log": [{"at": now, "by": by, "text": "Added"}],
+                "lead": lead, "helpers": _clean_helpers(fields.get("helpers"), lead),
+                "adds": fields.get("adds") if fields.get("adds") in GOAL_ADDS else "ask",
+                "review": (_clean_review(fields.get("review")) if "review" in fields
+                           else dict(DEFAULT_REVIEW) if lead else None),
+                "known_to_all": fields.get("known_to_all") is not False, "stands": None, "checkin": None,
+                "chat": _clean_chat(fields.get("chat")), "page_at": "", "kept_at": None, "offer": None}
+        self._save_goal(db, goal, insert=True)
+        return goal
+
+    def update_goal(self, goal_id: str, rev: int, patch: dict, by: str = "you") -> dict:
+        """``PATCH /goals/{id}``: ``patch`` holds only the keys being changed. A stale ``rev`` raises
+        ``TaskError(409, {"goal": current})``. A milestone left out of ``milestones`` is removed; its tasks stay in
+        the goal with no milestone."""
+        with closing(self._write_db()) as db, db:
+            goal = self._read_goal(db, goal_id)
+            if goal is None:
+                raise TaskError(404, "No such goal.")
+            if int(rev) != goal["rev"]:
+                raise TaskError(409, {"goal": goal})
+            now = _iso(self.clock)
+            updated, log = dict(goal), list(goal["log"])
+            if "title" in patch and patch["title"] is not None:
+                title = _text(patch["title"], TITLE_MAX)
+                if not title:
+                    raise TaskError(400, "A goal needs a name.")
+                updated["title"] = title
+            if "why" in patch and patch["why"] is not None:
+                updated["why"] = _text(patch["why"], GOAL_WHY_MAX)
+            if patch.get("color") in LIST_COLORS:
+                updated["color"] = patch["color"]
+            if "due" in patch:
+                updated["due"] = _clean_start(patch["due"])
+            if _number(patch.get("position")) is not None:
+                updated["position"] = float(patch["position"])
+            if "measure" in patch:
+                updated["measure"] = _clean_measure(patch["measure"], goal["measure"], now) if patch["measure"] else None
+            if "measure_now" in patch and _number(patch["measure_now"]) is not None:
+                if not updated["measure"]:
+                    raise TaskError(400, "This goal has no number to update.")
+                updated["measure"] = _clean_measure({"now": patch["measure_now"]}, updated["measure"], now)
+            if (updated["measure"] or {}).get("now") != (goal["measure"] or {}).get("now") and updated["measure"]:
+                unit = f' {updated["measure"]["unit"]}' if updated["measure"]["unit"] else ""
+                log.append({"at": now, "by": by, "text": f'Now {updated["measure"]["now"]:g}{unit}'})
+            if "milestones" in patch and patch["milestones"] is not None:
+                updated["milestones"] = _clean_milestones(patch["milestones"], goal["milestones"], now)
+                kept = {m["id"] for m in updated["milestones"]}
+                was_done = {m["id"] for m in goal["milestones"] if m["done"]}
+                for m in updated["milestones"]:
+                    if m["done"] and m["id"] not in was_done:
+                        log.append({"at": now, "by": by, "text": f'Milestone done: {m["title"]}'})
+                for (mid,) in db.execute("select distinct milestone from tasks where goal=? and milestone is not null",
+                                         (goal_id,)).fetchall():
+                    if mid not in kept:
+                        db.execute("update tasks set milestone=null, rev=rev+1 where goal=? and milestone=?", (goal_id, mid))
+            status = patch.get("status")
+            if status and status != goal["status"]:
+                if status not in GOAL_STATUSES:
+                    raise TaskError(400, f"status must be one of {', '.join(GOAL_STATUSES)}.")
+                updated["status"], updated["status_at"] = status, now
+                log.append({"at": now, "by": by, "text": {"active": "Resumed", "paused": "Paused",
+                                                           "achieved": "Achieved", "let_go": "Let go"}[status]})
+            self._goal_bots_patch(goal, updated, patch, log, now, by)
+            updated["log"] = log[-LOG_CAP:]
+            updated["rev"], updated["updated_at"] = goal["rev"] + 1, now
+            self._save_goal(db, updated)
+            self._bump_rev(db)
+        return updated
+
+    @staticmethod
+    def _goal_bots_patch(goal: dict, updated: dict, patch: dict, log: list, now: str, by: str) -> None:
+        """0.9.66's part of ``PATCH /goals/{id}``: the lead (null removes it and keeps the helpers), the helpers (never
+        the lead), New Tasks (``adds``), the check-in (``review``; null turns it off), Tell My Other Bots
+        (``known_to_all``), the goal's own chat, Keep Going (``keep``) and the answer to a lead's looks-done offer
+        (``offer_answer``: "done" ticks it, "keep" is Not Yet)."""
+        if "lead" in patch:
+            lead = patch["lead"] if isinstance(patch["lead"], str) and _PROFILE_NAME.match(patch["lead"]) else None
+            if patch["lead"] not in (None, "") and lead is None:
+                raise TaskError(400, "lead is a bot's profile name, or null for no one.")
+            if lead != goal["lead"]:
+                if lead and not goal["lead"] and goal["review"] is None and "review" not in patch:
+                    updated["review"] = dict(DEFAULT_REVIEW)   # a lead first given checks in on Monday 08:00
+                updated["lead"] = lead
+                log.append({"at": now, "by": by, "text": "Lead changed" if lead else "No lead now"})
+        if "helpers" in patch and patch["helpers"] is not None:
+            if not isinstance(patch["helpers"], list):
+                raise TaskError(400, "helpers is a list of bots' profile names.")
+            updated["helpers"] = _clean_helpers(patch["helpers"], updated["lead"])
+        updated["helpers"] = [h for h in updated["helpers"] if h != updated["lead"]]
+        if patch.get("adds") in GOAL_ADDS:
+            updated["adds"] = patch["adds"]
+        if "review" in patch:
+            review = _clean_review(patch["review"])
+            if patch["review"] is not None and review is None:
+                raise TaskError(400, "review is {day: 0-6 (0 = Monday), time: \"HH:MM\"}, or null to turn it off.")
+            updated["review"] = review
+        if isinstance(patch.get("known_to_all"), bool):
+            updated["known_to_all"] = patch["known_to_all"]
+        if "chat" in patch and patch["chat"] is not None:
+            updated["chat"] = _clean_chat(patch["chat"])
+        if patch.get("keep") is True:
+            updated["kept_at"] = now
+            log.append({"at": now, "by": by, "text": "Kept going"})
+        offer, answer = updated.get("offer"), patch.get("offer_answer")
+        if answer is not None and answer not in ("done", "keep"):
+            raise TaskError(400, "offer_answer is \"done\" or \"keep\".")
+        if answer and offer and not offer.get("kept"):
+            if answer == "keep":
+                updated["offer"] = dict(offer, kept=True, kept_at=now)
+            elif offer.get("what") == "goal":
+                if updated["status"] != "achieved":
+                    updated["status"], updated["status_at"] = "achieved", now
+                    log.append({"at": now, "by": by, "text": "Achieved"})
+                updated["offer"] = None
+            else:
+                ticked = []
+                for m in updated["milestones"]:
+                    if m["id"] == offer.get("what") and not m["done"]:
+                        m = dict(m, done=True, done_at=now)
+                        log.append({"at": now, "by": by, "text": f'Milestone done: {m["title"]}'})
+                    ticked.append(m)
+                updated["milestones"], updated["offer"] = ticked, None
+        offer = updated.get("offer")
+        if offer and (updated["status"] != "active" if offer.get("what") == "goal" else
+                      not any(m["id"] == offer.get("what") and not m["done"] for m in updated["milestones"])):
+            updated["offer"] = None   # ticked (or gone) by the person: the question has its answer
+
+    def delete_goal(self, goal_id: str) -> dict:
+        """``DELETE /goals/{id}``: the goal goes, its tasks stay (with no goal)."""
+        with closing(self._write_db()) as db, db:
+            db.execute("update tasks set goal=null, milestone=null, rev=rev+1 where goal=?", (goal_id,))
+            db.execute("delete from goals where id=?", (goal_id,))
+            self._bump_rev(db)
         return {"ok": True}
 
     # ---- the person's own files and links (0.9.53) ---------------------------------------------------------------
@@ -1166,6 +1550,12 @@ class Store:
             updated["alert"] = _clean_alert(patch["alert"])
         if "starts" in patch:
             updated["starts"] = _clean_start(patch["starts"])
+        if "goal" in patch:
+            updated["goal"] = patch["goal"] or None
+        if "milestone" in patch:
+            updated["milestone"] = patch["milestone"] or None
+        if not updated.get("goal"):
+            updated["milestone"] = None
         if patch.get("_edited"):
             updated["edited"] = True
         if "source" in patch and isinstance(patch["source"], dict):
@@ -1219,7 +1609,7 @@ class Store:
         db.execute("""update tasks set rev=?, title=?, notes=?, who=?, bot=?, status=?, status_note=?, due=?,
             repeat=?, prep=?, steps=?, made=?, updated_at=?, done_at=?, log=?, section=?, position=?, watch=?,
             chat=?, page_at=?, next_check=?, choices=?, priority=?, tags=?, alert=?, starts=?, edited=?, offer=?,
-            source=? where id=?""",
+            source=?, goal=?, milestone=? where id=?""",
             (task["rev"], task["title"], task["notes"], task["who"], task["bot"], task["status"],
              task["status_note"], task["due"], task["repeat"], int(task["prep"]), json.dumps(task["steps"]),
              json.dumps(task["made"]), task["updated_at"], task["done_at"], json.dumps(task["log"]),
@@ -1228,7 +1618,8 @@ class Store:
              json.dumps(task.get("choices") or []), _clean_priority(task.get("priority")),
              json.dumps(task.get("tags") or []), task.get("alert"), task.get("starts"),
              int(bool(task.get("edited"))), json.dumps(task["offer"], ensure_ascii=False) if task.get("offer") else "",
-             json.dumps(task.get("source") or {}, ensure_ascii=False), task["id"]))
+             json.dumps(task.get("source") or {}, ensure_ascii=False), task.get("goal") or None,
+             (task.get("milestone") or None) if task.get("goal") else None, task["id"]))
 
     def update_route(self, task_id: str, rev: int, patch: dict, by: str = "you") -> dict:
         """``PATCH /tasks/{id}``: a stale ``rev`` raises ``TaskError(409, {"task": current})``. Both carry the task's
@@ -1242,6 +1633,10 @@ class Store:
                 raise TaskError(409, {"task": self._shown(db, task)})
             if "section" in patch:
                 patch["section"] = self._section_id(db, patch["section"], by_id=True)
+            if "goal" in patch or "milestone" in patch:
+                goal = patch["goal"] if "goal" in patch else task.get("goal")
+                milestone = patch["milestone"] if "milestone" in patch else task.get("milestone")
+                patch["goal"], patch["milestone"] = self._goal_place(db, goal, milestone)
             if by == "you" and any(key in patch for key in EDIT_KEYS):
                 patch["_edited"] = True   # 0.9.55: from here the bot that added it no longer fills it in
             updated = self._merge(task, patch, by)
@@ -1254,7 +1649,7 @@ class Store:
                   add_steps=None, made=None, note=None, who=None, prep=None, due=_UNSET,
                   section=_UNSET, watch=None, page=None, title=None, undone_steps=None, next_check=_UNSET,
                   choices=None, owner_said=False, priority=None, tags=None, notes=None, source=None,
-                  offer_done=None) -> dict:
+                  offer_done=None, goal=_UNSET, milestone=_UNSET) -> dict:
         """``tasks_update``: no ``rev`` (the tool contract has none — the bot always applies to the current
         task). Enforces docs/tasks.md's rules in code: a bot may only mark ``done`` a task it owns alone
         (``who == "bot"``), and may not change a ``who == "me"`` task except to add ``note`` — or to take a part
@@ -1372,6 +1767,8 @@ class Store:
                     patch["offer"] = {"kind": "done", "by": profile, "text": why, "at": _iso(self.clock)}
             if priority is not None:
                 patch["priority"] = _clean_priority(priority)
+            if goal is not _UNSET:   # 0.9.66: already checked against rule 4 (bot_goal_place)
+                patch["goal"], patch["milestone"] = self._goal_place(db, goal, None if milestone is _UNSET else milestone)
             page_notes: list[str] = []
             if page is not None:
                 row = db.execute("select body from task_pages where id=?", (task_id,)).fetchone()
@@ -1426,6 +1823,8 @@ class Store:
             current["sort"] = fields["sort"]
         if isinstance(fields.get("ideas"), bool):
             current["ideas"] = fields["ideas"]
+        if isinstance(fields.get("goals"), bool):
+            current["goals"] = fields["goals"]
         if isinstance(fields.get("ideas_bot"), str) and _PROFILE_NAME.match(fields["ideas_bot"]):
             current["ideas_bot"] = fields["ideas_bot"]
         if _hhmm(fields.get("ideas_at")):
@@ -1526,7 +1925,20 @@ class Store:
                    " set value=excluded.value", (json.dumps(offers[-OFFERS_CAP:], ensure_ascii=False),))
 
     def _show_offer(self, db, offer: dict) -> dict:
-        """An offer as the app and the bot see it: the tasks to move carry their titles, ``made`` stays inside."""
+        """An offer as the app and the bot see it: the tasks to move carry their titles, ``made`` stays inside. A goal
+        offer (0.9.66, goals.py) says what accepting made (``added``, ``made_goal``, ``made_milestones``), and also
+        carries a list offer's keys (``list``: the goal's name, ``new: false``, ``move: []``) so an app from before
+        0.9.66, which knows only list offers, can still read the answer."""
+        if offer.get("kind", "list") != "list":
+            made = offer.get("made") or {}
+            out = {k: v for k, v in offer.items() if k != "made"}
+            out.update(added=list(made.get("added") or []), list=offer.get("title") or "", section=None, new=False,
+                       move=[])
+            if made.get("goal"):
+                out["made_goal"] = made["goal"]
+            if made.get("milestones"):
+                out["made_milestones"] = list(made["milestones"])
+            return out
         out = {k: v for k, v in offer.items() if k not in ("made", "move")}
         titles = {}
         if offer.get("move"):
@@ -1537,11 +1949,13 @@ class Store:
         return out
 
     def shown_offers(self) -> list[dict]:
-        """Offers still waiting, and answered ones from the last day (their card says what happened, with Undo)."""
+        """Offers still waiting, and answered ones from the last day (their card says what happened, with Undo). A goal
+        offer that is held for its lead (0.9.66) is not a card, so it isn't here."""
         since = _iso(lambda: self.clock() - 86400)
         with closing(self._db()) as db:
             return [self._show_offer(db, o) for o in self._read_offers(db)
-                    if o.get("state") == "new" or (o.get("answered_at") or "") >= since]
+                    if not (o.get("held") and o.get("state") in ("new", "folded"))
+                    and (o.get("state") == "new" or (o.get("answered_at") or "") >= since)]
 
     def offer(self, bot: str, session_id: str, list_name, tasks_in, move, why="") -> dict:
         """``tasks_offer``: a list to make (with the tasks that would go in it), tasks for a list that asks first,
@@ -1553,7 +1967,7 @@ class Store:
             sections = self._read_sections(db)
             section = next((s for s in sections if s["name"].casefold() == name.casefold()), None)
             offers = self._read_offers(db)
-            if section is None and any(o.get("state") == "declined" and o.get("new")
+            if section is None and any(o.get("kind", "list") == "list" and o.get("state") == "declined" and o.get("new")
                                        and o["list"].casefold() == name.casefold() for o in offers):
                 raise TaskError(403, f"They said not now to a \u201c{name}\u201d list. Don't offer it again unless "
                                      "they ask for it; add the tasks without a list.")
@@ -1593,6 +2007,7 @@ class Store:
                 raise TaskError(400, f"You keep \u201c{section['name']}\u201d and it takes your tasks without "
                                      "asking: add them with tasks_add (section) and say what you added.")
             offers = [o for o in offers if not (o.get("state") == "new" and o.get("bot") == bot
+                                                and o.get("kind", "list") == "list"
                                                 and o["list"].casefold() == name.casefold())]
             made = {"id": new_id(), "bot": bot, "session_id": str(session_id or ""), "at": _iso(self.clock),
                     "list": section["name"] if section else name, "section": section["id"] if section else None,
@@ -1620,6 +2035,8 @@ class Store:
             offer = next((o for o in offers if o["id"] == offer_id), None)
             if offer is None:
                 raise TaskError(404, "No such offer.")
+            if offer.get("kind", "list") != "list":
+                raise TaskError(400, "That is a goal's offer: answer it with goals.answer_offer.")
             now, state = _iso(self.clock), offer.get("state")
             done = offer.setdefault("made", {})
             sections = self._read_sections(db)
@@ -1785,7 +2202,8 @@ def status() -> dict:
     """``/status`` gains ``tasks: true`` (docs/tasks.md), so the app knows this add-on serves Tasks."""
     return {"tasks": True, "task_pages": True, "task_ideas": True,
             "task_fields": True,   # 0.9.53: priority, tags, alert, starts; a shared task repeats
-            "task_files": True}    # 0.9.53: the person's own files and links (POST /tasks/{id}/attach)
+            "task_files": True,    # 0.9.53: the person's own files and links (POST /tasks/{id}/attach)
+            "task_goals": True}    # 0.9.65: goals beside the list (POST /goals), a task's goal and milestone
 
 
 # ---------------------------------------------------------------------------
@@ -2378,7 +2796,11 @@ ADD_SCHEMA = _schema(
      "priority": PRIORITY,
      "tags": TAGS,
      "starts": {"type": "string", "description": "Only if they said when it can start: the day (YYYY-MM-DD) it joins "
-               "their day. Before then it waits under Upcoming."}},
+               "their day. Before then it waits under Upcoming."},
+     "goal": {"type": "string", "description": "A goal you lead or help (its id or exact name; goals_list): your own "
+              "task (who 'bot') goes under it; a task for the user only when that goal adds without asking. "
+              "Otherwise offer it with goals_offer."},
+     "milestone": {"type": "string", "description": "With goal: one of its milestones, by id or name."}},
     ("title",))
 
 UPDATE_SCHEMA = _schema(
@@ -2433,6 +2855,9 @@ UPDATE_SCHEMA = _schema(
      "offer_done": {"type": "string", "description": "On a task that isn't yours alone and looks settled: why, in "
                     "a few words (\"Sam confirmed by email Tuesday\"). The user sees it on the task with Mark Done "
                     "and Keep Open; you never mark their task done yourself."},
+     "goal": {"type": "string", "description": "Put your own task under a goal you lead or help (id or exact name); "
+              "empty takes your own task out of its goal."},
+     "milestone": {"type": "string", "description": "One of the task's goal's milestones, by id or name."},
      "page": PAGE},
     ("id",))
 
@@ -2467,6 +2892,52 @@ def _as_dict(args) -> dict:
     return args if isinstance(args, dict) else {}
 
 
+def goal_role(goal: dict, bot: str) -> str | None:
+    """``"lead"``, ``"helper"`` or ``None``: what ``bot`` is on ``goal`` (0.9.66)."""
+    if goal.get("lead") == bot:
+        return "lead"
+    return "helper" if bot in (goal.get("helpers") or []) else None
+
+
+def goal_seen(goal: dict, bot: str) -> bool:
+    """Rule 3 (0.9.66): every bot knows an active goal by name and why while Tell My Other Bots is on; the lead and
+    helpers know it always."""
+    return goal_role(goal, bot) is not None or (goal.get("known_to_all") is not False and goal.get("status") == "active")
+
+
+def find_goal(goals, value, bot: str) -> dict | None:
+    """The goal ``value`` names, by id or its exact name (any case), among the ones ``bot`` can see."""
+    text = _text(value, TITLE_MAX) if isinstance(value, str) else ""
+    if not text:
+        return None
+    seen = [g for g in goals if goal_seen(g, bot)]
+    return next((g for g in seen if g["id"] == text), None) or next(
+        (g for g in seen if g["title"].casefold() == text.casefold()), None)
+
+
+def bot_goal_place(store: "Store", bot: str, goal_value, milestone_value, own: bool) -> tuple[str, str | None]:
+    """Rule 4 (0.9.66) for ``tasks_add`` / ``tasks_update``'s ``goal``: a bot puts its OWN task (``own``: who 'bot',
+    its own profile) in a goal it leads or helps; a task for the person only when that goal's New Tasks is Add
+    Without Asking (``adds: "auto"``). Anything else is refused with what to do instead. Returns (goal id,
+    milestone id or ``None``: a milestone that names none of the goal's is dropped)."""
+    if not store.goals_on():
+        raise TaskError(403, "Goals is turned off, so a task can't go under a goal: add it without one.")
+    goal = find_goal(store.list_goals(), goal_value, bot)
+    if goal is None:
+        raise TaskError(400, "No goal by that id or name: goals_list names the goals you can use.")
+    if goal_role(goal, bot) is None:
+        raise TaskError(403, f"You aren't on \u201c{goal['title']}\u201d, and that holds for every goal you neither "
+                             "lead nor help: offer tasks for it with goals_offer (kind 'tasks') instead, and its "
+                             "lead picks them up.")
+    if not own and goal.get("adds") != "auto":
+        raise TaskError(403, f"\u201c{goal['title']}\u201d asks first for anything that is theirs: offer it with "
+                             "goals_offer (kind 'tasks') instead; only your own tasks (who 'bot') go in directly.")
+    wanted = _text(milestone_value, MILESTONE_TITLE_MAX) if isinstance(milestone_value, str) else ""
+    milestone = next((m["id"] for m in goal["milestones"] if wanted and m["id"] == wanted), None) or next(
+        (m["id"] for m in goal["milestones"] if wanted and m["title"].casefold() == wanted.casefold()), None)
+    return goal["id"], milestone
+
+
 def register_tools(ctx, store_for: Callable[[], Store], profile: Callable[[], str],
                    notify: Callable[[dict, str], None]) -> None:
     """``notify(task, profile)`` sends the push for a task that just went ``ready``/``needs_you`` (injected, like
@@ -2486,7 +2957,9 @@ def register_tools(ctx, store_for: Callable[[], Store], profile: Callable[[], st
         sections = store.get_sections()
         names = {s["id"]: s["name"] for s in sections}
         pages = store.pages_for(t["id"] for t in tasks if t.get("page_at"))
-        out = {"tasks": [compact(t, names, pages.get(t["id"])) for t in tasks]}
+        goal_names = ({g["id"]: g["title"] for g in store.list_goals() if goal_seen(g, bot)}
+                      if any(t.get("goal") for t in tasks) else None)   # 0.9.66: a goal hidden from it stays hidden
+        out = {"tasks": [compact(t, names, pages.get(t["id"]), goal_names) for t in tasks]}
         if names:
             out["sections"] = list(names.values())
         kept = [s["name"] for s in sections if s.get("bot") == bot]
@@ -2527,8 +3000,11 @@ def register_tools(ctx, store_for: Callable[[], Store], profile: Callable[[], st
                               ensure_ascii=False)
         try:
             fields = {**args, "due": resolve_due(args.get("due"), store.clock())}
-            for key in ("source", "asked"):
+            for key in ("source", "asked", "goal", "milestone"):
                 fields.pop(key, None)
+            if args.get("goal"):   # 0.9.66: rule 4, in code
+                own = args.get("who") == "bot" and _text(args.get("bot"), 64) in ("", bot)
+                fields["goal"], fields["milestone"] = bot_goal_place(store, bot, args["goal"], args.get("milestone"), own)
             if fields.get("priority") == "none":
                 fields["priority"] = 0
             task = store.create(fields, created_by=bot, source=source)
@@ -2564,6 +3040,20 @@ def register_tools(ctx, store_for: Callable[[], Store], profile: Callable[[], st
         before = store.get(task_id) or {}
         own_chat = store.task_for_chat(str(session_id or ""))
         owner_said = bool(own_chat) and own_chat["id"] == task_id
+        goal, milestone = _UNSET, _UNSET
+        if before and ("goal" in args or "milestone" in args):   # 0.9.66: rule 4, in code
+            own = before.get("who") == "bot" and before.get("bot") == bot
+            try:
+                if "goal" in args and not args.get("goal"):
+                    if before.get("goal") and not own:
+                        raise TaskError(403, "Only the person takes their task out of a goal: say so in the chat "
+                                             "if it doesn't belong there.")
+                    goal, milestone = None, None
+                else:
+                    goal, milestone = bot_goal_place(store, bot, args.get("goal") or before.get("goal"),
+                                                     args.get("milestone"), own)
+            except TaskError as error:
+                return json.dumps({"error": str(error.detail)}, ensure_ascii=False)
         try:
             due = resolve_due(args.get("due"), store.clock()) if "due" in args else _UNSET
             next_check = (resolve_due(args.get("next_check"), store.clock()) if args.get("next_check") else None) \
@@ -2579,7 +3069,7 @@ def register_tools(ctx, store_for: Callable[[], Store], profile: Callable[[], st
                                     priority=(0 if args.get("priority") == "none" else args.get("priority")) if "priority" in args else None,
                                     tags=args.get("tags") if "tags" in args else None,
                                     notes=args.get("notes"), source=args.get("source"),
-                                    offer_done=args.get("offer_done"))
+                                    offer_done=args.get("offer_done"), goal=goal, milestone=milestone)
         except TaskError as error:
             return json.dumps({"error": str(error.detail)}, ensure_ascii=False)
         store.mark_checked(bot)
