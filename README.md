@@ -256,6 +256,12 @@ made, its history) and what its bot writes with `tasks_update(page={summary, nex
 next, and parts such as options compared in a table, the numbers that matter, or what it found. The bot writes words,
 never HTML. The `task-page` skill (hermes-hq-push:task-page) tells bots what goes on it.
 
+Version 0.9.73 stops a chat's new branch reading as merged before it has a commit (0.9.72 is the Goals release,
+installed from its own branch). A branch made from main and not committed on yet is nothing at all; 0.9.71 said so
+only while the commit it was made from stayed on main's own line of first parents, and a main moved up to another
+branch's merge takes its older tips off that line. A branch's own log now decides: no move that made a commit, and
+only ever at commits main itself was at (main's log of moves), is no work of its own, however main moved since.
+
 Version 0.9.71 answers a coding project's marks quickly on a busy computer. Each question to git is a process, and
 0.9.70 asked about six per chat every time (measured on a computer that was building: 10 seconds for 64 chats). What
 git said is now kept for as long as it stays true: a repository's branches and their tips are read in one question

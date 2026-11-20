@@ -114,6 +114,36 @@ def test_a_fast_forwarded_branch_is_merged_and_a_branch_that_never_moved_is_noth
     assert state(branch('feat/idle'), listed(repo)) == (None, 0)
 
 
+def test_a_branch_with_no_commit_of_its_own_is_nothing_however_main_moved(repo):
+    """Owner 2026-11-19, a chat that had made a branch and not committed yet: "It showed that there was a
+    successful merge. But I had not created a PR yet in that session." Main had since been moved up to
+    another branch's merge, which took the commit the new branch was made from off main's own line."""
+    git(repo, 'switch', '-q', '-c', 'fix/other')
+    commit(repo, 'other')
+    git(repo, 'switch', '-q', 'main')
+    commit(repo, 'on-main')
+    git(repo, 'branch', 'feat/new')                           # the chat's branch, made from main, no commit yet
+    git(repo, 'switch', '-q', '-c', 'feat/follows')           # another: made from main, later moved up along it
+    git(repo, 'switch', '-q', 'fix/other')
+    git(repo, 'merge', '-q', '--no-ff', '-m', "Merge branch 'main' into fix/other", 'main')
+    git(repo, 'switch', '-q', 'main')
+    git(repo, 'merge', '-q', '--ff-only', 'fix/other')        # main's own line is now fix/other's
+    made_from = git(repo, 'rev-parse', 'feat/new')
+    assert made_from not in git(repo, 'log', '--first-parent', '--format=%H', 'main').split()
+    assert state(branch('feat/new'), listed(repo)) == (None, 0)
+    commit(repo, 'more-on-main')
+    git(repo, 'switch', '-q', 'feat/follows')
+    git(repo, 'merge', '-q', '--ff-only', 'main')             # caught up with main: still nothing of its own
+    assert state(branch('feat/follows'), listed(repo)) == (None, 0)
+    commit(repo, 'mine')                                      # its first commit: waiting
+    assert state(branch('feat/follows'), listed(repo)) == ('draft', 0)
+    git(repo, 'switch', '-q', 'main')
+    git(repo, 'merge', '-q', '--no-ff', '-m', "Merge branch 'feat/follows'", 'feat/follows')
+    assert state(branch('feat/follows'), listed(repo)) == ('merged', 0)
+    assert state(branch('feat/new'), listed(repo)) == (None, 0)
+    assert state(branch('fix/other'), listed(repo)) == ('merged', 0)        # main was moved up to it: merged
+
+
 def test_a_deleted_branch_is_found_by_its_commit_or_by_the_merge_that_names_it(repo):
     git(repo, 'switch', '-q', '-c', 'fix/gone')
     sha = commit(repo, 'a')
