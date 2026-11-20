@@ -256,6 +256,16 @@ made, its history) and what its bot writes with `tasks_update(page={summary, nex
 next, and parts such as options compared in a table, the numbers that matter, or what it found. The bot writes words,
 never HTML. The `task-page` skill (hermes-hq-push:task-page) tells bots what goes on it.
 
+Goals, as installed with 0.9.73 (released as 0.9.68 and 0.9.72 from installed copies and never committed until this
+reconcile; code comments still call them 0.9.65 and 0.9.66, the numbers they were built under). Your goals sit beside
+your tasks (`goals.py`, `POST/PATCH/DELETE /goals` and in `GET /tasks`, list shape 7: `goals`, a task's `goal` and
+`milestone`): a finish line, a day, a number, milestones and the tasks under them. Bots can help on a goal you give
+them (list shape 8): one bot leads it and up to five help; the lead offers a plan and a short weekly check-in as cards
+you tap (tools `goals_list`, `goals_offer`, `goals_update`, `goals_next_review`), keeps where the goal stands and its
+Goal Page (`GET /goals/{id}/page`, skill `hermes-hq-push:goal-page`), and reads the goal's number only when you say it
+may. A bot never ticks your task, a milestone or the goal itself, and the "Goal check-in" job is kept to research and
+drafts.
+
 Version 0.9.73 stops a chat's new branch reading as merged before it has a commit (0.9.72 is the Goals release,
 installed from its own branch). A branch made from main and not committed on yet is nothing at all; 0.9.71 said so
 only while the commit it was made from stayed on main's own line of first parents, and a main moved up to another

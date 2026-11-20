@@ -6,7 +6,7 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -148,6 +148,13 @@ else:
     task_page = importlib.util.module_from_spec(_page_spec)
     sys.modules["hermes_hq_task_page"] = task_page
     _page_spec.loader.exec_module(task_page)
+if "hermes_hq_goals" in sys.modules:   # 0.9.66: bots on a goal (goals.py); one copy, shared with the tools
+    goals = sys.modules["hermes_hq_goals"]
+else:
+    _goals_spec = importlib.util.spec_from_file_location("hermes_hq_goals", Path(__file__).parents[1] / "goals.py")
+    goals = importlib.util.module_from_spec(_goals_spec)
+    sys.modules["hermes_hq_goals"] = goals
+    _goals_spec.loader.exec_module(goals)
 
 _warm_spec = importlib.util.spec_from_file_location("hermes_hq_serve_warmup", Path(__file__).parents[1] / "serve_warmup.py")
 serve_warmup = importlib.util.module_from_spec(_warm_spec)
@@ -230,7 +237,7 @@ class ApprovalIn(BaseModel):
 def status():
     """The app probes this to offer push; a 404 means the plugin isn't installed or enabled."""
     return {**push.status_body(push.data_dir(), push.sender_from_env()), **terminal.status(push.data_dir()),
-            **tasks.status(), **drafts.status(push.data_dir()), **shopping.status(push.data_dir()), **asks.status(push.data_dir()),
+            **tasks.status(), **goals.status(), **drafts.status(push.data_dir()), **shopping.status(push.data_dir()), **asks.status(push.data_dir()),
             **plugin_updates.status(),
             **onepassword_allow.status(), "sessionPRStatus": session_pr_status.supported(),
             # 0.9.70: the owner's "closed" mark on a chat, and repositories linked per project from the app.
@@ -917,6 +924,9 @@ class TaskIn(BaseModel):
     tags: list[str] = Field(default_factory=list, max_length=10)
     alert: int | None = Field(default=None, ge=0, le=10080)
     starts: str | None = Field(default=None, max_length=40)
+    # 0.9.65: the goal this task is for, and its milestone there.
+    goal: str | None = Field(default=None, max_length=64)
+    milestone: str | None = Field(default=None, max_length=64)
 
 
 class AttachIn(BaseModel):
@@ -950,6 +960,62 @@ class TaskPatchIn(BaseModel):
     alert: int | None = Field(default=None, ge=0, le=10080)
     starts: str | None = Field(default=None, max_length=40)
     keep_open: bool | None = None   # 0.9.55: "Keep Open" on a bot's offer to close it
+    goal: str | None = Field(default=None, max_length=64)        # 0.9.65; null takes it out of its goal
+    milestone: str | None = Field(default=None, max_length=64)
+
+
+class MilestoneIn(BaseModel):
+    id: str = Field(default="", max_length=64)
+    title: str = Field(max_length=120)
+    due: str | None = Field(default=None, max_length=40)
+    done: bool = False
+
+
+class MeasureIn(BaseModel):
+    """A goal's number. In a PATCH a field left out keeps what was saved."""
+    unit: str | None = Field(default=None, max_length=20)
+    start: float | None = None
+    target: float | None = None
+    now: float | None = None
+    source: Any = None   # 0.9.66: "you", or {bot, what}: the bot that reads it and where (tasks._clean_source checks it)
+
+
+class ReviewIn(BaseModel):
+    """0.9.66: a goal's weekly check-in, 0 = Monday."""
+    day: int = Field(ge=0, le=6)
+    time: str = Field(pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+
+
+class GoalIn(BaseModel):
+    title: str = Field(max_length=200)
+    why: str = Field(default="", max_length=300)
+    due: str | None = Field(default=None, max_length=40)
+    color: str | None = Field(default=None, max_length=20)
+    position: float | None = None
+    measure: MeasureIn | None = None
+    milestones: list[MilestoneIn] = Field(default_factory=list, max_length=30)
+
+
+class GoalPatchIn(BaseModel):
+    rev: int
+    title: str | None = Field(default=None, max_length=200)
+    why: str | None = Field(default=None, max_length=300)
+    status: str | None = Field(default=None, pattern="^(active|paused|achieved|let_go)$")
+    due: str | None = Field(default=None, max_length=40)
+    color: str | None = Field(default=None, max_length=20)
+    position: float | None = None
+    measure: MeasureIn | None = None
+    measure_now: float | None = None
+    milestones: list[MilestoneIn] | None = Field(default=None, max_length=30)
+    # 0.9.66: bots on a goal. null on lead or review takes it away.
+    lead: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+    helpers: list[str] | None = Field(default=None, max_length=5)
+    adds: str | None = Field(default=None, pattern="^(ask|auto)$")
+    review: ReviewIn | None = None
+    known_to_all: bool | None = None
+    chat: ChatIn | None = None
+    keep: bool | None = None                  # the stall question's Keep Going: stamps kept_at
+    offer_answer: str | None = Field(default=None, pattern="^(done|keep)$")   # Mark Done / Not Yet on a looks-done
 
 
 class SettingsIn(BaseModel):
@@ -965,6 +1031,7 @@ class SettingsIn(BaseModel):
     ideas_bot: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
     ideas_at: str | None = Field(default=None, pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
     ideas_max: int | None = Field(default=None, ge=1, le=5)
+    goals: bool | None = None   # 0.9.66: false hides the goals tools, the note and every Goal check-in job
 
 
 class IdeaAddIn(BaseModel):
@@ -985,6 +1052,8 @@ class SectionIn(BaseModel):
 class OfferAnswerIn(BaseModel):
     action: str = Field(pattern="^(accept|decline|move|leave|undo)$")
     list: bool = True   # accept only: false is "Add, No List"
+    plan: bool = True      # 0.9.66, a goal's offer: false is "Keep the Goal, No Plan" (on a plan: decline it)
+    in_goal: bool = True   # 0.9.66, a check-in's or tasks offer: false is "Just Tasks" (added with no goal)
 
 
 class SectionsIn(BaseModel):
@@ -1080,7 +1149,7 @@ def tasks_settings_get():
 @router.put("/tasks/settings")
 def tasks_settings_put(body: SettingsIn):
     store = _tasks_store()
-    before, ideas_before = store.enabled(), store.get_settings()
+    before, ideas_before, goals_before = store.enabled(), store.get_settings(), store.goals_on()
     saved = store.put_settings(body.model_dump(exclude_unset=True))
     if store.enabled() != before:   # on or off: every bot's Task prep job follows (removed off, back on if it has prep)
         for bot in store.bots_with_tasks():
@@ -1094,6 +1163,8 @@ def tasks_settings_put(body: SettingsIn):
             home = tasks.bot_home(bot)
             if home is not None:
                 ideas.reconcile_job(store, bot, home)
+    if store.goals_on() != goals_before:   # 0.9.66: Tasks or Goals on or off: every lead's Goal check-in job follows
+        goals.reconcile_all(store)
     return saved
 
 
@@ -1157,13 +1228,92 @@ def tasks_sections_put(body: SectionsIn):
     return _tasks_store().put_sections([s.model_dump(exclude_unset=True) for s in body.sections])
 
 
-@router.post("/tasks/offers/{offer_id}")
-def tasks_offer_answer(offer_id: str, body: OfferAnswerIn):
-    """0.9.55: the person's tap on a bot's offer of a list or a batch of tasks: ``{rev, offer, sections}``."""
+# Goals (0.9.65, `task_goals` in status): what the tasks are for. They ride in GET /tasks as `goals`, under its rev.
+
+def _goal_call(call):
     try:
-        return _tasks_store().answer_offer(offer_id, body.action, make_list=body.list)
+        return call()
     except tasks.TaskError as error:
         raise HTTPException(error.status_code, error.detail) from None
+
+
+def _measure_fields(measure: "MeasureIn | None"):
+    return measure.model_dump(exclude_unset=True, exclude_none=True) if measure is not None else None
+
+
+@router.post("/goals")
+def goals_create(body: GoalIn):
+    """A goal: its name, and any of why, a day, a colour, a number and milestones. Returns the Goal."""
+    fields = body.model_dump(exclude={"measure", "milestones"})
+    fields["measure"] = _measure_fields(body.measure)
+    fields["milestones"] = [m.model_dump(exclude_unset=True) for m in body.milestones]
+    return _goal_call(lambda: _tasks_store().create_goal(fields))
+
+
+@router.patch("/goals/{goal_id}")
+def goals_patch(goal_id: str, body: GoalPatchIn):
+    """A stale ``rev`` is a 409 carrying the current goal: ``{"goal": <current>}``. ``measure: null`` removes the
+    number; ``measure_now`` alone moves it; ``milestones`` is the whole list in order."""
+    patch = body.model_dump(exclude_unset=True, exclude={"rev", "measure", "milestones"})
+    if "measure" in body.model_fields_set:
+        patch["measure"] = _measure_fields(body.measure)
+    if body.milestones is not None:
+        patch["milestones"] = [m.model_dump(exclude_unset=True) for m in body.milestones]
+    store = _tasks_store()
+    before = store.get_goal(goal_id)
+    updated = _goal_call(lambda: store.update_goal(goal_id, body.rev, patch))
+    if {"lead", "review", "status"} & set(patch):
+        # 0.9.66: the Goal check-in job follows its lead: armed on the new one, gone from the old one if it leads
+        # nothing else with a check-in.
+        _reconcile_checkin({(before or {}).get("lead"), updated.get("lead")})
+    return updated
+
+
+def _reconcile_checkin(bots) -> None:
+    store = _tasks_store()
+    for bot in sorted(b for b in bots if b):
+        home = tasks.bot_home(bot)
+        if home is not None:
+            goals.reconcile_checkin_job(store, bot, home)
+
+
+@router.delete("/goals/{goal_id}")
+def goals_delete(goal_id: str):
+    """The goal goes; its tasks are kept, with no goal."""
+    store = _tasks_store()
+    before = store.get_goal(goal_id)
+    out = store.delete_goal(goal_id)
+    _reconcile_checkin({(before or {}).get("lead")})
+    return out
+
+
+@router.get("/goals/{goal_id}/page")
+def goals_page(goal_id: str, names: str = ""):
+    """The goal's Goal Page (0.9.66, goals.render_page): HTML drawn now from the goal, the tasks under it and what its
+    lead wrote with goals_update(page=…). ``names``: the app's bot names, a JSON object by profile."""
+    try:
+        given = json.loads(names) if names else {}
+    except ValueError:
+        given = {}
+    shown = {str(k)[:64]: str(v)[:60] for k, v in (given.items() if isinstance(given, dict) else []) if v}
+    html = goals.page_for(_tasks_store(), goal_id, shown)
+    if html is None:
+        raise HTTPException(status_code=404, detail="No such goal.")
+    return HTMLResponse(html, headers={"Cache-Control": "no-store"})
+
+
+@router.post("/tasks/offers/{offer_id}")
+def tasks_offer_answer(offer_id: str, body: OfferAnswerIn):
+    """0.9.55: the person's tap on a bot's offer of a list or a batch of tasks. 0.9.66: and on a goal's offer (``kind``
+    goal, plan, checkin or tasks; ``plan``, ``in_goal``). ``{rev, offer, sections, goals}``."""
+    store = _tasks_store()
+    try:
+        answer = goals.answer_offer(store, offer_id, body.action, plan=body.plan, in_goal=body.in_goal,
+                                    make_list=body.list)
+    except tasks.TaskError as error:
+        raise HTTPException(error.status_code, error.detail) from None
+    goals.settle(store, answer)
+    return answer
 
 
 @router.post("/tasks/prep-job/{profile}")
