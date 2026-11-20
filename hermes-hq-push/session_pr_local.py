@@ -474,6 +474,45 @@ def _given_up(repo, snap, commit, branch):
     return answer
 
 
+def _main_tips(repo, snap):
+    """Every commit main itself has pointed at, from its own log of moves (asked once per main). Main's
+    own line (first parents) is not enough: a main moved up to another branch's merge of it leaves its
+    older tips off that line."""
+    key = (repo['path'], snap['main'], 'tips')
+    with _lock:
+        known = _by_main.get(key)
+    if known is None:
+        ref = ('refs/heads/' if repo['main'] in snap['heads'] else 'refs/remotes/') + repo['main']
+        known = frozenset((_git(repo['path'], 'reflog', 'show', '--format=%H', ref) or '').split())
+        with _lock:
+            _by_main[key] = known
+    return known
+
+
+# How a branch's own log names a move that made a commit on it.
+_MADE_A_COMMIT = ('commit', 'cherry-pick', 'revert', 'am')
+
+
+def _never_its_own(repo, snap, branch, tip):
+    """Whether a branch main already holds never had a commit of its own: made from main and left there,
+    or only moved up along main. Its own log says: no move that made a commit, and it only ever pointed
+    at commits main itself was at. Such a branch is no work at all, not merged work (owner 2026-11-19:
+    "It showed that there was a successful merge. But I had not created a PR yet in that session.")."""
+    path = repo['path']
+    moves = _fact((path, 'moves', branch, tip), lambda: tuple(
+        tuple(row.partition(' ')[::2]) for row in
+        (_git(path, 'reflog', 'show', '--format=%H %gs', f'refs/heads/{branch}') or '').splitlines()))
+    on_main = snap['index']
+    if not moves:                           # no log of its own (expired): only where it stands can say
+        return tip in on_main or tip in _main_tips(repo, snap)
+    if any(subject.partition(':')[0].split(' ')[0] in _MADE_A_COMMIT for _, subject in moves):
+        return False
+    if all(sha in on_main for sha, _ in moves):
+        return True
+    tips = _main_tips(repo, snap)
+    return all(sha in on_main or sha in tips for sha, _ in moves)
+
+
 def _branch_answer(repo, snap, branch, shas, tips=None):
     """An answer, ``_NOTHING``, or None when this repository doesn't know the branch at all.
 
@@ -487,13 +526,8 @@ def _branch_answer(repo, snap, branch, shas, tips=None):
         if merged is None:
             return None
         if branch in merged:
-            if tip in snap['index'] and not any(_exists(repo, snap, sha) for sha in shas):
-                # On main's own line: main was moved up to it (a fast-forward), or it never got a
-                # commit. Its own log says: the commit it was made from, and whether it moved since.
-                moves = _fact((path, 'moves', branch, tip), lambda: (
-                    _git(path, 'reflog', 'show', '--format=%H', f'refs/heads/{branch}') or '').split())
-                if not moves or moves[-1] == tip:
-                    return _NOTHING
+            if not any(_exists(repo, snap, sha) for sha in shas) and _never_its_own(repo, snap, branch, tip):
+                return _NOTHING
             return _merged_answer(repo, snap, tip, branch)
         ahead = _fact((path, 'cherry', snap['main'], tip), lambda: _git(path, 'cherry', snap['main'], tip))
         if ahead is None:
