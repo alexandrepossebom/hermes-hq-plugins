@@ -4,6 +4,18 @@ import os
 import tempfile
 from pathlib import Path
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _isolate_task_title_worker(request, monkeypatch):
+    # Only the dedicated title tests exercise the worker, with synthetic generation.
+    # Other tests create tasks too; they must not start provider calls or retry timers.
+    if request.node.path.name != 'test_task_titles.py':
+        import tasks
+        monkeypatch.setattr(tasks.task_titles, 'schedule', lambda store: None)
+
+
 os.environ["HERMES_HOME"] = tempfile.mkdtemp(prefix="hermes-hq-push-tests-")
 # A real 1Password key in the runner's own env (a Hermes background shell inherits the gateway's) would be frozen into
 # Hermes's launch-env snapshot by the first test that turns on multi-profile hosting, and test_onepassword_allow would

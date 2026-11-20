@@ -24,6 +24,8 @@ al.), so this file still imports cleanly outside a Hermes checkout.
 """
 from __future__ import annotations
 
+import importlib.util
+import sys
 import json
 import logging
 import re
@@ -34,6 +36,15 @@ from contextlib import closing, contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
+
+# Both plugin entry points load tasks.py by filename, without adding its folder to
+# sys.path. Bind the sibling explicitly and share its per-store worker registry.
+if "hermes_hq_task_titles" not in sys.modules:
+    _spec = importlib.util.spec_from_file_location("hermes_hq_task_titles", Path(__file__).with_name("task_titles.py"))
+    _titles = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_titles)
+    sys.modules.setdefault(_spec.name, _titles)
+task_titles = sys.modules["hermes_hq_task_titles"]
 
 log = logging.getLogger("hermes-hq-push")
 
@@ -71,7 +82,7 @@ _UNSET = object()  # tasks_update left `due` out (None clears it)
 # The list answer's shape: raise it when the answer gains a field. An app polling `?since=<rev>` hears "unchanged" until
 # the rev moves, so it would keep an answer from before the field (0.9.40: after an update to 0.9.39 the app never saw
 # `ideas` and kept asking for the update). A new shape moves the rev once, and every app reads the whole list again.
-LIST_SHAPE = "8"   # 2: `ideas` (0.9.39). 3: each task's `page` (0.9.43). 4: `next_check`, `choices` (0.9.47).
+LIST_SHAPE = "9"   # 9: optional task title recommendation and the title it was generated for.
                    # 5: `priority`, `tags`, `alert`, `starts` (0.9.53). 6: `lists`, `offers`, a task's `offer` (0.9.55)
                    # 7: `goals`, a task's `goal` and `milestone` (0.9.65)
                    # 8: a goal's lead, helpers, check-in and the rest of goals.py's fields, goal offers (0.9.66)
@@ -133,7 +144,7 @@ EDIT_KEYS = ("title", "notes", "due", "repeat", "steps", "who", "bot", "priority
 COLUMNS = ("id", "rev", "title", "notes", "who", "bot", "status", "status_note", "due", "repeat", "prep",
            "steps", "made", "source", "created_at", "updated_at", "done_at", "created_by", "log", "section", "position",
            "watch", "chat", "page_at", "next_check", "choices", "priority", "tags", "alert", "starts", "edited", "offer",
-           "goal", "milestone")
+           "goal", "milestone", "suggested_title", "suggested_for_title")
 
 # 0.9.65, owner 2026-11-18 ("on top of the tasks section, what if we had an area for goals … things that I want to
 # achieve over time"): a goal is a finish line, an optional day, a one-line why, milestones, and ordinary tasks under
@@ -904,6 +915,12 @@ class Store:
                 create table if not exists goals (
                     id text primary key, rev integer not null, position real not null default 0,
                     body text not null default '{}');
+                create table if not exists task_title_queue (
+                    task_id text primary key, title text not null, next_attempt real not null default 0,
+                    lease text, lease_until real not null default 0);
+                create trigger if not exists task_title_queue_delete after delete on tasks begin
+                    delete from task_title_queue where task_id=old.id;
+                end;
             """)
             # 0.9.53: from this moment a bot's own task runs without the prep flag (``_open_prep``). Tasks nobody
             # has touched since stay as they were: installing the update must not start a pile of old ones.
@@ -912,6 +929,10 @@ class Store:
             if fresh:
                 db.execute("insert into meta (key, value) values ('rev', '0')")
             have = {row[1] for row in db.execute("pragma table_info(tasks)")}
+            if "suggested_title" not in have:
+                db.execute("alter table tasks add column suggested_title text")
+            if "suggested_for_title" not in have:
+                db.execute("alter table tasks add column suggested_for_title text")
             if "section" not in have:   # 0.9.36: the user's own sections, and each task's place in its section
                 db.execute("alter table tasks add column section text")
             if "watch" not in have:   # 0.9.37: what a bot watches for, and the task's own chat
@@ -1046,6 +1067,7 @@ class Store:
         """``GET /tasks``: the whole list, or ``{rev, unchanged: true}`` once the caller's ``rev`` is current. A task
         whose bot wrote a summary or next on its Task Page carries them as ``page`` (0.9.43, ``page_gist``). A page
         write moves the task's rev and the list's like any other change (``update_bot``), so ``?since=`` hears of it."""
+        self._schedule_title_work()
         current = self.rev()
         if since is not None and since >= current:
             return {"rev": current, "unchanged": True}
@@ -1204,14 +1226,21 @@ class Store:
                 row["position"] = float(fields["position"])
             db.execute(f"insert into tasks ({','.join(row)}) values ({','.join('?' * len(row))})",
                       list(row.values()))
+            db.execute("insert into task_title_queue (task_id, title) values (?, ?)", (row["id"], title))
 
         if db is not None:
             insert(db)
+            self._schedule_title_work()
             return row
         with closing(self._write_db()) as fresh, fresh:
             insert(fresh)
             self._bump_rev(fresh)
+        self._schedule_title_work()
         return self.get(row["id"])
+
+    def _schedule_title_work(self):
+        # A single bounded daemon per database; never wait for a model on the write path.
+        task_titles.schedule(self)
 
     def _kept_list(self, db, bot: str) -> str | None:
         """The one list ``bot`` keeps (0.9.55), or ``None`` when it keeps none or several."""
@@ -1522,6 +1551,8 @@ class Store:
         for key in ("title", "notes", "who", "bot", "status_note", "due", "repeat"):
             if key in patch:
                 updated[key] = patch[key]
+        if updated["title"] != task["title"]:
+            updated["suggested_title"] = updated["suggested_for_title"] = None
         if "watch" in patch and patch["watch"] is not None:
             updated["watch"] = _text(patch["watch"], WATCH_MAX)
         if "chat" in patch and patch["chat"] is not None:
@@ -1609,7 +1640,7 @@ class Store:
         db.execute("""update tasks set rev=?, title=?, notes=?, who=?, bot=?, status=?, status_note=?, due=?,
             repeat=?, prep=?, steps=?, made=?, updated_at=?, done_at=?, log=?, section=?, position=?, watch=?,
             chat=?, page_at=?, next_check=?, choices=?, priority=?, tags=?, alert=?, starts=?, edited=?, offer=?,
-            source=?, goal=?, milestone=? where id=?""",
+            source=?, goal=?, milestone=?, suggested_title=?, suggested_for_title=? where id=?""",
             (task["rev"], task["title"], task["notes"], task["who"], task["bot"], task["status"],
              task["status_note"], task["due"], task["repeat"], int(task["prep"]), json.dumps(task["steps"]),
              json.dumps(task["made"]), task["updated_at"], task["done_at"], json.dumps(task["log"]),
@@ -1619,7 +1650,10 @@ class Store:
              json.dumps(task.get("tags") or []), task.get("alert"), task.get("starts"),
              int(bool(task.get("edited"))), json.dumps(task["offer"], ensure_ascii=False) if task.get("offer") else "",
              json.dumps(task.get("source") or {}, ensure_ascii=False), task.get("goal") or None,
-             (task.get("milestone") or None) if task.get("goal") else None, task["id"]))
+             (task.get("milestone") or None) if task.get("goal") else None,
+             task.get("suggested_title"), task.get("suggested_for_title"), task["id"]))
+        if task.get("suggested_for_title") is None:
+            db.execute("delete from task_title_queue where task_id=? and title<>?", (task["id"], task["title"]))
 
     def update_route(self, task_id: str, rev: int, patch: dict, by: str = "you") -> dict:
         """``PATCH /tasks/{id}``: a stale ``rev`` raises ``TaskError(409, {"task": current})``. Both carry the task's
