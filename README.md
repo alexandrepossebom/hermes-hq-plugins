@@ -266,6 +266,8 @@ Goal Page (`GET /goals/{id}/page`, skill `hermes-hq-push:goal-page`), and reads 
 may. A bot never ticks your task, a milestone or the goal itself, and the "Goal check-in" job is kept to research and
 drafts.
 
+Version 0.9.74 suggests titles for newly created tasks. Only the task title is sent to the auxiliary model; notes and sources stay out of the request. The original title stays until you accept a suggestion, and a late suggestion cannot overwrite an edit. Existing tasks are not queued by the update.
+
 Version 0.9.73 stops a chat's new branch reading as merged before it has a commit (0.9.72 is the Goals release,
 installed from its own branch). A branch made from main and not committed on yet is nothing at all; 0.9.71 said so
 only while the commit it was made from stayed on main's own line of first parents, and a main moved up to another

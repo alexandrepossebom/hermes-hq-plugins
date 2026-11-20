@@ -275,7 +275,7 @@ def test_status_says_goals():
 
 
 def test_the_version_is_this_release():
-    assert push.PLUGIN_VERSION == "0.9.73"
+    assert push.PLUGIN_VERSION == "0.9.74"
 
 
 # ---------------------------------------------------------------------------
@@ -372,4 +372,4 @@ def test_a_goal_from_an_app_that_never_sends_the_bot_fields_reads_with_their_def
 
 
 def test_the_list_shape_moved_for_the_bot_fields():
-    assert tasks.LIST_SHAPE == "8" and "goals" in tasks.DEFAULT_SETTINGS and tasks.DEFAULT_SETTINGS["goals"] is True
+    assert tasks.LIST_SHAPE == "9" and "goals" in tasks.DEFAULT_SETTINGS and tasks.DEFAULT_SETTINGS["goals"] is True
