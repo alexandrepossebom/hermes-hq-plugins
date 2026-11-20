@@ -414,13 +414,10 @@ def _own_chrome_up() -> None:
     raw = _cdp_override_raw()
     if not raw or not _fleet.port_of(raw):
         return
-    if _fleet.on_demand():
-        # Before the "already up" short-circuit, and under the same lock as an idle stop. A Chrome that is already
-        # idle has to see this call before it is ended; one that was just ended is started again below.
-        try:
-            _fleet.note_call(profile_name())
-        except Exception:  # noqa: BLE001 - a missed stamp only means this call starts the Chrome if the stop won
-            log.debug("hermes-hq-browser: couldn't note the browser call", exc_info=True)
+    try:
+        _fleet.note_call(profile_name(), raw)
+    except Exception:  # noqa: BLE001 - observation must never disturb a browser tool
+        log.debug("hermes-hq-browser: couldn't note the browser call", exc_info=True)
     if _reachable(raw) or time.time() - _starting.get(raw, 0) < 30:
         return
     from hermes_constants import get_hermes_home

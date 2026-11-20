@@ -859,16 +859,19 @@ def call_claimed(state: dict, now: float) -> bool:
     return at > 0 and now - at < claim_window()
 
 
-def note_call(profile: str) -> None:
-    """A browser call is about to use this bot's Chrome (``agent._own_chrome_up``).
+def note_call(profile: str, url: str) -> None:
+    """Claim the bot's managed on-demand Chrome under the same lock that guards idle shutdown.
 
-    Written under the profile lock, which is the same lock an idle stop holds while it looks again and ends the
-    process. The stop therefore either sees the call and keeps the Chrome, or finishes before the call starts one.
+    The supervisor records the mode in shared state because agent processes can have a different environment.
     """
     root = hermes_root()
-    if not read_state(root, profile):
+    if not read_state(root, profile).get("on_demand"):
         return
-    update_state(root, profile, {"activity_at": time.time()})
+    with Locked(state_folder(root) / f"{profile}.lock"):
+        state = read_state(root, profile)
+        if (state.get("on_demand") and state.get("url") == url
+                and state.get("status") not in ("external", "released", "cloud")):
+            write_state(root, profile, {**state, "activity_at": time.time()})
 
 
 def ensure(profile: str, home: Path, url: str) -> bool:
@@ -965,6 +968,7 @@ class Supervisor:
             return {"profile": profile, "status": reason}
         port, url = decision["manage"], decision["url"]
         folder = str(home / "chrome-debug")
+        on_demand_mode = on_demand()
         if decision["write"]:
             if not chrome_binary():  # nothing to point it at: the bot keeps the browser it has until there is one
                 return {"profile": profile, "status": "no_chrome", "error": "No Chrome or Chromium found on this computer."}
@@ -974,7 +978,9 @@ class Supervisor:
             log.info("hermes-hq-browser: %s now browses in its own Chrome (%s)", profile, url)
         if state.get("url") != url or state.get("port") != port or state.get("folder") != folder:
             state = update_state(self.root, profile, {"profile": profile, "port": port, "url": url, "folder": folder,
-                                                       "status": "starting"})
+                                                       "status": "starting", "on_demand": on_demand_mode})
+        elif bool(state.get("on_demand")) != on_demand_mode:
+            state = update_state(self.root, profile, {"on_demand": on_demand_mode})
         mine = [pid for pid, data, p in processes if data == folder and p == port]
         for pid, data, other in processes:
             if data == folder and other != port and state.get("status") != "external":
@@ -986,15 +992,17 @@ class Supervisor:
             if state.get("status") != status or (mine and state.get("pid") != mine[0]):
                 state = update_state(self.root, profile, {"status": status, "pid": mine[0] if mine else state.get("pid"),
                                                            "error": None})
-            if status == "ready" and mine and on_demand() and self.unused(profile):
+            if status == "ready" and mine and on_demand_mode and self.unused(profile):
                 return self.sleep(profile, port, mine[0], folder, now)
             if status == "ready" and mine and self.stale(profile, mine[0], port, now):
                 with Locked(state_folder(self.root) / f"{profile}.lock"):
                     fresh = read_state(self.root, profile)
-                    if call_claimed(fresh, time.time()) or starting_grace(fresh, time.time()):
+                    checked_at = time.time()
+                    if (call_claimed(fresh, checked_at) or starting_grace(fresh, checked_at)
+                            or self.idle_seconds(profile) < REFRESH_IDLE):
                         return {"profile": profile, "status": "ready", "port": port}
                     end_politely(port, mine[0], folder)
-                if on_demand():  # an old Chrome nobody uses: the bot's next browser call starts a fresh one
+                if on_demand_mode:  # an old Chrome nobody uses: the bot's next browser call starts a fresh one
                     return self.sleep(profile, port, now=now)
                 result = start(self.root, profile, home, port, url, now)
                 return {"profile": profile, "status": result.get("status") or "starting", "port": port}
@@ -1006,7 +1014,7 @@ class Supervisor:
             if self.misses[profile] < MISSES:
                 return {"profile": profile, "status": "not_responding", "port": port}
             log.warning("hermes-hq-browser: %s's Chrome (port %d) stopped answering; %s", profile, port,
-                        "ending it (the bot's next browser call starts a fresh one)" if on_demand() else "restarting it")
+                        "ending it (the bot's next browser call starts a fresh one)" if on_demand_mode else "restarting it")
             sample(mine[0], port, self.root)
             end(mine[0], folder)
             self.misses[profile] = 0
@@ -1021,7 +1029,7 @@ class Supervisor:
                     write_state(self.root, profile, fresh)
                     outcome = {"profile": profile, "status": "port_taken", "port": port, "error": fresh["error"]}
             return outcome
-        if on_demand():
+        if on_demand_mode:
             # Nothing is running and nothing is wanted yet: only a bot's browser call (``ensure``) starts this Chrome.
             # ``sleep`` leaves a start that landed after this pass listed its processes.
             return self.sleep(profile, port, now=now)
@@ -1036,19 +1044,17 @@ class Supervisor:
         result = start(self.root, profile, home, port, url, now)
         return {"profile": profile, "status": result.get("status") or "starting", "port": port, "error": result.get("error")}
 
-    def unused(self, profile: str) -> bool:
-        """On-demand mode: nobody has used this bot's Chrome for ``idle_limit()`` (the dashboard's ``idle_for``: 0 while a
-        browser call runs, a phone watches it, a person holds or asked for it, or a ``browser_ask_user`` waits). Without
-        that clock, never."""
-        if self.idle_for is None:
-            return False
-        limit = idle_limit()
-        if limit == float("inf"):  # IDLE_MINUTES=0, and ``inf >= inf`` would otherwise count as unused
-            return False
+    def idle_seconds(self, profile: str) -> float:
+        """Treat a missing or unreadable idle clock as activity."""
         try:
-            return self.idle_for(profile) >= limit
+            return self.idle_for(profile) if self.idle_for is not None else 0.0
         except Exception:  # noqa: BLE001
-            return False
+            return 0.0
+
+    def unused(self, profile: str) -> bool:
+        """Has this bot's Chrome reached its on-demand idle limit?"""
+        limit = idle_limit()
+        return limit != float("inf") and self.idle_seconds(profile) >= limit
 
     def sleep(self, profile: str, port: int, pid: int | None = None, folder: str | None = None,
               now: float | None = None) -> dict:
@@ -1102,10 +1108,7 @@ class Supervisor:
         outdated = installed_version() not in (None, running_version(port))
         if age < REFRESH_AGE and not outdated:
             return False
-        try:
-            idle = self.idle_for(profile)
-        except Exception:  # noqa: BLE001
-            return False
+        idle = self.idle_seconds(profile)
         if idle < REFRESH_IDLE or (idle == float("inf") and age < REFRESH_UNUSED and not outdated):
             return False
         self.refreshed_at = now

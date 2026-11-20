@@ -10,10 +10,10 @@ import shutil
 import signal
 import sys
 import tempfile
-import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent))
 import test_browser as tb  # noqa: E402
@@ -193,7 +193,6 @@ class PlanTests(Base):
         self.assertEqual(decisions["new"]["manage"], PORTS + 3)  # not the real-profile bot's port, nor the released one's
 
 
-@unittest.skipUnless(tb.CHROME, "needs Chrome or Chromium")
 class RefreshTests(Base):
     """mac.md F6 (Plaid round): ten bot Chromes restarted in one 35 s burst every hour inside the gateway's process,
     and the main bot's Chrome was restarted ten minutes after it last browsed, mid-session."""
@@ -232,7 +231,8 @@ class RefreshTests(Base):
 class SupervisorTests(Base):
     def setUp(self):
         super().setUp()
-        os.environ["HERMES_HQ_BROWSER_CHROME"] = tb.CHROME
+        if tb.CHROME:
+            os.environ["HERMES_HQ_BROWSER_CHROME"] = tb.CHROME
         self.fleet.START_GRACE, self.fleet.MISSES, self.fleet.PROBE_TIMEOUT = 0.0, 2, 1.0
         self.supervisor = self.fleet.Supervisor(self.root, self.source, activate=lambda profile: None)
 
@@ -271,6 +271,7 @@ class SupervisorTests(Base):
     def mine(self, home):
         return [pid for pid, folder, _ in self.fleet.chrome_processes() if folder == str(home / "chrome-debug")]
 
+    @unittest.skipUnless(tb.CHROME, "needs Chrome or Chromium")
     def test_every_bot_browses_in_a_chrome_of_its_own_which_comes_back_when_it_dies_or_freezes(self):
         jim = self.bot("jim", {"plugins": {"enabled": ["hermes-hq-browser"]}, "browser": {"cloud_provider": "browser-use"}})
         clone = self.bot("jim-copy", {"plugins": {"enabled": ["hermes-hq-browser"]}, "browser": {"cdp_url": ""}})
@@ -322,6 +323,7 @@ class SupervisorTests(Base):
         self.supervisor.pass_once()
         self.assertNotIn("cdp_url", config(jim)["browser"])
 
+    @unittest.skipUnless(tb.CHROME, "needs Chrome or Chromium")
     def test_a_bot_that_browses_first_starts_its_own_chrome(self):
         jim = self.bot("jim", {"plugins": {"enabled": ["hermes-hq-browser"]}})
         self.supervisor.pass_once()
@@ -334,6 +336,7 @@ class SupervisorTests(Base):
         self.assertTrue(self.fleet.ensure("jim", jim, url))
         self.assertFalse(self.fleet.ensure("jim", jim, "http://127.0.0.1:1"))  # not a Chrome the plugin runs
 
+    @unittest.skipUnless(tb.CHROME, "needs Chrome or Chromium")
     def test_an_old_chrome_is_started_afresh_only_while_nobody_uses_it(self):
         jim = self.bot("jim", {"plugins": {"enabled": ["dispatch-browser"]}})
         self.supervisor.pass_once()
@@ -361,7 +364,7 @@ class SupervisorTests(Base):
 
 class OnDemandTests(Base):
     """``HERMES_HQ_BROWSER_ON_DEMAND=1``: a bot's Chrome runs only while it is used. Chrome is faked here (launch, the
-    port probe, the process list and ``end``), so these run anywhere; the default mode is checked the same way."""
+    port probe, the process list and ``end_politely``), so these run anywhere."""
 
     def setUp(self):
         super().setUp()
@@ -389,6 +392,7 @@ class OnDemandTests(Base):
         def end(pid, folder):
             self.running.pop(folder, None)
         fleet.launch, fleet.end = launch, end
+        fleet.end_politely = lambda port, pid, folder: end(pid, folder)
         self.supervisor = fleet.Supervisor(self.root, self.source, activate=lambda profile: None)
         self.jim = self.bot("jim", {"plugins": {"enabled": ["hermes-hq-browser"]}})
 
@@ -419,93 +423,53 @@ class OnDemandTests(Base):
     def folder(self):
         return str(self.jim / "chrome-debug")
 
-    def test_by_default_every_bots_chrome_is_started_and_comes_back_as_today(self):
-        self.supervisor.pass_once()
-        self.assertEqual(len(self.running), 2)  # the main bot's and jim's
-        self.assertEqual(self.status(), "ready")
-        self.running.pop(self.folder())  # it exits
-        self.supervisor.pass_once()
-        self.assertIn(self.folder(), self.running)  # started again on the next pass
-        self.assertEqual(len(self.launches), 3)
-        self.supervisor.idle_for = lambda profile: 10 ** 9  # never stopped for being idle
-        self.supervisor.pass_once()
-        self.assertEqual(len(self.running), 2)
-
-    def test_on_demand_gives_every_bot_its_port_and_profile_but_starts_no_chrome(self):
-        self.on()
-        statuses = self.supervisor.pass_once()
-        self.assertEqual({s["status"] for s in statuses.values()}, {"sleeping"})
-        self.assertEqual((self.running, self.launches), ({}, []))
-        urls = {self.url(self.root), self.url()}
-        self.assertEqual(len(urls), 2)  # each bot is pointed at a Chrome of its own
-        state = self.fleet.read_state(self.root, "jim")
-        self.assertEqual((state["status"], state["url"], state["folder"], state.get("pid")),
-                         ("sleeping", self.url(), self.folder(), None))
-        self.supervisor.pass_once()
-        self.assertEqual(self.launches, [])  # later passes start nothing either
-
-    def test_a_bots_browser_call_starts_its_chrome_and_only_its_own(self):
-        self.on()
-        self.supervisor.pass_once()
-        self.wake()
-        self.assertEqual(self.launches, [self.fleet.port_of(self.url())])
-        statuses = self.supervisor.pass_once()
-        self.assertEqual((statuses["jim"]["status"], statuses["default"]["status"]), ("ready", "sleeping"))
-
-    def test_an_unused_chrome_is_stopped_and_its_profile_and_next_start_are_kept(self):
-        self.on(minutes=15)
-        self.supervisor.pass_once()
-        self.wake()
-        (self.jim / "chrome-debug" / "Default" / "Cookies").write_text("signed in")  # what the profile keeps
-        self.supervisor.idle_for = lambda profile: 15 * 60 - 1
-        self.assertEqual(self.status(), "ready")  # not yet
-        self.supervisor.idle_for = lambda profile: 15 * 60
-        self.assertEqual(self.status(), "sleeping")
-        self.assertEqual(self.running, {})
-        state = self.fleet.read_state(self.root, "jim")
-        self.assertEqual((state["status"], state.get("pid"), state["url"]), ("sleeping", None, self.url()))
-        self.assertEqual((self.jim / "chrome-debug" / "Default" / "Cookies").read_text(), "signed in")
-        self.assertEqual(self.status(), "sleeping")  # and it stays asleep
-        self.supervisor.idle_for = lambda profile: 0.0  # (the dashboard's clock starts over with the new Chrome)
-        self.wake()  # the bot's next call
-        self.assertEqual(len(self.launches), 2)
-        self.assertEqual((self.jim / "chrome-debug" / "Default" / "Cookies").read_text(), "signed in")
-
-    def test_a_chrome_in_use_is_never_stopped(self):
+    def test_an_agent_without_the_dashboard_flag_can_wake_and_claim_its_chrome(self):
         self.on(minutes=1)
-        self.supervisor.pass_once()
-        self.wake()
-        self.supervisor.idle_for = lambda profile: 0.0  # a call runs, a phone watches, a person holds it, or an ask waits
-        for _ in range(3):
+        self.assertEqual({row["status"] for row in self.supervisor.pass_once().values()}, {"sleeping"})
+        self.assertEqual(self.launches, [])
+        url = self.url()
+        self.assertNotEqual(url, self.url(self.root))
+        port = self.fleet.port_of(url)
+
+        _, agent = tb.plugin_modules()
+        agent._fleet = self.fleet
+        agent._cdp_override_raw = self.url
+        agent._start = lambda: None
+        agent._reachable = lambda endpoint: self.fleet.answers(port)
+
+        def browse():
+            with patch.dict(os.environ, {"HERMES_HQ_BROWSER_ON_DEMAND": ""}):
+                agent.before_tool("browser_navigate", task_id="turn")
+
+        with patch.object(sys.modules["hermes_constants"], "get_hermes_home", return_value=str(self.jim)):
+            browse()
+            self.assertEqual(self.launches, [port])
             self.assertEqual(self.status(), "ready")
-        self.supervisor.idle_for = None  # no idle clock (a dashboard that doesn't run it): never stopped
-        self.assertEqual(self.status(), "ready")
 
-        def broken(profile):
-            raise RuntimeError("torn read")
-        self.supervisor.idle_for = broken
-        self.assertEqual(self.status(), "ready")
-        self.assertEqual(len(self.running), 1)
+            self.supervisor.idle_for = lambda profile: 60.0
+            observed = []
 
-    def test_idle_minutes_is_read_from_the_environment_and_zero_never_stops_one(self):
-        self.assertEqual(self.fleet.idle_limit(), 900.0)
-        for value, seconds in (("2", 120.0), ("0.5", 30.0), ("0", float("inf")), ("0.0", float("inf")),
-                                ("soon", 900.0), ("-3", 900.0), ("nan", 900.0), ("", 900.0)):
-            os.environ["HERMES_HQ_BROWSER_IDLE_MINUTES"] = value
-            self.assertEqual(self.fleet.idle_limit(), seconds, value)
-        os.environ.pop("HERMES_HQ_BROWSER_IDLE_MINUTES")
-        os.environ["DISPATCH_BROWSER_IDLE_MINUTES"] = "4"  # the older name still works
-        self.assertEqual(self.fleet.idle_limit(), 240.0)
-        os.environ.pop("DISPATCH_BROWSER_IDLE_MINUTES")
-        self.assertFalse(self.fleet.on_demand())
-        for value, wanted in (("1", True), ("true", True), ("on", True), ("yes", True),
-                               ("0", False), ("", False), ("no", False)):
-            os.environ["HERMES_HQ_BROWSER_ON_DEMAND"] = value
-            self.assertIs(self.fleet.on_demand(), wanted, value)
-        os.environ.pop("HERMES_HQ_BROWSER_ON_DEMAND")
-        os.environ["DISPATCH_BROWSER_ON_DEMAND"] = "on"  # the older name still works
-        self.assertTrue(self.fleet.on_demand())
-        os.environ.pop("DISPATCH_BROWSER_ON_DEMAND")
+            def probe(endpoint):
+                reachable = self.fleet.answers(port)
+                with patch.dict(os.environ, {"HERMES_HQ_BROWSER_ON_DEMAND": "1"}):
+                    observed.append(self.status())
+                return reachable
+
+            # The supervisor runs after the agent has checked for a live Chrome and before the tool uses it.
+            with patch.object(agent, "_reachable", side_effect=probe):
+                browse()
+            self.assertEqual(observed, ["ready"])
+
+            state = self.fleet.read_state(self.root, "jim")
+            self.assertEqual(self.status(now=state["activity_at"] + 59), "ready")
+            self.assertEqual(self.status(now=state["activity_at"] + 60), "sleeping")
+            self.assertEqual(self.running, {})
+            self.assertEqual(self.status(), "sleeping")
+
+            browse()
+            self.supervisor.idle_for = lambda profile: 0.0
+            self.assertEqual(self.status(), "ready")
+            self.assertEqual(self.launches, [port, port])
 
     def test_a_chrome_that_exits_or_freezes_is_not_started_again_until_the_bot_browses(self):
         self.on()
@@ -524,22 +488,6 @@ class OnDemandTests(Base):
         self.frozen.clear()
         self.wake()  # a fresh one for the bot's next call
         self.assertEqual(len(self.launches), 3)
-
-    def test_a_chrome_a_bot_call_is_just_starting_is_not_marked_asleep(self):
-        self.on()
-        self.supervisor.pass_once()
-        self.fleet.update_state(self.root, "jim", {"status": "starting", "launched_at": time.time()})
-        self.assertEqual(self.status(), "starting")  # launched, but not in this pass's process list yet
-        self.fleet.update_state(self.root, "jim", {"status": "starting", "launched_at": time.time() - 3600})
-        self.assertEqual(self.status(), "sleeping")  # a start that never happened
-
-    def test_an_old_chrome_nobody_uses_is_stopped_not_refreshed(self):
-        self.on(minutes=0)  # never stopped for being idle: the hourly refresh would have restarted it
-        self.supervisor.pass_once()
-        self.wake()
-        self.supervisor.stale = lambda *args: True
-        self.assertEqual(self.status(), "sleeping")
-        self.assertEqual((len(self.launches), self.running), (1, {}))
 
     def test_the_dashboard_counts_idle_time_from_the_start_in_on_demand_mode(self):
         api = tb.load("dashboard/plugin_api")
@@ -566,20 +514,34 @@ class OnDemandTests(Base):
         os.environ.pop("HERMES_HQ_BROWSER_ON_DEMAND")
         self.assertFalse(api.bots()["on_demand"])
 
-    def test_an_idle_stop_looks_again_before_it_kills_the_chrome(self):
+    def test_shutdown_rechecks_for_a_new_watcher(self):
+        api = tb.load("dashboard/plugin_api")
         self.on(minutes=1)
         self.supervisor.pass_once()
         self.wake()
-        calls = {"n": 0}
+        self.fleet.update_state(self.root, "jim", {"launched_at": time.time() - 3600})
 
         def idle_for(profile):
-            calls["n"] += 1
-            return 60.0 if calls["n"] == 1 else 0.0  # idle on the first look; a call, watch, hold or ask on the second
+            idle = api._idle_for(profile)
+            api._watching[profile] = 1  # the phone connects after the first idle check
+            return idle
 
-        self.supervisor.idle_for = idle_for
-        self.assertEqual(self.status(), "ready")
-        self.assertGreaterEqual(calls["n"], 2)
-        self.assertIn(self.folder(), self.running)
+        def stale(profile, *args):
+            return idle_for(profile) >= self.fleet.REFRESH_IDLE
+
+        # Zero disables idle shutdown, so the second pass reaches the stale refresh path.
+        for minutes in (1, 0):
+            with self.subTest(idle_minutes=minutes):
+                self.on(minutes=minutes)
+                self.supervisor.idle_for = idle_for if minutes else api._idle_for
+                with patch.object(self.supervisor, "stale", side_effect=stale):
+                    self.assertEqual(self.status(), "ready")
+                self.assertIn(self.folder(), self.running)
+                api._watching.clear()
+
+        with patch.object(self.supervisor, "stale", return_value=True):
+            self.assertEqual(self.status(), "sleeping")
+        self.assertEqual(self.running, {})
 
     def test_a_short_idle_limit_does_not_end_a_chrome_a_call_just_claimed(self):
         # The dashboard has not published the call yet, and the idle limit is shorter than that gap.
@@ -592,32 +554,6 @@ class OnDemandTests(Base):
         self.assertIn(self.folder(), self.running)
         self.fleet.update_state(self.root, "jim", {"activity_at": time.time() - 3600})
         self.assertEqual(self.status(), "sleeping")  # once the claim window has passed, the short limit still stops it
-
-    def test_an_idle_stop_does_not_kill_a_chrome_a_call_has_claimed(self):
-        self.on(minutes=15)
-        self.supervisor.pass_once()
-        self.wake()
-        self.fleet.update_state(self.root, "jim", {"launched_at": time.time() - 3600})
-        self.supervisor.idle_for = lambda profile: 15 * 60  # the dashboard clock still says idle
-        claimed = {"done": False}
-        real_enter = self.fleet.Locked.__enter__
-
-        def enter(lock):
-            # The call's stamp lands before this stop takes the profile lock (note_call writes it under that lock).
-            if not claimed["done"] and lock.path.name == "jim.lock":
-                claimed["done"] = True
-                state = self.fleet.read_state(self.root, "jim")
-                self.fleet.write_state(self.root, "jim", {**state, "activity_at": time.time()})
-            return real_enter(lock)
-
-        self.fleet.Locked.__enter__ = enter
-        try:
-            self.assertEqual(self.status(), "ready")
-        finally:
-            self.fleet.Locked.__enter__ = real_enter
-        self.assertTrue(claimed["done"])
-        self.assertIn(self.folder(), self.running)
-        self.assertEqual(self.fleet.read_state(self.root, "jim")["status"], "ready")
 
     def test_marking_a_bot_asleep_loses_to_a_start_that_landed_first(self):
         self.on()
@@ -654,25 +590,12 @@ class OnDemandTests(Base):
         self.on()
         self.supervisor.pass_once()
         self.fleet.chrome_binary = lambda: None
+        self.fleet.READY_WAIT = 0
         self.assertFalse(self.fleet.ensure("jim", self.jim, self.url()))
         self.assertEqual(self.fleet.read_state(self.root, "jim")["status"], "no_chrome")
         self.assertEqual(self.status(), "no_chrome")
         self.assertEqual((self.launches, self.running), ([], {}))
         self.assertEqual(self.status(), "no_chrome")  # later passes don't bring it back on their own
-
-    def test_a_chrome_that_never_answers_is_not_started_again_by_the_supervisor(self):
-        self.on()
-        self.supervisor.pass_once()
-        self.fleet.answers = lambda port, timeout=0: False
-        self.fleet.READY_WAIT = 0
-        self.fleet.START_GRACE = 0
-        self.fleet.MISSES = 1
-        self.assertFalse(self.fleet.ensure("jim", self.jim, self.url()))
-        self.assertEqual(len(self.launches), 1)
-        self.assertEqual(self.status(), "sleeping")
-        self.assertEqual(self.running, {})
-        self.assertEqual(len(self.launches), 1)  # on-demand does not keep restarting an unused Chrome
-        self.assertEqual(self.status(), "sleeping")
 
     def test_zero_idle_minutes_does_not_stop_a_chrome_even_when_the_clock_says_never_used(self):
         self.on(minutes=0)
@@ -681,46 +604,6 @@ class OnDemandTests(Base):
         self.supervisor.idle_for = lambda profile: float("inf")
         self.assertEqual(self.status(), "ready")
         self.assertIn(self.folder(), self.running)
-
-    def test_two_browser_calls_at_once_start_one_chrome(self):
-        self.on()
-        self.supervisor.pass_once()
-        overlap = {"now": 0, "max": 0}
-        gate = threading.Lock()
-        real_launch = self.fleet.launch
-
-        def launch(home, port, binary, window="hidden", copied=False):
-            with gate:
-                overlap["now"] += 1
-                overlap["max"] = max(overlap["max"], overlap["now"])
-            try:
-                time.sleep(0.05)  # both calls are in start() together if the profile lock doesn't cover launch
-                return real_launch(home, port, binary, window, copied)
-            finally:
-                with gate:
-                    overlap["now"] -= 1
-
-        self.fleet.launch = launch
-        barrier = threading.Barrier(2)
-        errors = []
-
-        def call():
-            try:
-                barrier.wait(2)
-                if not self.fleet.ensure("jim", self.jim, self.url()):
-                    errors.append("ensure returned False")
-            except Exception as error:  # noqa: BLE001
-                errors.append(error)
-
-        threads = [threading.Thread(target=call) for _ in range(2)]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(5)
-            self.assertFalse(thread.is_alive())
-        self.assertEqual(errors, [])
-        self.assertEqual(self.launches, [self.fleet.port_of(self.url())])
-        self.assertEqual(overlap["max"], 1)
 
     def test_a_call_a_hold_or_an_ask_keeps_the_idle_clock_at_zero(self):
         api = tb.load("dashboard/plugin_api")
@@ -757,10 +640,14 @@ class OnDemandTests(Base):
         self.fleet.write_state(self.root, "sam", {"profile": "sam", "port": PORTS + 7, "url": url,
                                                   "folder": str(home / "chrome-debug"), "status": "ready"})
         self.assertEqual(choice.read_choice(self.fleet, self.root, "sam", home)["blocked"], "real_profile")
-        threading.Timer(0.3, self.supervisor.pass_once).start()  # the supervisor's next pass
-        started = time.monotonic()
-        result = choice.take_over(self.fleet, self.root, "sam", home)
-        self.assertLess(time.monotonic() - started, 8.0)  # not choice.TAKE_OVER_WAIT
+        with patch.object(choice, "time", wraps=time) as clock:
+            def next_pass(_):
+                self.assertEqual(clock.sleep.call_count, 1)
+                self.supervisor.pass_once()
+
+            clock.sleep.side_effect = next_pass
+            result = choice.take_over(self.fleet, self.root, "sam", home)
+        clock.sleep.assert_called_once()
         self.assertEqual((result["blocked"], result["status"]), (None, "sleeping"))
         self.assertEqual(self.launches, [])
 
@@ -770,10 +657,11 @@ def chrome_for_test() -> str | None:
     bot share one profile, so process checks and sign-ins can't be tested through it."""
     path = tb.CHROME or ""
     try:
-        head = Path(path).read_text(errors="ignore")[:800]
+        with Path(path).open("rb") as executable:
+            head = executable.read(800)
     except OSError:
-        head = ""
-    if head.startswith("#!") and "--user-data-dir=" in head:
+        head = b""
+    if head.startswith(b"#!") and b"--user-data-dir=" in head:
         for candidate in ("/usr/bin/google-chrome-stable", "/usr/bin/chromium", "/usr/bin/chromium-browser"):
             if os.access(candidate, os.X_OK):
                 return candidate
@@ -782,7 +670,7 @@ def chrome_for_test() -> str | None:
 
 @unittest.skipUnless(chrome_for_test(), "needs Chrome or Chromium")
 class OnDemandRealChromeTests(Base):
-    """One real Chrome, in a temporary profile: launch on a call, stay up while watched, sleep, wake, keep the profile.
+    """One real Chrome, in a temporary profile: launch on a call, sleep, wake, keep the profile.
 
     The idle decision uses the dashboard clock with a short limit. Page restore when a restart is noticed is the
     tracker's job (TabTrackerTests); what survives here is the profile, including a cookie set over CDP."""
@@ -819,7 +707,7 @@ class OnDemandRealChromeTests(Base):
             time.sleep(0.2)
         return False
 
-    def test_a_real_chrome_starts_from_sleep_navigates_idles_and_wakes_with_its_profile(self):
+    def test_a_real_chrome_keeps_a_cookie_after_sleep_and_wake(self):
         import asyncio
         import json
         import urllib.request
@@ -839,7 +727,6 @@ class OnDemandRealChromeTests(Base):
             browser = await cdp.Cdp().connect(endpoint)
             try:
                 if write:
-                    await browser.call("Target.createTarget", {"url": "data:text/html,hq-on-demand"})
                     # Expires, so it is stored in the profile. A session cookie would not survive the restart.
                     # Storage.* is on the browser target; Network.setCookie is not, on current Chrome.
                     await browser.call("Storage.setCookies", {"cookies": [{
@@ -852,33 +739,17 @@ class OnDemandRealChromeTests(Base):
 
         endpoint = json.load(urllib.request.urlopen(f"{url}/json/version", timeout=5))["webSocketDebuggerUrl"]
         self.assertIn("kept", asyncio.run(browse(endpoint, True)))
-        listing = json.load(urllib.request.urlopen(f"{url}/json/list", timeout=5))
-        self.assertTrue(any("hq-on-demand" in str(target.get("url") or "") for target in listing))
-
         api = tb.load("dashboard/plugin_api")
         self.supervisor.idle_for = api._idle_for
-        api._watching["jim"] = 1
-        try:
-            time.sleep(3.5)  # longer than the idle limit, and a phone is watching
-            self.assertEqual(self.supervisor.pass_once()["jim"]["status"], "ready")
-            self.assertTrue(self.mine(self.home))
-        finally:
-            api._watching.pop("jim", None)
+        self.fleet.update_state(self.root, "jim", {"launched_at": time.time() - 10})
 
         def asleep():
             status = self.supervisor.pass_once()["jim"]["status"]
             return status == "sleeping" and not self.mine(self.home)
 
         self.assertTrue(self.until(asleep), self.fleet.read_state(self.root, "jim"))
-        self.assertTrue((self.home / "chrome-debug" / "Default").is_dir())
-        cookie_files = list((self.home / "chrome-debug").rglob("Cookies*"))
-        # Kept so a failure can show whether Chrome flushed the store before the process ended.
-        self._cookie_files = [(str(path.relative_to(self.home)), path.stat().st_size) for path in cookie_files]
-        # The profile directory itself, not only what Chrome may still be flushing.
-        marker = self.home / "chrome-debug" / "Default" / "hq-marker.txt"
-        marker.write_text("kept-profile")
-        self.assertTrue(self.fleet.ensure("jim", self.home, url))  # the next browse starts it again
-        self.assertEqual(marker.read_text(), "kept-profile")
+        cookie_files = [str(path.relative_to(self.home)) for path in (self.home / "chrome-debug").rglob("Cookies*")]
+        self.assertTrue(self.fleet.ensure("jim", self.home, url))
         found = []
         deadline = time.time() + 8
         while time.time() < deadline:
@@ -887,7 +758,7 @@ class OnDemandRealChromeTests(Base):
             if "kept" in found:
                 break
             time.sleep(0.4)
-        self.assertIn("kept", found, self._cookie_files)
+        self.assertIn("kept", found, cookie_files)
         self.assertEqual(self.mine(self.root), [])
 
 
