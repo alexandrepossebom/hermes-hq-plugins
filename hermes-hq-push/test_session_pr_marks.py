@@ -53,9 +53,10 @@ def test_a_mark_covers_what_is_not_merged_and_never_what_is():
     assert status._resolve([], {'branches': {}, 'commits': []}, nobody, (), None, True) == {'state': 'closed', 'manual': True}
     assert status._resolve(None, None, nobody, (), None, True) == {'state': 'closed', 'manual': True}
     assert status._resolve([], {'branches': {}, 'commits': []}, nobody, (), None, False) == {'state': 'none'}
-    for state, covered in (('draft', True), ('closed', True), ('open', False), ('merged', False)):
+    # An open pull request is covered too (0.9.75): the owner said the chat is done; its item still says open.
+    for state, covered in (('draft', True), ('closed', True), ('open', True), ('merged', False)):
         import unittest.mock as mock
-        with mock.patch.object(status, '_computed', lambda *a, state=state: {'state': state, 'branch': 'b'}):
+        with mock.patch.object(status, '_detail', lambda *a, state=state: ({'state': state, 'branch': 'b'}, [])):
             answer = status._resolve([], {}, nobody, (), None, True)
         assert (answer == {'state': 'closed', 'branch': 'b', 'manual': True}) is covered
         assert covered or answer == {'state': state, 'branch': 'b'}

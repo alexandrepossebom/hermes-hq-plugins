@@ -114,10 +114,19 @@ def test_a_subagents_pull_request_is_its_parents_and_nobody_elses(db):
 
 
 def test_only_the_newest_few_and_no_duplicates(db):
-    for number in range(1, 10):
+    for number in range(1, 16):
         run(db, 'gh pr create --fill', APP + str(number))
     run(db, 'gh pr create --fill', APP + '2')            # reported again: now the newest
-    assert created.created_from_conn(db, 's') == [('owner/app', n) for n in (5, 6, 7, 8, 9, 2)]
+    kept = created.created_from_conn(db, 's')
+    assert kept == [('owner/app', n) for n in (5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 2)]
+    assert kept.truncated                                # 1, 3 and 4 were left out: said, not hidden
+
+
+def test_all_kept_is_not_truncated(db):
+    for number in (1, 2):
+        run(db, 'gh pr create --fill', APP + str(number))
+    kept = created.created_from_conn(db, 's')
+    assert kept == [('owner/app', 1), ('owner/app', 2)] and not kept.truncated
 
 
 def test_history_is_data(db, monkeypatch):

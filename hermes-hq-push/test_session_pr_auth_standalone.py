@@ -145,7 +145,8 @@ def test_authorization_and_evidence_share_one_snapshot(tmp_path, monkeypatch):
     monkeypatch.setattr(migration, 'legacy_history_row', real_row)
     assert client.post('/sessions/pr-status', json=body).json() == {'sessions': [
         {'profile': 'default', 'id': 'chat', 'state': 'unknown', 'repo': 'a/b', 'number': 7,
-         'url': 'https://github.com/a/b/pull/7'}]}
+         'url': 'https://github.com/a/b/pull/7',
+         'items': [{'state': 'unknown', 'repo': 'a/b', 'number': 7, 'url': 'https://github.com/a/b/pull/7', 'source': 'github'}]}]}
 
 
 def test_a_plugin_host_trusts_only_hermes_own_verdict(tmp_path, monkeypatch):
@@ -187,7 +188,8 @@ def test_a_plugin_host_trusts_only_hermes_own_verdict(tmp_path, monkeypatch):
     assert admitted.status_code == 200
     assert admitted.json() == {'sessions': [
         {'profile': 'default', 'id': 'mine', 'state': 'unknown', 'repo': 'a/b', 'number': 7,
-         'url': 'https://github.com/a/b/pull/7'},      # its repository isn't listed as public: not asked
+         'url': 'https://github.com/a/b/pull/7',      # its repository isn't listed as public: not asked
+         'items': [{'state': 'unknown', 'repo': 'a/b', 'number': 7, 'url': 'https://github.com/a/b/pull/7', 'source': 'github'}]},
         {'profile': 'default', 'id': 'login', 'state': 'none'}]}
     for verdict in (False, None, 'true', 1):
         refused = TestClient(with_hosted_admission(app, verdict)).post(

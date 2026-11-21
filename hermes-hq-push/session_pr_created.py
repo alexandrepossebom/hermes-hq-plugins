@@ -22,7 +22,7 @@ _ENV = re.compile(r'[A-Za-z_][A-Za-z0-9_]*=')
 _TERMINAL = ('terminal', 'functions.terminal')
 _MAX_FIELD = 400_000
 _MAX_ROWS = 2000
-MAX_CREATED = 6
+MAX_CREATED = 12
 _MAX_DEPTH = 3
 _MAX_FAMILY = 200
 
@@ -130,7 +130,15 @@ def created_from_conn(db, session_id):
         if pair in found:
             found.remove(pair)   # opened again or reported again: it is the newer one
         found.append(pair)
-    return found[-MAX_CREATED:]
+    kept = Created(found[-MAX_CREATED:])
+    kept.truncated = len(found) > MAX_CREATED
+    return kept
+
+
+class Created(list):
+    """The pull requests kept, oldest first; ``truncated`` when older ones were left out (so the
+    answer can't say they all finished)."""
+    truncated = False
 
 
 def _scan(db, session_id):
