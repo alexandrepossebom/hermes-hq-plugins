@@ -98,7 +98,8 @@ _watching: dict = {}  # profile -> phones watching its browser right now
 
 def _idle_for(profile) -> float:
     """Seconds since anyone used this bot's browser: 0 while a call runs, a person holds or was asked for it, or a
-    phone watches it. The supervisor starts an old Chrome afresh only once this is long enough."""
+    phone watches it. The supervisor starts an old Chrome afresh (and, in on-demand mode, stops an unused one) only once
+    this is long enough."""
     now = time.time()
     if _watching.get(profile):
         return 0.0
@@ -115,6 +116,15 @@ def _idle_for(profile) -> float:
     url = _standing_url(home) if home else None
     if url:
         last = max(last, tracker.last_used(url))
+    if fleet.on_demand():
+        # A Chrome the bot just woke gets its whole idle window (its first call may not be published yet), and one nobody
+        # ever uses is still stopped: the clock counts from when it was started, not from never. ``activity_at`` is the
+        # stamp a browser call writes before it runs, so a stop already in progress can see that call.
+        try:
+            state = fleet.read_state(fleet.hermes_root(), profile)
+            last = max(last, float(state.get("launched_at") or 0), float(state.get("activity_at") or 0))
+        except Exception:  # noqa: BLE001
+            pass
     return now - last if last else float("inf")
 
 
@@ -420,14 +430,15 @@ def _own_chrome() -> bool:
 
 @router.get("/bots")
 def bots():  # sync: FastAPI runs it on a worker thread
-    """Each bot's own Chrome: ``ready``, ``starting``, ``not_responding``, ``external`` (a Chrome the person runs),
-    or why it has none: ``off`` (plugin disabled there), ``real_profile``, ``remote``, ``fixed``, ``camofox``,
-    ``released`` (the person removed its ``cdp_url``), ``no_chrome``, ``port_taken``, ``no_port``."""
+    """Each bot's own Chrome: ``ready``, ``starting``, ``not_responding``, ``sleeping`` (on-demand mode: not running
+    until the bot browses; ``on_demand`` says which mode this is), ``external`` (a Chrome the person runs), or why it
+    has none: ``off`` (plugin disabled there), ``real_profile``, ``remote``, ``fixed``, ``camofox``, ``released`` (the
+    person removed its ``cdp_url``), ``no_chrome``, ``port_taken``, ``no_port``."""
     if _supervisor is not None and _supervisor.statuses:
         rows = list(_supervisor.statuses.values())
     else:
         rows = fleet.statuses(fleet.hermes_root())
-    return {"schema": "dispatch-browser.bots.v1", "own_chrome": _own_chrome(), "bots": rows}
+    return {"schema": "dispatch-browser.bots.v1", "own_chrome": _own_chrome(), "on_demand": fleet.on_demand(), "bots": rows}
 
 
 def _bot_home(profile: str):

@@ -412,7 +412,13 @@ def _own_chrome_up() -> None:
     if _fleet is None:
         return
     raw = _cdp_override_raw()
-    if not raw or not _fleet.port_of(raw) or _reachable(raw) or time.time() - _starting.get(raw, 0) < 30:
+    if not raw or not _fleet.port_of(raw):
+        return
+    try:
+        _fleet.note_call(profile_name(), raw)
+    except Exception:  # noqa: BLE001 - observation must never disturb a browser tool
+        log.debug("hermes-hq-browser: couldn't note the browser call", exc_info=True)
+    if _reachable(raw) or time.time() - _starting.get(raw, 0) < 30:
         return
     from hermes_constants import get_hermes_home
     if not _fleet.ensure(profile_name(), Path(get_hermes_home()), raw):

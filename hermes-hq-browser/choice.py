@@ -474,7 +474,8 @@ def take_over(fleet, root: Path, profile: str, home: Path, *, wait: float | None
         state = fleet.read_state(root, profile)
         port = state.get("port")
         if (blocked_reason(fleet, fleet.read_config(home), state) is None and isinstance(port, int)
-                and fleet.answers(port, 1.0)):
+                and (fleet.answers(port, 1.0)
+                     or (fleet.on_demand() and state.get("status") == "sleeping"))):  # on demand: nothing to wait for
             break
         if time.time() >= deadline:
             break                               # it comes up on a later pass; the phone shows where it is

@@ -57,8 +57,32 @@ Install the plugin once, for the main profile. The dashboard (`fleet.py`, one su
   person removes after the plugin set it (that is how to opt a bot out). `HERMES_HQ_BROWSER_OWN_CHROME=0` in the
   dashboard's environment turns the whole thing off. (The older `DISPATCH_BROWSER_*` names still work.)
 
-`GET /bots` reports each bot's Chrome (`ready`, `starting`, `not_responding`, or why it has none) and Hermes HQ
-says so when there is no page to show. State lives in `<hermes root>/hermes-hq-browser/chromes/<profile>.json`.
+`GET /bots` reports each bot's Chrome (`ready`, `starting`, `not_responding`, `sleeping` in on-demand mode, or why it
+has none) and Hermes HQ says so when there is no page to show. State lives in
+`<hermes root>/hermes-hq-browser/chromes/<profile>.json`.
+
+## On-demand browsers (3.12, opt-in)
+
+By default every bot's Chrome runs all the time, as above. On a computer with many bots that is many Chromes
+(about 200 MB each) doing nothing most of the day. Set `HERMES_HQ_BROWSER_ON_DEMAND=1` in the dashboard's environment
+(the one that runs `hermes serve`), restart it, and a bot's Chrome runs only while it is used:
+
+- **Nothing starts with the dashboard.** Each bot still gets its own port, its `browser.cdp_url` and its profile folder
+  (`<bot home>/chrome-debug`), but its Chrome isn't started; `GET /bots` says `sleeping` (and `on_demand: true`).
+- **A bot's first browser call starts its Chrome.** The call waits for it (up to 15 seconds), as it already does when a
+  bot browses before the dashboard has started its Chrome. Only that bot's Chrome starts.
+- **An unused Chrome stops** after `HERMES_HQ_BROWSER_IDLE_MINUTES` (default 15; `0` never stops one for being idle) and
+  goes back to `sleeping`. The stop asks that Chrome to exit and write its profile, then signals it only if it is still
+  there, so sign-ins stay in the profile folder. The pages the bot had open come back when its Chrome does. Nothing is
+  stopped while a browser call is running, a phone is watching it, a person holds or has asked for it, or a
+  `browser_ask_user` is waiting. A call claims that bot's Chrome before it runs, and the stop looks again before it
+  ends the process, so the two can't cross. That claim lasts at least as long as a Chrome is given to start (about 30
+  seconds), so a shorter idle limit still cannot end a Chrome a call has only just claimed.
+- **A Chrome that exits or freezes isn't started again** until the bot browses; it sleeps instead.
+
+Limits: there is no cap on how many Chromes run at once (every bot that browses gets its own, and they stop as they go
+quiet), and a sleeping bot isn't listed in Watch Browser until it browses, so you can't open it to sign in to a site
+ahead of time. Leave the setting off for that.
 
 ## Browser Use Cloud (3.9)
 
