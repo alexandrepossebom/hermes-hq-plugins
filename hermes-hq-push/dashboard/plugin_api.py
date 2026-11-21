@@ -540,6 +540,8 @@ class SessionPRIn(BaseModel):
 
 class SessionPRBatchIn(BaseModel):
     sessions: list[SessionPRIn] = Field(max_length=32)
+    # A chat being opened: its waiting pull requests are asked about again rather than read from the cache.
+    fresh: StrictBool = False
 
 
 class SessionPRMarkIn(BaseModel):
@@ -716,7 +718,8 @@ def sessions_pr_status(body: SessionPRBatchIn, request: Request):
         if actor.subject not in access:
             access[actor.subject] = session_pr_status.access_for(data_dir, actor.subject, config)
         return {"profile": profile, "id": sid, "created": created, "work": work, "access": access[actor.subject],
-                "repos": config['repos'], "data_dir": data_dir, "closed": f"{profile}/{sid}" in marks}
+                "repos": config['repos'], "data_dir": data_dir, "closed": f"{profile}/{sid}" in marks,
+                "fresh": body.fresh and len(rows) <= 4}
 
     return {"sessions": session_pr_status.resolve_batch(_pr_owned(request, rows, visit))}
 

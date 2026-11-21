@@ -350,8 +350,15 @@ def _save_merged(data_dir):
         pass
 
 
-def _lookup(repo, number, access):
-    """What became of one pull request: draft, open, merged, closed, or unknown (never a guess)."""
+FRESH_AFTER = 15   # a chat being opened asks again about its waiting pull requests once they are this old
+
+
+def _lookup(repo, number, access, fresh=False):
+    """What became of one pull request: draft, open, merged, closed, or unknown (never a guess).
+
+    The answer carries ``_head`` (the pull request's branch) when GitHub said it, for joining it to the
+    chat's own branch; it is never sent. *fresh*: a waiting answer older than ``FRESH_AFTER`` is asked
+    again (with its ETag, so an unchanged one costs GitHub nothing new)."""
     link = {'repo': repo, 'number': number, 'url': f'https://github.com/{repo}/pull/{number}'}
     unknown = {'state': 'unknown', **link}
     if not _valid_repo(repo) or type(number) is not int or not 0 < number <= 2147483647:
@@ -365,7 +372,10 @@ def _lookup(repo, number, access):
         if not access.token:
             _load_merged(access.data_dir)
         entry = _cache.get(key)
-        if entry and entry[0] > time.monotonic():
+        now = time.monotonic()
+        stale = (fresh and entry is not None and entry[1].get('state') in ('draft', 'open')
+                 and now - (entry[0] - TTL) >= FRESH_AFTER)
+        if entry and entry[0] > now and not stale:
             _cache.move_to_end(key)
             return dict(entry[1])
     previous = entry[1] if entry and entry[1].get('state') != 'unknown' else None
@@ -373,7 +383,8 @@ def _lookup(repo, number, access):
     owner, name = repo.split('/')
     try:
         pr, tag = _api(f'/repos/{quote(owner, safe="")}/{quote(name, safe="")}/pulls/{number}', access, etag)
-        result = {key_: value for key_, value in _pr_result(pr, repo, None, number).items() if key_ != 'branch'}
+        result = {('_head' if key_ == 'branch' else key_): value
+                  for key_, value in _pr_result(pr, repo, None, number).items()}
         etag = tag
     except _Unchanged:
         result = dict(previous)
@@ -395,65 +406,133 @@ def _lookup(repo, number, access):
     return result
 
 
-def _resolve_created(created, access=None):
+def _public(answer):
+    """An answer as it is sent: nothing internal (``_head``, ``direct``, ``source``)."""
+    return {key: value for key, value in answer.items() if not key.startswith('_') and key not in ('direct', 'source')}
+
+
+_WAITING = ('draft', 'open')
+
+
+def _finished_pick(answers):
+    """Of finished answers (oldest first): the newest merged one, else the newest closed one."""
+    for state in ('merged', 'closed'):
+        for answer in reversed(answers):
+            if answer['state'] == state:
+                return answer
+    return None
+
+
+def _resolve_created(created, access=None, fresh=False):
     """One answer from the pull requests a session opened itself, oldest first; None when it opened none.
 
-    The newest one still waiting (draft or open) if there is one, else the newest one.
+    The newest one still waiting (draft or open) if there is one; else an unreadable one, because it
+    may be the one still waiting; else the newest merged one, else the newest closed one.
     """
     access = access if access is not None else Access()
-    newest = None
-    for repo, number in reversed(created or ()):
-        result = _lookup(repo, number, access)
-        if result['state'] in ('draft', 'open'):
-            return result
-        if newest is None or (newest['state'] == 'unknown' and result['state'] != 'unknown'):
-            newest = result
-    return newest
+    answers = [_lookup(repo, number, access, fresh) for repo, number in (created or ())]
+    if not answers:
+        return None
+    pick = next((a for a in reversed(answers) if a['state'] in _WAITING), None) \
+        or next((a for a in reversed(answers) if a['state'] == 'unknown'), None) or _finished_pick(answers)
+    return _public(pick or answers[-1])
 
 
-def _resolve(created, work, access=None, repos=(), tips=None, closed=False):
-    answer = _computed(created, work, access, repos, tips)
-    # The owner's own mark: a label over whatever isn't merged. Work that reached main says so itself.
-    if closed and answer.get('state') in ('none', 'draft', 'unknown', 'closed'):
-        answer = {**answer, 'state': 'closed', 'manual': True}
-    return answer
+def _joined(github, git):
+    """One pull request and the chat's own branch it was opened from, as one answer.
+
+    Waiting on GitHub wins; then work still waiting on the branch; then landed (merged on GitHub, or the
+    branch reached main without the pull request); then closed. GitHub's number and link are kept."""
+    if github['state'] in _WAITING:
+        state = github['state']
+    elif git['state'] == 'draft':
+        state = 'draft'
+    elif 'merged' in (github['state'], git['state']):
+        state = 'merged'
+    elif 'closed' in (github['state'], git['state']):
+        state = 'closed'
+    else:
+        state = github['state']
+    joined = {**git, **{k: v for k, v in github.items() if k in ('repo', 'number', 'url')}, 'state': state,
+              'branch': git.get('branch') or github.get('_head'), 'source': 'github'}
+    return joined
 
 
-def _computed(created, work, access=None, repos=(), tips=None):
-    """Where a session's code changes stand, from the pull requests it opened and its own branches.
+def _detail(created, work, access=None, repos=(), tips=None, fresh=False):
+    """``(answer, items)``: where a session's code changes stand as one answer, and every pull request
+    and branch of its own that it rests on (newest first, at most ``MAX_ITEMS``).
 
-    Work still waiting comes first: a pull request waiting on GitHub (``draft`` or ``open``), then a
-    branch not merged yet (``draft``). Then what is finished: merged or closed. No pull request and no branch of its own: ``none``.
-    Unreadable history is ``unknown``, never ``none``.
+    The one answer: work still waiting comes first: a pull request waiting on GitHub (``draft`` or
+    ``open``), then a branch not merged yet (``draft``). Then a pull request GitHub couldn't be asked
+    about, when no branch of the chat's own stands for it: it may be the one still waiting. Then what is
+    finished: merged before closed (a chat whose work landed is not undone by a later attempt it gave
+    up). Then, when older work was left out or half the history couldn't be read, ``unknown``. No pull
+    request and no branch of its own: ``none``.
     """
     if created is None and work is None:
-        return {'state': 'unknown'}
-    asked = _resolve_created(created, access)
-    if asked is not None and asked['state'] in ('draft', 'open'):
-        return asked
+        return {'state': 'unknown'}, []
+    access = access if access is not None else Access()
+    github = [dict(_lookup(repo, number, access, fresh), source='github') for repo, number in (created or ())]
     try:
-        local, unplaced = _local().local_state(work, repos, tips) if work and repos else (None, 0)
+        git, unplaced = _local().local_items(work, repos, tips) if work and repos else ([], [])
     except Exception:
-        local, unplaced = None, 1
-    if local is not None:
-        local.pop('direct', None)
-        if local['state'] in ('draft', 'open'):
-            return local
-    if asked is not None and asked['state'] != 'unknown':
-        return asked
-    if local is not None:
-        return local
-    if asked is not None:
-        return asked
+        git, unplaced = [], [None]
+    git = [dict(answer, source='git') for answer in git]
+    # A pull request opened from one of the chat's own branches is that branch's: one item, not two.
+    for index, pr in enumerate(github):
+        head = pr.get('_head')
+        match = next((i for i, answer in enumerate(git) if head and answer.get('branch') == head), None)
+        if match is not None:
+            github[index] = _joined(pr, git.pop(match))
+    known = git + github          # the same state from GitHub is told before a branch's (newest last)
+    items = [{**_public(a), 'source': a['source']} for a in list(reversed(github)) + list(reversed(git))]
+    items += [{'state': 'unknown', 'branch': name, 'source': 'git'} for name in reversed(unplaced) if name]
+    items = items[:MAX_ITEMS]
+
+    waiting = next((a for a in reversed(github) if a['state'] in _WAITING), None) \
+        or next((a for a in reversed(git) if a['state'] in _WAITING), None)
+    if waiting is not None:
+        return _public(waiting), items
+    unreadable = next((a for a in reversed(github) if a['state'] == 'unknown'), None)
+    if unreadable is not None and not git:
+        return _public(unreadable), items
+    finished = _finished_pick([a for a in known if a['state'] in ('merged', 'closed')])
+    truncated = bool(getattr(created, 'truncated', False)) or bool((work or {}).get('truncated'))
+    if finished is not None and not truncated:
+        return _public(finished), items
+    if truncated:
+        return {'state': 'unknown'}, items       # older work was left out: it may still be waiting
+    if unreadable is not None:
+        return _public(unreadable), items
     if created is None or work is None or unplaced:
         # Half the history could not be read, or the chat made a branch no listed repository
         # knows: not proof of nothing.
-        return {'state': 'unknown'}
-    return {'state': 'none'}
+        return {'state': 'unknown'}, items
+    return {'state': 'none'}, items
+
+
+MAX_ITEMS = 12
+
+
+def _computed(created, work, access=None, repos=(), tips=None):
+    return _detail(created, work, access, repos, tips)[0]
+
+
+def _resolve(created, work, access=None, repos=(), tips=None, closed=False):
+    return _resolve_detail(created, work, access, repos, tips, closed)[0]
+
+
+def _resolve_detail(created, work, access=None, repos=(), tips=None, closed=False, fresh=False):
+    answer, items = _detail(created, work, access, repos, tips, fresh)
+    # The owner's own mark: a label over whatever isn't merged, a pull request still open on GitHub
+    # included (each item keeps what GitHub or git says). Work that reached main says so itself.
+    if closed and answer.get('state') in ('none', 'draft', 'open', 'unknown', 'closed'):
+        answer = {**answer, 'state': 'closed', 'manual': True}
+    return answer, items
 
 
 def resolve_batch(items):
-    """*items*: ``{'profile', 'id', 'created', 'work', 'access', 'repos', 'data_dir', 'closed'}`` already
+    """*items*: ``{'profile', 'id', 'created', 'work', 'access', 'repos', 'data_dir', 'closed', 'fresh'}`` already
     authorized and read in one snapshot."""
     if len(items) > MAX_BATCH:
         raise ValueError('too many sessions')
@@ -463,11 +542,15 @@ def resolve_batch(items):
 
     def one(item):
         try:
-            result = _resolve(item.get('created'), item.get('work', {}), item.get('access'), item.get('repos') or (),
-                              tips, bool(item.get('closed')))
+            result, listed = _resolve_detail(item.get('created'), item.get('work', {}), item.get('access'),
+                                             item.get('repos') or (), tips, bool(item.get('closed')),
+                                             bool(item.get('fresh')))
         except Exception:
-            result = {'state': 'unknown'}
-        return {'profile': item['profile'], 'id': item['id'], **result}
+            result, listed = {'state': 'unknown'}, []
+        answer = {'profile': item['profile'], 'id': item['id'], **result}
+        if listed:
+            answer['items'] = listed   # every pull request and branch the answer rests on (0.9.75)
+        return answer
 
     with ThreadPoolExecutor(max_workers=4) as pool:
         out = list(pool.map(one, items))

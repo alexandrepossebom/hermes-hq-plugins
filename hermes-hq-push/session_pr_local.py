@@ -180,9 +180,13 @@ def work_from_conn(db, session_id):
         if sha and sha not in shas:
             shas.append(sha)
         branches[branch] = shas[-8:]
+    dropped = len(branches) > MAX_BRANCHES or len(commits) > 8
     for name in list(branches)[:-MAX_BRANCHES]:
         del branches[name]
-    return {'branches': branches, 'commits': commits[-8:]}
+    work = {'branches': branches, 'commits': commits[-8:]}
+    if dropped:
+        work['truncated'] = True     # older work left out: not proof it is all finished
+    return work
 
 
 def _scan(db, session_id):
@@ -581,14 +585,27 @@ def local_state(work, repos, tips=None):
 
     Work still waiting wins: a chat with an unmerged branch is not done because an older one merged.
     """
+    answers, unplaced = local_items(work, repos, tips)
+    best = None
+    for answer in answers:
+        if best is None or _RANK[answer['state']] >= _RANK[best['state']]:
+            best = dict(answer)
+    return best, len(unplaced)
+
+
+def local_items(work, repos, tips=None):
+    """``(answers, unplaced)``: one answer per branch (or loose commit) of the session's that holds work,
+    oldest first, each the best any listed repository gives it; *unplaced* names the branches no listed
+    repository knows, oldest first."""
     if not work or not repos:
-        return None, 0
+        return [], []
     snaps = [(repo, snap) for repo, snap in ((repo, _snapshot(repo)) for repo in repos) if snap is not None]
-    best, unplaced = None, 0
+    answers, unplaced = [], []
     items = [(name, tuple(shas)) for name, shas in work.get('branches', {}).items()]
     items += [(None, (sha,)) for sha in work.get('commits', [])]
     for branch, shas in items:
         placed = False
+        best = None
         for repo, snap in snaps:
             remembered = tips.get(f"{repo['path']}\n{branch}") if tips is not None and branch is not None else None
             # Everything an answer rests on: main, the marker, every branch's tip, the receipts, the tip remembered.
@@ -617,6 +634,8 @@ def local_state(work, repos, tips=None):
             placed = True
             if cached['state'] != 'nothing' and (best is None or _RANK[cached['state']] >= _RANK[best['state']]):
                 best = dict(cached)
+        if best is not None:
+            answers.append(best)
         if not placed and branch is not None:
-            unplaced += 1
-    return best, unplaced
+            unplaced.append(branch)
+    return answers, unplaced

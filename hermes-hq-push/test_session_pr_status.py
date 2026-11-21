@@ -323,6 +323,12 @@ def test_http_route_and_validation(tmp_path, monkeypatch):
     assert response.status_code == 200
     assert response.json() == {'sessions': [{'profile': 'default', 'id': 's-1', 'state': 'none'}]}
     assert batches[-1][0]['created'] == [] and batches[-1][0]['access'].token is None
+    assert batches[-1][0]['fresh'] is False
+    client.post(url, json={**payload, 'fresh': True}, headers=headers)
+    assert batches[-1][0]['fresh'] is True           # a chat being opened (0.9.75)
+    client.post(url, json={'sessions': payload['sessions'] * 5, 'fresh': True}, headers=headers)
+    assert batches[-1][0]['fresh'] is False          # a whole list is never asked for fresh
+    assert client.post(url, json={**payload, 'fresh': 'yes'}, headers=headers).status_code == 422
     owner.sessions['s-1'].source = SimpleNamespace(platform=Platform.TELEGRAM, user_id='alice')
     assert client.post(url, json=payload, headers=headers).json() == {'sessions': []}
     owner.sessions['s-1'].source = SimpleNamespace(platform=Platform.LOCAL, user_id='alice')
