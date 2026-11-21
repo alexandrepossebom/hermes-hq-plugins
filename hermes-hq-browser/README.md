@@ -61,7 +61,7 @@ Install the plugin once, for the main profile. The dashboard (`fleet.py`, one su
 has none) and Hermes HQ says so when there is no page to show. State lives in
 `<hermes root>/hermes-hq-browser/chromes/<profile>.json`.
 
-## On-demand browsers (3.12, opt-in)
+## On-demand browsers (3.13, opt-in)
 
 By default every bot's Chrome runs all the time, as above. On a computer with many bots that is many Chromes
 (about 200 MB each) doing nothing most of the day. Set `HERMES_HQ_BROWSER_ON_DEMAND=1` in the dashboard's environment
