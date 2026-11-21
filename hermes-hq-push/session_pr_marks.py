@@ -16,6 +16,7 @@ from pathlib import Path
 MARKS_NAME = 'session-pr-marks.json'
 LINKS_NAME = 'session-pr-links.json'
 MARKER = 'hq-public-published'      # the file a publisher keeps in the git folder: main's last public commit
+RECEIPTS = 'hq-public-receipts.jsonl'   # beside it: which public pull request carried each private commit (0.9.76)
 MAX_MARKS = 5000
 MAX_LINKS = 64
 _GITHUB = re.compile(r'(?:https://github\.com/|ssh://git@github\.com/|git@github\.com:)'
@@ -82,6 +83,8 @@ def links(data_dir):
     """``{project key: checked repo}`` as the app linked them (anything malformed is left out)."""
     out = {}
     for project, raw in _read(data_dir, LINKS_NAME).items():
+        if isinstance(raw, dict) and raw.get('published_marker') and not raw.get('receipts'):
+            raw = {**raw, 'receipts': RECEIPTS}    # a mirrored repo's public PR numbers (links made before 0.9.76 too)
         repos = _local().load_repos([raw])
         if isinstance(project, str) and 0 < len(project) <= 1024 and repos:
             out[project] = repos[0]
@@ -152,7 +155,8 @@ def link(data_dir, project, path, public_repo=None):
     if public_repo is None and marker is None:
         match = _GITHUB.fullmatch((local._git(root, 'remote', 'get-url', 'origin') or '').strip())
         public_repo = match.group(1) if match else None
-    raw = {'path': root, 'main': main, 'published_marker': marker, 'public_repo': public_repo}
+    raw = {'path': root, 'main': main, 'published_marker': marker, 'public_repo': public_repo,
+           'receipts': RECEIPTS if marker else None}
     checked = local.load_repos([raw])
     if not checked:
         raise ValueError('invalid_path')
