@@ -89,6 +89,31 @@ def test_linking_asks_git_and_takes_only_a_repository(tmp_path, repo):
     assert list(marks.links(data)) == ['/other']
 
 
+def test_a_mirrored_link_reads_the_publishers_receipts(tmp_path, repo):
+    """0.9.76: a linked repository with a publisher's marker also reads its receipts, so a merged branch carries the
+    public pull request's number (the owner's rows showed "Merged" with no number). A link saved before 0.9.76 has
+    no receipts field: it reads them too."""
+    local = marks._local()
+    data = tmp_path / 'data'
+    data.mkdir()
+    git(repo, 'switch', '-q', '-c', 'feat/a'); (repo / 'a').write_text('a'); git(repo, 'add', '-A')
+    git(repo, 'commit', '-q', '-m', 'a'); tip = git(repo, 'rev-parse', 'HEAD')
+    git(repo, 'switch', '-q', 'main'); git(repo, 'merge', '-q', '--no-ff', '-m', 'Merge feat/a', 'feat/a')
+    landed = git(repo, 'rev-parse', 'main')
+    (repo / '.git' / marks.MARKER).write_text(landed + '\n')
+    (repo / '.git' / marks.RECEIPTS).write_text(json.dumps({'commit': landed, 'url': 'https://github.com/owner/public/pull/41'}) + '\n')
+    marks.link(data, '/proj', str(repo), 'owner/public')
+    stored = json.loads((data / marks.LINKS_NAME).read_text())
+    assert stored['/proj']['receipts'] == marks.RECEIPTS
+    del stored['/proj']['receipts']; (data / marks.LINKS_NAME).write_text(json.dumps(stored))   # a pre-0.9.76 link
+    [linked] = marks.repos(data)
+    assert linked['receipts'] == marks.RECEIPTS
+    snap = local._snapshot(linked)
+    answer = local._merged_answer(linked, snap, tip, 'feat/a')
+    assert answer == {'state': 'merged', 'branch': 'feat/a', 'repo': 'owner/public', 'number': 41,
+                      'url': 'https://github.com/owner/public/pull/41'}
+
+
 def test_a_linked_repository_is_read_and_its_public_copy_may_be_asked(tmp_path, repo):
     data = tmp_path / 'data'
     data.mkdir()
