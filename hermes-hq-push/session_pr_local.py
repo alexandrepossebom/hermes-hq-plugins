@@ -443,11 +443,31 @@ def _merged_answer(repo, snap, commit, branch):
     if public and commit is not None and snap['receipts']:
         landed = _landed(repo, snap, commit)
         receipt = snap['receipts'].get(landed[:8]) if landed else None
+        if not receipt and branch is not None:
+            receipt = _own_receipt(repo, snap, commit, branch)
         if receipt:
             answer.update(repo=receipt[0], number=receipt[1], url=f'https://github.com/{receipt[0]}/pull/{receipt[1]}')
     if 'repo' not in answer and repo['public_repo']:
         answer['repo'] = repo['public_repo']
     return answer
+
+
+def _own_receipt(repo, snap, commit, branch):
+    """The newest public pull request among the branch's own commits, when the commit that brought it into main
+    published nothing. A release branch is moved into main whole, and its last commit is a notes-only merge the
+    publisher keeps private, so that commit has no receipt while the work merged before it does (owner
+    2026-11-21: "Fix it", rows showed "Merged" with no number). Only commits the branch itself made count, as its
+    own log records them, newest first; a branch later moved up along main never takes another chat's number, and
+    without that log no number is guessed."""
+    path = repo['path']
+    moves = _fact((path, 'moves', branch, commit), lambda: tuple(
+        tuple(row.partition(' ')[::2]) for row in
+        (_git(path, 'reflog', 'show', '--format=%H %gs', f'refs/heads/{branch}') or '').splitlines()))
+    # A move that made the commit it points at (a fast-forward or reset only points at someone else's).
+    own = [sha for sha, subject in moves
+           if subject.partition(':')[0].split(' ')[0] in _MADE_A_COMMIT + ('merge', 'pull')
+           and 'Fast-forward' not in subject.partition(':')[2]]
+    return next((snap['receipts'][sha[:8]] for sha in own if sha[:8] in snap['receipts']), None)
 
 
 def _draft(repo, branch):
