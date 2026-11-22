@@ -114,6 +114,38 @@ def test_a_mirrored_link_reads_the_publishers_receipts(tmp_path, repo):
                       'url': 'https://github.com/owner/public/pull/41'}
 
 
+def test_a_release_moved_into_main_whole_takes_its_own_work_s_number(tmp_path, repo):
+    """0.9.79: a release branch lands on main by a fast-forward whose last commit is a notes-only merge the publisher
+    keeps private. The number comes from the newest published commit of the branch's own line, never from main's
+    work before the branch was made (that belongs to other chats)."""
+    local = marks._local()
+    data = tmp_path / 'data'
+    data.mkdir()
+    (repo / 'm').write_text('m'); git(repo, 'add', '-A'); git(repo, 'commit', '-q', '-m', 'earlier work on main')
+    earlier = git(repo, 'rev-parse', 'HEAD')
+    git(repo, 'switch', '-q', '-c', 'release/9'); (repo / 'r').write_text('r'); git(repo, 'add', '-A')
+    git(repo, 'commit', '-q', '-m', 'release work'); work = git(repo, 'rev-parse', 'HEAD')
+    (repo / 'notes').write_text('n'); git(repo, 'add', '-A'); git(repo, 'commit', '-q', '-m', 'release notes')
+    tip = git(repo, 'rev-parse', 'HEAD')
+    git(repo, 'switch', '-q', '-c', 'release/10', earlier); (repo / 'n2').write_text('n'); git(repo, 'add', '-A')
+    git(repo, 'commit', '-q', '-m', 'notes only'); bare = git(repo, 'rev-parse', 'HEAD')
+    git(repo, 'switch', '-q', 'main'); git(repo, 'merge', '-q', '--ff-only', 'release/9')
+    git(repo, 'merge', '-q', '--no-ff', '-m', 'Merge release/10', 'release/10')
+    (repo / '.git' / marks.MARKER).write_text(git(repo, 'rev-parse', 'main') + '\n')
+    (repo / '.git' / marks.RECEIPTS).write_text(''.join(json.dumps({'commit': c, 'url': f'https://github.com/owner/public/pull/{n}'}) + '\n'
+                                                       for c, n in ((earlier, 40), (work, 41))))
+    marks.link(data, '/proj', str(repo), 'owner/public')
+    [linked] = marks.repos(data)
+    snap = local._snapshot(linked)
+    assert local._merged_answer(linked, snap, tip, 'release/9')['number'] == 41
+    assert 'number' not in local._merged_answer(linked, snap, bare, 'release/10')
+    git(repo, 'branch', '-f', 'release/10', 'main')         # moved up along main: main's numbers are not its own
+    (repo / '.git' / marks.MARKER).write_text(git(repo, 'rev-parse', 'main') + '\n')
+    snap = local._snapshot(linked)
+    assert 'number' not in local._merged_answer(linked, snap, git(repo, 'rev-parse', 'main'), 'release/10')
+    assert local._merged_answer(linked, snap, tip, 'release/9')['number'] == 41
+
+
 def test_a_linked_repository_is_read_and_its_public_copy_may_be_asked(tmp_path, repo):
     data = tmp_path / 'data'
     data.mkdir()
